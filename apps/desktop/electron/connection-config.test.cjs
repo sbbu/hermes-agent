@@ -19,6 +19,7 @@ const {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  configuredRemoteSource,
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,
@@ -88,6 +89,32 @@ test('profileRemoteOverride tolerates a missing/!object profiles map', () => {
   assert.equal(profileRemoteOverride({}, 'coder'), null)
   assert.equal(profileRemoteOverride({ profiles: null }, 'coder'), null)
   assert.equal(profileRemoteOverride(null, 'coder'), null)
+})
+
+// --- configuredRemoteSource ---
+
+test('configuredRemoteSource follows profile override → env override → global settings precedence', () => {
+  assert.equal(
+    configuredRemoteSource(
+      { mode: 'remote', profiles: { coder: { mode: 'remote', url: 'https://profile.example' } } },
+      'coder',
+      { HERMES_DESKTOP_REMOTE_URL: 'https://env.example' }
+    ),
+    'profile'
+  )
+  assert.equal(
+    configuredRemoteSource({ mode: 'local' }, 'coder', { HERMES_DESKTOP_REMOTE_URL: 'https://env.example' }),
+    'env'
+  )
+  assert.equal(
+    configuredRemoteSource({ mode: 'remote', remote: { url: 'https://settings.example' } }, 'coder', {}),
+    'settings'
+  )
+})
+
+test('configuredRemoteSource returns null for local profiles with no remote override', () => {
+  assert.equal(configuredRemoteSource({ mode: 'local', profiles: {} }, 'coder', {}), null)
+  assert.equal(configuredRemoteSource(null, 'coder', {}), null)
 })
 
 // --- normalizeRemoteBaseUrl ---

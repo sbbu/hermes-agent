@@ -23,7 +23,17 @@ vi.mock('@/store/notifications', () => ({
   dismissNotification: (...args: unknown[]) => dismissSpy(...args)
 }))
 
-const { maybeNotifyUpdateAvailable } = await import('./updates')
+const {
+  $updateApply,
+  $updateStatus,
+  applyUpdates,
+  checkUpdates,
+  maybeNotifyUpdateAvailable,
+  reportBackendContract,
+  resetUpdateApplyState
+} = await import('./updates')
+
+const { $connection } = await import('./session')
 
 const status = (over: Partial<DesktopUpdateStatus> = {}): DesktopUpdateStatus => ({
   supported: true,
@@ -39,6 +49,10 @@ describe('maybeNotifyUpdateAvailable', () => {
   beforeEach(() => {
     storage.clear()
     notifySpy.mockClear()
+    dismissSpy.mockClear()
+    $connection.set(null)
+    $updateStatus.set(null)
+    resetUpdateApplyState()
     vi.useRealTimers()
   })
 
@@ -73,5 +87,42 @@ describe('maybeNotifyUpdateAvailable', () => {
   it('does nothing when already up to date', () => {
     maybeNotifyUpdateAvailable(status({ behind: 0 }))
     expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('does not call the update bridge while connected to a remote backend', async () => {
+    const bridgeCheck = vi.fn(async () => status())
+    window.hermesDesktop = { updates: { check: bridgeCheck } } as never
+    $connection.set({ mode: 'remote' } as never)
+
+    const result = await checkUpdates()
+
+    expect(bridgeCheck).not.toHaveBeenCalled()
+    expect(result?.supported).toBe(false)
+    expect(result?.reason).toBe('remote-connection')
+    expect(dismissSpy).toHaveBeenCalledWith('desktop-update-available')
+  })
+
+  it('refuses to apply updates while connected to a remote backend', async () => {
+    const bridgeApply = vi.fn(async () => ({ ok: true }))
+    window.hermesDesktop = { updates: { apply: bridgeApply } } as never
+    $connection.set({ mode: 'remote' } as never)
+
+    const result = await applyUpdates()
+
+    expect(bridgeApply).not.toHaveBeenCalled()
+    expect(result.ok).toBe(false)
+    expect(result.error).toBe('remote-connection')
+    expect($updateApply.get().stage).toBe('error')
+  })
+
+  it('surfaces remote backend skew without offering in-app self-update', () => {
+    $connection.set({ mode: 'remote' } as never)
+
+    reportBackendContract(0)
+
+    const notification = notifySpy.mock.calls.at(-1)?.[0]
+    expect(notification.title).toBe('Remote backend out of date')
+    expect(notification.action.label).toBe('Details')
+    expect(notification.message).toContain('Update the remote host')
   })
 })

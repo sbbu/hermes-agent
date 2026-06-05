@@ -15,6 +15,7 @@ import type {
 } from '@/global'
 import { persistString, storedString } from '@/lib/storage'
 import { dismissNotification, notify } from '@/store/notifications'
+import { $connection } from '@/store/session'
 
 export interface UpdateApplyState {
   applying: boolean
@@ -55,6 +56,23 @@ const UPDATE_TOAST_ID = 'desktop-update-available'
 const UPDATE_TOAST_SNOOZE_KEY = 'hermes:update-toast-snooze-until'
 const UPDATE_TOAST_COOLDOWN_MS = 24 * 60 * 60 * 1000
 
+const REMOTE_UPDATE_DISABLED_MESSAGE =
+  'Desktop self-update is disabled while this window is connected to a remote Hermes backend. ' +
+  'Update the remote host from a separate shell/supervisor, then restart or reconnect the desktop if needed.'
+
+function remoteUpdateDisabledStatus(): DesktopUpdateStatus {
+  return {
+    supported: false,
+    reason: 'remote-connection',
+    message: REMOTE_UPDATE_DISABLED_MESSAGE,
+    fetchedAt: Date.now()
+  }
+}
+
+function isRemoteConnection(): boolean {
+  return $connection.get()?.mode === 'remote'
+}
+
 function snoozeUpdateToast(): void {
   persistString(UPDATE_TOAST_SNOOZE_KEY, String(Date.now() + UPDATE_TOAST_COOLDOWN_MS))
 }
@@ -80,6 +98,21 @@ const SKEW_TOAST_ID = 'backend-contract-skew'
 export function reportBackendContract(contract: number | undefined): void {
   if ((contract ?? 0) >= REQUIRED_BACKEND_CONTRACT) {
     dismissNotification(SKEW_TOAST_ID)
+
+    return
+  }
+
+  if (isRemoteConnection()) {
+    notify({
+      action: { label: 'Details', onClick: () => openUpdatesWindow() },
+      durationMs: 0,
+      id: SKEW_TOAST_ID,
+      kind: 'warning',
+      message:
+        'Your remote Hermes backend is older than this desktop build and may not work correctly. ' +
+        'Update the remote host from a separate shell/supervisor.',
+      title: 'Remote backend out of date'
+    })
 
     return
   }
@@ -174,6 +207,14 @@ export async function refreshDesktopVersion(): Promise<DesktopVersionInfo | null
 }
 
 export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
+  if (isRemoteConnection()) {
+    const status = remoteUpdateDisabledStatus()
+    $updateStatus.set(status)
+    dismissNotification(UPDATE_TOAST_ID)
+
+    return status
+  }
+
   const bridge = window.hermesDesktop?.updates
 
   if (!bridge || $updateChecking.get()) {
@@ -212,6 +253,14 @@ export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
 }
 
 export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promise<DesktopUpdateApplyResult> {
+  if (isRemoteConnection()) {
+    const message = REMOTE_UPDATE_DISABLED_MESSAGE
+    $updateApply.set({ ...IDLE, applying: false, stage: 'error', error: 'remote-connection', message })
+    dismissNotification(UPDATE_TOAST_ID)
+
+    return { ok: false, error: 'remote-connection', message }
+  }
+
   const bridge = window.hermesDesktop?.updates
 
   if (!bridge) {

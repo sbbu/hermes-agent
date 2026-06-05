@@ -124,6 +124,7 @@ export interface DesktopUpdateStatus {
   commits?: DesktopUpdateCommit[]
   dirty?: boolean
   fetchedAt?: number
+  remoteSource?: 'env' | 'profile' | 'settings'
 }
 
 export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'
@@ -142,6 +143,7 @@ export interface DesktopUpdateApplyResult {
   manual?: boolean
   command?: string
   hermesRoot?: string
+  remoteSource?: 'env' | 'profile' | 'settings'
 }
 
 export type DesktopUpdateStage = 'idle' | 'prepare' | 'fetch' | 'pull' | 'pydeps' | 'restart' | 'manual' | 'error'
@@ -160,7 +162,7 @@ export interface HermesConnection {
   mode?: 'local' | 'remote'
   authMode?: 'oauth' | 'token'
   nativeOverlayWidth: number
-  source?: 'env' | 'local' | 'settings'
+  source?: 'env' | 'local' | 'profile' | 'settings'
   token: string
   wsUrl: string
   logs: string[]

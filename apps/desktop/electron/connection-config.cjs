@@ -166,6 +166,30 @@ function profileRemoteOverride(config, profile) {
   return { url, authMode: normAuthMode(entry.authMode), token: entry.token }
 }
 
+/**
+ * Return the source that makes the primary desktop connection remote, without
+ * touching the network or decrypting credentials. The live resolver in main.cjs
+ * has the same precedence (profile override → env override → global settings),
+ * but it also mints OAuth tickets / validates tokens as part of building a
+ * connection. Update checks only need to answer "would this window be connected
+ * to a remote backend?" so they can stay side-effect free.
+ */
+function configuredRemoteSource(config, profile, env = {}) {
+  if (profileRemoteOverride(config, profile)) {
+    return 'profile'
+  }
+
+  if (env?.HERMES_DESKTOP_REMOTE_URL) {
+    return 'env'
+  }
+
+  if (config?.mode === 'remote') {
+    return 'settings'
+  }
+
+  return null
+}
+
 function tokenPreview(value) {
   const raw = String(value || '')
 
@@ -228,12 +252,7 @@ function cookiesHaveSession(cookies) {
  */
 function cookiesHaveLiveSession(cookies) {
   if (!Array.isArray(cookies)) return false
-  return cookies.some(
-    c =>
-      c &&
-      c.value &&
-      (AT_COOKIE_VARIANTS.includes(c.name) || RT_COOKIE_VARIANTS.includes(c.name))
-  )
+  return cookies.some(c => c && c.value && (AT_COOKIE_VARIANTS.includes(c.name) || RT_COOKIE_VARIANTS.includes(c.name)))
 }
 
 module.exports = {
@@ -242,6 +261,7 @@ module.exports = {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  configuredRemoteSource,
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,

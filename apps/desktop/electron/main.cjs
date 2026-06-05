@@ -32,6 +32,7 @@ const {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  configuredRemoteSource,
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,
@@ -1203,6 +1204,23 @@ function emitUpdateProgress(payload) {
   }
 }
 
+function primaryRemoteUpdateSource() {
+  return configuredRemoteSource(readDesktopConnectionConfig(), primaryProfileKey(), process.env)
+}
+
+function remoteUpdateDisabledStatus(remoteSource, branch) {
+  return {
+    supported: false,
+    reason: 'remote-connection',
+    remoteSource,
+    branch,
+    message:
+      'Desktop self-update is disabled while this window is connected to a remote Hermes backend. ' +
+      'Update the remote host from a separate shell/supervisor, then restart or reconnect the desktop if needed.',
+    fetchedAt: Date.now()
+  }
+}
+
 // Self-heal the tracked update branch: if origin no longer publishes it (e.g.
 // bb/gui was merged into main and deleted), fall back to main and persist so
 // every later check/apply follows main — no manual flip, even for already-
@@ -1228,8 +1246,13 @@ async function resolveHealedBranch(updateRoot, branch) {
 }
 
 async function checkUpdates() {
-  const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
+  const remoteSource = primaryRemoteUpdateSource()
+  if (remoteSource) {
+    return remoteUpdateDisabledStatus(remoteSource, branch)
+  }
+
+  const updateRoot = resolveUpdateRoot()
   const gitDir = path.join(updateRoot, '.git')
   if (!directoryExists(gitDir)) {
     return {
@@ -1435,6 +1458,14 @@ async function applyUpdates(opts = {}) {
   updateInFlight = true
 
   try {
+    const { branch: configuredBranch } = readDesktopUpdateConfig()
+    const remoteSource = primaryRemoteUpdateSource()
+    if (remoteSource) {
+      const status = remoteUpdateDisabledStatus(remoteSource, configuredBranch)
+      emitUpdateProgress({ stage: 'error', message: status.message, error: 'remote-connection', percent: null })
+      return { ok: false, error: 'remote-connection', message: status.message, branch: configuredBranch, remoteSource }
+    }
+
     const updater = resolveUpdaterBinary()
     if (!updater && !IS_WINDOWS) {
       // macOS/Linux drag-install: no staged Tauri hermes-setup. Unlike Windows
@@ -1475,9 +1506,8 @@ async function applyUpdates(opts = {}) {
     emitUpdateProgress({ stage: 'restart', message: 'Handing off to the Hermes updater…', percent: 100 })
 
     const updateRoot = resolveUpdateRoot()
-    const { branch: configuredBranch } = readDesktopUpdateConfig()
-    const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
-    const updaterArgs = ['--update', '--branch', branch]
+    const updateBranch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
+    const updaterArgs = ['--update', '--branch', updateBranch]
     const targetApp = IS_MAC ? runningAppBundle() : null
     if (targetApp) {
       updaterArgs.push('--target-app', targetApp)
@@ -3980,7 +4010,8 @@ async function testDesktopConnectionConfig(input = {}) {
   // The block under test: a per-profile entry or the global remote. Coerce has
   // already normalized the URL and resolved token inheritance for the scope.
   const block = key ? config.profiles?.[key] || null : config.remote
-  const wantRemote = block?.mode === 'remote' || (!key && config.mode === 'remote') || (input.mode === 'remote' && block)
+  const wantRemote =
+    block?.mode === 'remote' || (!key && config.mode === 'remote') || (input.mode === 'remote' && block)
   // ``/api/status`` is public on every gateway (no creds needed), so a
   // reachability test works for local, token, and oauth modes alike — we only
   // need a base URL. For a remote config we normalize the URL from the input;
@@ -4231,7 +4262,9 @@ async function spawnPoolBackend(profile, entry) {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     backendPool.delete(profile)
     if (!ready) {
-      rejectStart?.(new Error(`Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).`))
+      rejectStart?.(
+        new Error(`Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).`)
+      )
     }
   })
 
