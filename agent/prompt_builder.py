@@ -35,8 +35,8 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Context file scanning — detect prompt injection / promptware in AGENTS.md,
-# .cursorrules, SOUL.md before they get injected into the system prompt.
+# Context file scanning — detect prompt injection / promptware in untrusted
+# project context files before they get injected into the system prompt.
 #
 # Patterns live in ``tools/threat_patterns.py`` — the single source of truth
 # shared with the memory-tool scanner and the tool-result delimiter system.
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
 
-def _scan_context_content(content: str, filename: str) -> str:
+def _scan_context_content(content: str, filename: str, trusted: bool = False) -> str:
     """Scan context file content for injection. Returns sanitized content.
 
     Uses the "context" scope from the shared threat-pattern library, which
@@ -65,6 +65,9 @@ def _scan_context_content(content: str, filename: str) -> str:
     # elsewhere in the content remain subject to the threat scan below.
     if content.startswith("\ufeff"):
         content = content[1:]
+
+    if trusted:
+        return content
 
     findings = _scan_for_threats(content, scope="context")
     if findings:
@@ -1892,7 +1895,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
             return None
-        content = _scan_context_content(content, "SOUL.md")
+        content = _scan_context_content(content, "SOUL.md", trusted=True)
         content = _truncate_content(
             content, "SOUL.md", context_length=context_length,
             read_path=str(soul_path),
