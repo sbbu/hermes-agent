@@ -179,6 +179,7 @@ def test_load_restart_drain_timeout_prefers_env_then_config_then_default(
 @pytest.mark.asyncio
 async def test_request_restart_is_idempotent():
     runner, _adapter = make_restart_runner()
+    runner._wait_for_restart_safe_point = AsyncMock()
     runner.stop = AsyncMock()
     runner._launch_detached_restart_command = AsyncMock()
 
@@ -193,6 +194,7 @@ async def test_request_restart_is_idempotent():
     await runner._restart_task
 
     runner._launch_detached_restart_command.assert_awaited_once_with()
+    runner._wait_for_restart_safe_point.assert_awaited_once()
     runner.stop.assert_awaited_once_with(
         restart=True, detached_restart=True, service_restart=False
     )
@@ -239,6 +241,34 @@ async def test_run_restart_excluded_from_stop_cancel_loop():
     runner.stop.assert_awaited_once_with(
         restart=True, detached_restart=False, service_restart=True
     )
+
+
+@pytest.mark.asyncio
+async def test_wait_for_restart_safe_point_waits_for_all_gateway_work(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    runner._running_agents = {"agent:main:telegram:dm:999": object()}
+    running_jobs = {"job-1"}
+    api_runs = {"run-1"}
+    runner._active_cron_job_count = lambda: len(running_jobs)
+    runner._active_api_run_count = lambda: len(api_runs)
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", fast_sleep)
+
+    async def finish_work():
+        await real_sleep(0)
+        runner._running_agents.clear()
+        running_jobs.clear()
+        api_runs.clear()
+
+    asyncio.create_task(finish_work())
+    await asyncio.wait_for(runner._wait_for_restart_safe_point(), timeout=1)
+
+    assert runner._draining is True
 
 
 @pytest.mark.asyncio
@@ -411,7 +441,7 @@ async def test_shutdown_notification_sent_to_active_sessions():
 
     assert len(adapter.sent) == 1
     assert "shutting down" in adapter.sent[0]
-    assert "interrupted" in adapter.sent[0]
+    assert "wait for current work" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
@@ -426,7 +456,7 @@ async def test_shutdown_notification_says_restarting_when_restart_requested():
 
     assert len(adapter.sent) == 1
     assert "restarting" in adapter.sent[0]
-    assert "resume" in adapter.sent[0]
+    assert "wait for the current task to finish" in adapter.sent[0]
 
 
 @pytest.mark.asyncio

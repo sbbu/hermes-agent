@@ -40,6 +40,10 @@ class TestUserSystemdPrivateSocketPreflight:
 
 
 class TestSystemdServiceRefresh:
+    @pytest.fixture(autouse=True)
+    def _skip_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")
@@ -880,6 +884,28 @@ class TestLaunchdServiceRecovery:
         assert "draining in-flight runs" in out
         assert "up to 12s" in out
 
+    def test_launchd_restart_does_not_force_kickstart_when_gateway_still_draining(self, monkeypatch, capsys):
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: False)
+        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: calls.append(("term", pid, force)))
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launchctl should not force restart while draining")),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert calls == [("term", 321, False)]
+        out = capsys.readouterr().out.lower()
+        assert "still draining" in out
+        assert "not forcing restart" in out
+
+
     def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
         calls = []
 
@@ -916,7 +942,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: True)
 
         gateway_cli.launchd_stop()
 
@@ -934,7 +960,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: True)
 
         # Should not raise — exit code 3 means already unloaded
         gateway_cli.launchd_stop()
@@ -953,12 +979,13 @@ class TestLaunchdServiceRecovery:
             wait_called.append(kwargs)
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", fake_wait)
 
         gateway_cli.launchd_stop()
 
         assert len(wait_called) == 1
-        assert wait_called[0] == {"timeout": 10.0, "force_after": 5.0}
+        assert wait_called[0] == {"timeout": 12.0, "force_after": None}
 
     def test_launchd_status_reports_local_stale_plist_when_unloaded(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
@@ -1185,7 +1212,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: True)
 
         gateway_cli.launchd_stop()
 
@@ -1539,6 +1566,10 @@ class TestGatewayServiceDetection:
         assert gateway_cli._is_service_running() is False
 
 class TestGatewaySystemServiceRouting:
+    @pytest.fixture(autouse=True)
+    def _skip_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 
