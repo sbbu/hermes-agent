@@ -127,6 +127,9 @@ def make_restart_runner(
     runner._persist_active_agents = GatewayRunner._persist_active_agents.__get__(
         runner, GatewayRunner
     )
+    runner._wait_for_restart_safe_point = GatewayRunner._wait_for_restart_safe_point.__get__(
+        runner, GatewayRunner
+    )
     runner._snapshot_running_agents = GatewayRunner._snapshot_running_agents.__get__(
         runner, GatewayRunner
     )

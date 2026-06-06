@@ -4342,8 +4342,11 @@ def launchd_stop():
             pass
         else:
             raise
-    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
-    print("✓ Service stopped")
+    exited = _wait_for_gateway_exit(timeout=_get_restart_drain_timeout(), force_after=None)
+    if exited:
+        print("✓ Service stopped")
+    else:
+        print("⚠ Service stop requested; gateway is still draining — not force-killing")
 
 
 def _wait_for_gateway_exit(
@@ -4429,8 +4432,9 @@ def launchd_restart():
                 exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
                 if not exited:
                     print(
-                        f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
+                        f"⚠ Gateway is still draining after {drain_timeout:.0f}s — not forcing restart"
                     )
+                    return
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
