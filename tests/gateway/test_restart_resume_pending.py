@@ -38,6 +38,7 @@ from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
+    _history_has_unfinished_gateway_work,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
     _should_clear_resume_pending_after_turn,
@@ -104,6 +105,15 @@ def _build_agent_history(history: list) -> list:
     return agent_history
 
 
+def _unfinished_history() -> list:
+    return [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
+        ], "timestamp": time.time() - 1},
+        {"role": "tool", "tool_call_id": "c1", "content": "result", "timestamp": time.time()},
+    ]
+
+
 def _simulate_note_injection(
     history: list,
     user_message: str,
@@ -133,10 +143,12 @@ def _simulate_note_injection(
     )
 
     message = user_message
+    has_unfinished_gateway_work = _history_has_unfinished_gateway_work(history)
     is_resume_pending = bool(
         resume_entry is not None
         and getattr(resume_entry, "resume_pending", False)
         and interruption_is_fresh
+        and has_unfinished_gateway_work
     )
     has_fresh_tool_tail = bool(
         agent_history
@@ -435,7 +447,10 @@ class TestResumePendingSystemNote:
         entry = self._pending_entry(reason="restart_timeout")
         result = _simulate_note_injection(
             history=[
-                {"role": "assistant", "content": "in progress", "timestamp": time.time()},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
+                ], "timestamp": time.time() - 1},
+                {"role": "tool", "tool_call_id": "c1", "content": "result", "timestamp": time.time()},
             ],
             user_message="what happened?",
             resume_entry=entry,
@@ -448,24 +463,25 @@ class TestResumePendingSystemNote:
         entry = self._pending_entry(reason="shutdown_timeout")
         result = _simulate_note_injection(
             history=[
-                {"role": "assistant", "content": "in progress", "timestamp": time.time()},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
+                ], "timestamp": time.time() - 1},
+                {"role": "tool", "tool_call_id": "c1", "content": "result", "timestamp": time.time()},
             ],
             user_message="ping",
             resume_entry=entry,
         )
         assert "gateway shutdown" in result
 
-    def test_resume_pending_fires_without_tool_tail(self):
-        """Key improvement over PR #9934: the restart-resume note fires
-        even when the transcript's last role is NOT ``tool``."""
+    def test_resume_pending_without_unfinished_work_does_not_inject_filler(self):
+        """A restart marker alone must not synthesize the bogus 'I'm back' turn."""
         entry = self._pending_entry()
         history = [
             {"role": "user", "content": "run a long thing", "timestamp": time.time() - 10},
             {"role": "assistant", "content": "ok, starting...", "timestamp": time.time()},
         ]
         result = _simulate_note_injection(history, "ping", resume_entry=entry)
-        assert "[System note:" in result
-        assert "gateway restart" in result
+        assert result == "ping"
 
     def test_resume_pending_subsumes_tool_tail_note(self):
         """When BOTH conditions are true, the restart-resume note wins —
@@ -646,6 +662,18 @@ class TestResumePendingSystemNote:
         ]
         result = _simulate_note_injection(history, "ping", resume_entry=None)
         assert result == "ping"
+
+    def test_unfinished_gateway_work_detector_requires_tool_tail(self):
+        assert _history_has_unfinished_gateway_work([
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+        ]) is True
+        assert _history_has_unfinished_gateway_work([
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+        ]) is True
+        assert _history_has_unfinished_gateway_work([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "done"},
+        ]) is False
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +910,7 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
         last_resume_marked_at=datetime.now(),
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner.session_store.load_transcript = MagicMock(return_value=_unfinished_history())
     adapter.handle_message = AsyncMock()
 
     scheduled = runner._schedule_resume_pending_sessions()
@@ -924,6 +953,7 @@ async def test_startup_auto_resume_includes_crash_recovery():
         last_resume_marked_at=datetime.now(),
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner.session_store.load_transcript = MagicMock(return_value=_unfinished_history())
     adapter.handle_message = AsyncMock()
 
     scheduled = runner._schedule_resume_pending_sessions()
@@ -931,6 +961,36 @@ async def test_startup_auto_resume_includes_crash_recovery():
 
     assert scheduled == 1
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_when_no_unfinished_tool_work():
+    """Prevents bogus post-restart filler when only the resume marker is set."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="clean-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:clean-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner.session_store.load_transcript = MagicMock(return_value=[
+        {"role": "user", "content": "hello", "timestamp": time.time() - 2},
+        {"role": "assistant", "content": "done", "timestamp": time.time() - 1},
+    ])
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1087,6 +1147,7 @@ async def test_reconnect_reschedules_pending_after_late_platform_connect():
         last_resume_marked_at=datetime.now(),
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner.session_store.load_transcript = MagicMock(return_value=_unfinished_history())
     adapter.handle_message = AsyncMock()
 
     # Platform was not connected at gateway startup → session skipped.
@@ -1146,6 +1207,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
         tg_entry.session_key: tg_entry,
         discord_entry.session_key: discord_entry,
     }
+    runner.session_store.load_transcript = MagicMock(return_value=_unfinished_history())
     adapter.handle_message = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: adapter}
 
@@ -1195,10 +1257,8 @@ async def test_auto_resume_skips_sessions_with_running_agent():
 
 
 @pytest.mark.asyncio
-async def test_restart_banner_uses_try_to_resume_wording():
-    """The notification sent before drain should hedge the resume promise
-    — the session-continuity fix is best-effort (stuck-loop counter can
-    still escalate to suspended)."""
+async def test_restart_banner_says_restart_waits_for_current_work():
+    """Restart/shutdown should drain active work, not advertise interruption."""
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
@@ -1208,7 +1268,7 @@ async def test_restart_banner_uses_try_to_resume_wording():
     assert len(adapter.sent) == 1
     msg = adapter.sent[0]
     assert "restarting" in msg
-    assert "try to resume" in msg
+    assert "wait for the current task to finish" in msg
 
 
 @pytest.mark.asyncio
@@ -1224,8 +1284,8 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "⚠️ Gateway restarting — I'll wait for the current task to finish before restarting. "
+        "New messages will be queued until the gateway comes back."
     ]
 
 

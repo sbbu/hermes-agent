@@ -213,6 +213,34 @@ async def test_discord_free_response_in_server_channels(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discord_free_response_in_server_channels_includes_recent_channel_context(adapter, monkeypatch):
+    """Free-response server channels still need human-style recent context.
+
+    Regression: history backfill only ran for mention-gated channels and
+    threads, so a normal #general message with DISCORD_REQUIRE_MENTION=false
+    reached the model blind to the immediately preceding channel discussion.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    channel = FakeHistoryChannel(
+        [make_history_message(author=human, content="we were talking about invoices", msg_id=122)],
+        channel_id=123,
+    )
+
+    message = make_message(channel=channel, content="can you handle that?")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "can you handle that?"
+    assert event.channel_context == (
+        "[Recent channel messages]\n[Alice] we were talking about invoices"
+    )
+
+
+@pytest.mark.asyncio
 async def test_discord_free_response_in_threads(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)

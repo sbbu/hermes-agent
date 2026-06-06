@@ -5263,48 +5263,24 @@ class DiscordAdapter(BasePlatformAdapter):
             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
 
         # ── History backfill ─────────────────────────────────────────
-        # When require_mention is active, the bot only processes messages
-        # that @mention it.  Messages in the channel between bot turns are
-        # invisible to the session transcript.  To recover that context,
-        # fetch recent channel history and prepend it to the user message.
+        # Discord should feel human: in shared server channels, a message is
+        # interpreted against the recent channel conversation even when the user
+        # did not use Discord's formal Reply feature.  Fetch everything after the
+        # bot's last channel message up to (but not including) the current
+        # trigger and attach it as API-only channel_context.
         #
-        # The fetch window is: everything after the bot's last message in
-        # the channel up to (but not including) the current trigger.  On
-        # cold start (no prior bot message found), fetch the last N messages
-        # and stop at the first self-message encountered.
-        #
-        # Threads naturally scope to thread-only history (channel.history()
-        # on a thread returns only that thread's messages).  DMs are skipped
-        # because every DM message triggers the bot — there's no mention gap
-        # to fill; the session transcript already has everything.
-        #
-        # Per-user sessions also benefit: Alice's session is missing the
-        # other-channel-participants' context, and her own messages from
-        # before she mentioned the bot.  Backfill fills that gap.
-        #
-        # Messages that arrive while the bot is processing (between trigger
-        # and response) are not captured — this is an accepted simplification
-        # to keep the partition rule clean.
+        # This covers both mention-gated and free-response channels.  DMs are
+        # skipped because every DM is already part of the one-on-one transcript.
+        # Auto-threaded messages also skip — we just created the thread, so
+        # there's no prior thread-local history to backfill.
         _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm and self._discord_history_backfill():
-            # Run backfill when there's a real gap to fill:
-            #   - mention-gated channels with no free-response override
-            #     (messages between bot turns aren't in the transcript)
-            #   - any thread (in_bot_thread bypasses the mention check, but
-            #     processing-window gaps and post-restart context still need
-            #     recovery)
-            # DMs skip entirely because every DM message triggers the bot,
-            # so the session transcript already has everything.
-            # Auto-threaded messages also skip — we just created the thread,
-            # there's nothing prior to backfill.
-            _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
-            if (_has_mention_gap or is_thread) and auto_threaded_channel is None:
-                _backfill_text = await self._fetch_channel_context(
-                    message.channel, before=message,
-                )
-                if _backfill_text:
-                    _channel_context = _backfill_text
+        if not _is_dm and self._discord_history_backfill() and auto_threaded_channel is None:
+            _backfill_text = await self._fetch_channel_context(
+                message.channel, before=message,
+            )
+            if _backfill_text:
+                _channel_context = _backfill_text
 
         # Defense-in-depth: prevent empty user messages from entering session
         # (can happen when user sends @mention-only with no other text).
