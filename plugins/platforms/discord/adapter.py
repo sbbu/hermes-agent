@@ -7106,6 +7106,106 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
 
+    @staticmethod
+    def _reply_context_text_from_message(message: Any) -> Optional[str]:
+        """Return concise text for a Discord message used as reply context.
+
+        Discord does not always populate ``message.reference.resolved.content``
+        for replied-to messages, especially after restarts or when replying to
+        bot/cron output. When we do fetch the referenced message, preserve the
+        human-visible text the user is pointing at. Embeds/attachments are a
+        fallback for messages with blank ``content``.
+        """
+        if message is None:
+            return None
+
+        parts: List[str] = []
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            parts.append(content.strip())
+
+        for embed in getattr(message, "embeds", None) or []:
+            for attr in ("title", "description"):
+                value = getattr(embed, attr, None)
+                if value:
+                    parts.append(str(value).strip())
+            for field in getattr(embed, "fields", None) or []:
+                name = getattr(field, "name", None)
+                value = getattr(field, "value", None)
+                if name and value:
+                    parts.append(f"{name}: {value}".strip())
+                elif value:
+                    parts.append(str(value).strip())
+
+        if not parts:
+            for att in getattr(message, "attachments", None) or []:
+                filename = getattr(att, "filename", None) or getattr(att, "url", None)
+                if filename:
+                    parts.append(f"[attachment: {filename}]")
+
+        text = "\n".join(p for p in parts if p).strip()
+        return text or None
+
+    async def _fetch_referenced_message(self, message: Any, message_id: str) -> Optional[Any]:
+        """Best-effort fetch of a replied-to Discord message.
+
+        This is the bridge for visible channel context that is not in the agent
+        transcript, e.g. cron/no-agent messages posted into Discord. If the
+        user replies "don't post these" to that message, the model must see the
+        referenced text or it will guess from stale conversation state.
+        """
+        if not message_id:
+            return None
+
+        reference = getattr(message, "reference", None)
+        channel = None
+        ref_channel_id = getattr(reference, "channel_id", None) if reference else None
+        client = self._client
+
+        if ref_channel_id is not None and client is not None:
+            try:
+                channel = client.get_channel(int(ref_channel_id))
+            except Exception:
+                channel = None
+            if channel is None and hasattr(client, "fetch_channel"):
+                try:
+                    channel = await client.fetch_channel(int(ref_channel_id))
+                except Exception:
+                    channel = None
+
+        if channel is None:
+            channel = getattr(message, "channel", None)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return None
+
+        try:
+            return await channel.fetch_message(int(message_id))
+        except Exception as exc:
+            logger.debug(
+                "[%s] Could not fetch Discord reply target %s: %s",
+                self.name,
+                message_id,
+                exc,
+            )
+            return None
+
+    async def _resolve_reply_context(self, message: Any) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve Discord reply id + human-visible quoted text."""
+        reference = getattr(message, "reference", None)
+        if not reference:
+            return None, None
+
+        raw_id = getattr(reference, "message_id", None)
+        reply_to_id = str(raw_id) if raw_id is not None else None
+        resolved = getattr(reference, "resolved", None)
+        reply_to_text = self._reply_context_text_from_message(resolved)
+
+        if not reply_to_text and reply_to_id:
+            fetched = await self._fetch_referenced_message(message, reply_to_id)
+            reply_to_text = self._reply_context_text_from_message(fetched)
+
+        return reply_to_id, reply_to_text
+
     async def _handle_message(
         self,
         message: DiscordMessage,
@@ -7560,12 +7660,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
 
-        reply_to_id = None
-        reply_to_text = None
-        if message.reference:
-            reply_to_id = str(message.reference.message_id)
-            if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
+        reply_to_id, reply_to_text = await self._resolve_reply_context(message)
 
         event = MessageEvent(
             text=event_text,
