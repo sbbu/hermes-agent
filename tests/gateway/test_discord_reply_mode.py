@@ -360,6 +360,24 @@ class TestReplyToText:
         assert event.reply_to_text is None
 
     @pytest.mark.asyncio
+    async def test_reference_without_resolved_fetches_message_content(self, reply_text_adapter):
+        """Replies to cron/bot output still carry quoted text when Discord doesn't resolve it."""
+        ref = SimpleNamespace(message_id=555, channel_id=None, resolved=None)
+        message = _make_message(reference=ref)
+        message.channel.fetch_message = AsyncMock(
+            return_value=SimpleNamespace(
+                content="spotify taste daemon: new listening signal\nrecent plays: Bladee"
+            )
+        )
+
+        await reply_text_adapter._handle_message(message)
+
+        message.channel.fetch_message.assert_awaited_once_with(555)
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_message_id == "555"
+        assert event.reply_to_text == "spotify taste daemon: new listening signal\nrecent plays: Bladee"
+
+    @pytest.mark.asyncio
     async def test_reference_with_resolved_content(self, reply_text_adapter):
         resolved_msg = SimpleNamespace(content="original message text")
         ref = SimpleNamespace(message_id=555, resolved=resolved_msg)
