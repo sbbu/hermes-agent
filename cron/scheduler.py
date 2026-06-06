@@ -296,12 +296,37 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+_shutdown_draining = False
 
 # Sequential (env-mutating) cron jobs — workdir jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
 # ticker thread.  A persistent single-thread executor preserves ordering across
 # ticks while keeping dispatch fire-and-forget, the same as the parallel pool.
 _sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def set_shutdown_draining(value: bool = True) -> None:
+    """Gate new cron dispatch while the gateway is draining for shutdown.
+
+    Already-running jobs are allowed to finish; future ticks return without
+    advancing schedules or submitting new work.  The flag is process-local on
+    purpose: it protects the in-gateway ticker during service restarts without
+    affecting a separate manual ``hermes cron run`` process.
+    """
+    global _shutdown_draining
+    with _running_lock:
+        _shutdown_draining = bool(value)
+
+
+def get_running_job_ids() -> set:
+    """Return a snapshot of cron job IDs currently executing in this process."""
+    with _running_lock:
+        return set(_running_job_ids)
+
+
+def is_shutdown_draining() -> bool:
+    with _running_lock:
+        return _shutdown_draining
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -2860,6 +2885,11 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         return 0
 
     try:
+        if is_shutdown_draining():
+            if verbose:
+                logger.info("Cron tick skipped — gateway shutdown/restart is draining")
+            return 0
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
@@ -2930,6 +2960,12 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             """
             job_id = job["id"]
             with _running_lock:
+                if _shutdown_draining:
+                    logger.info(
+                        "Job '%s' skipped — gateway shutdown/restart is draining",
+                        job.get("name", job_id),
+                    )
+                    return None
                 if job_id in _running_job_ids:
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None

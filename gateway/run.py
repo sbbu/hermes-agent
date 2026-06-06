@@ -631,6 +631,31 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+def _history_has_unfinished_gateway_work(history: Any) -> bool:
+    """Return True only when a transcript tail contains resumable work.
+
+    ``resume_pending`` alone is not enough to synthesize an auto-resume turn:
+    a shutdown can mark a session while the model was merely between messages,
+    and blindly waking it produces the useless "I'm back / interrupted" filler
+    that users read as nonsense.  Auto-resume should only fire when there is a
+    concrete unfinished assistant→tool sequence to process.
+    """
+    if not isinstance(history, list):
+        return False
+    for msg in reversed(history):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role in {"session_meta", "system"}:
+            continue
+        if role in {"tool", "function"}:
+            return True
+        if role == "assistant" and msg.get("tool_calls"):
+            return True
+        return False
+    return False
+
+
 # Assistant-message fields that must survive transcript replay so multi-turn
 # reasoning context, prefix-cache hits, and provider-specific echo
 # requirements all behave the same on the gateway as they do in the CLI.
@@ -3844,6 +3869,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raise
             except Exception:  # noqa: BLE001 - the watcher must never crash the gateway
                 logger.debug("scale-to-zero watcher iteration error", exc_info=True)
+    def _running_cron_job_ids(self) -> set[str]:
+        try:
+            from cron.scheduler import get_running_job_ids
+            return {str(jid) for jid in get_running_job_ids()}
+        except Exception as exc:
+            logger.debug("Failed to inspect running cron jobs: %s", exc)
+            return set()
+
+    async def _wait_for_restart_safe_point(self) -> None:
+        """Defer a planned restart/shutdown until active agent turns and cron jobs finish."""
+        try:
+            from cron.scheduler import set_shutdown_draining
+            set_shutdown_draining(True)
+        except Exception as exc:
+            logger.debug("Failed to pause cron dispatch for restart: %s", exc)
+
+        self._draining = True
+        self._update_runtime_status("draining")
+        last_log_at = 0.0
+        first = True
+        while True:
+            active_agents = self._running_agent_count()
+            running_jobs = self._running_cron_job_ids()
+            if active_agents == 0 and not running_jobs:
+                if not first:
+                    logger.info("Gateway shutdown/restart safe point reached; no active sessions or cron jobs remain")
+                return
+
+            now = time.monotonic()
+            if first or now - last_log_at >= 30.0:
+                logger.info(
+                    "Gateway shutdown/restart waiting for safe point: active_sessions=%d, running_cron_jobs=%s",
+                    active_agents,
+                    sorted(running_jobs) or [],
+                )
+                last_log_at = now
+                first = False
+            self._update_runtime_status("draining")
+            await asyncio.sleep(1.0)
 
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
@@ -4920,10 +4984,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+            "I'll wait for the current task to finish before restarting. "
+            "New messages will be queued until the gateway comes back."
             if self._restart_requested
-            else "Your current task will be interrupted."
+            else "I'll wait for current work to finish before shutting down."
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
@@ -5499,6 +5563,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _run_restart() -> None:
             await asyncio.sleep(0.05)
+            await self._wait_for_restart_safe_point()
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
         task = asyncio.create_task(_run_restart())
@@ -5652,6 +5717,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
             if entry.session_key in self._running_agents:
+                continue
+
+            try:
+                history = self.session_store.load_transcript(entry.session_id)
+            except Exception:
+                history = []
+            if not _history_has_unfinished_gateway_work(history):
+                logger.info(
+                    "Skipping auto-resume for %s: no unfinished tool work in transcript tail",
+                    entry.session_key,
+                )
                 continue
 
             source = entry.origin
@@ -7014,6 +7090,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     cleanup_all_browsers()
                 except Exception as _e:
                     logger.debug("cleanup_all_browsers (%s) error: %s", phase, _e)
+
+            try:
+                from cron.scheduler import set_shutdown_draining
+                set_shutdown_draining(True)
+            except Exception as exc:
+                logger.debug("Failed to pause cron dispatch for shutdown: %s", exc)
 
             logger.info(
                 "Stopping gateway%s...",
@@ -16561,10 +16643,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _resume_entry = self.session_store._entries.get(session_key)
                 except Exception:
                     _resume_entry = None
+            _has_unfinished_gateway_work = _history_has_unfinished_gateway_work(history)
             _is_resume_pending = bool(
                 _resume_entry is not None
                 and getattr(_resume_entry, "resume_pending", False)
                 and _interruption_is_fresh
+                and _has_unfinished_gateway_work
             )
             _has_fresh_tool_tail = bool(
                 agent_history
@@ -18180,6 +18264,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _signal_initiated_shutdown = False
 
     # Set up signal handlers
+    async def _run_planned_shutdown_after_safe_point() -> None:
+        try:
+            await runner._wait_for_restart_safe_point()
+        finally:
+            await runner.stop()
+
     def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
         # Planned --replace takeover check: when a sibling gateway is
@@ -18273,7 +18363,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
             except Exception as _e:
                 logger.debug("spawn_async_diagnostic failed: %s", _e)
-        asyncio.create_task(runner.stop())
+        if planned_stop or planned_takeover:
+            asyncio.create_task(_run_planned_shutdown_after_safe_point())
+        else:
+            asyncio.create_task(runner.stop())
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)

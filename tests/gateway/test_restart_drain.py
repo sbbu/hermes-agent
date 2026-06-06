@@ -179,6 +179,7 @@ def test_load_restart_drain_timeout_prefers_env_then_config_then_default(
 @pytest.mark.asyncio
 async def test_request_restart_is_idempotent():
     runner, _adapter = make_restart_runner()
+    runner._wait_for_restart_safe_point = AsyncMock()
     runner.stop = AsyncMock()
 
     assert runner.request_restart(detached=True, via_service=False) is True
@@ -187,9 +188,41 @@ async def test_request_restart_is_idempotent():
 
     await first_task
 
+    runner._wait_for_restart_safe_point.assert_awaited_once()
     runner.stop.assert_awaited_once_with(
         restart=True, detached_restart=True, service_restart=False
     )
+
+
+@pytest.mark.asyncio
+async def test_wait_for_restart_safe_point_waits_for_agents_and_cron(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    runner._running_agents = {"agent:main:telegram:dm:999": object()}
+    running_jobs = {"job-1"}
+    runner._running_cron_job_ids = lambda: set(running_jobs)
+    set_draining_calls = []
+    monkeypatch.setattr(
+        "cron.scheduler.set_shutdown_draining",
+        lambda value=True: set_draining_calls.append(value),
+    )
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", fast_sleep)
+
+    async def finish_work():
+        await real_sleep(0)
+        runner._running_agents.clear()
+        running_jobs.clear()
+
+    asyncio.create_task(finish_work())
+    await asyncio.wait_for(runner._wait_for_restart_safe_point(), timeout=1)
+
+    assert set_draining_calls == [True]
+    assert runner._draining is True
 
 
 @pytest.mark.asyncio
@@ -302,7 +335,7 @@ async def test_shutdown_notification_sent_to_active_sessions():
 
     assert len(adapter.sent) == 1
     assert "shutting down" in adapter.sent[0]
-    assert "interrupted" in adapter.sent[0]
+    assert "wait for current work" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
@@ -317,7 +350,7 @@ async def test_shutdown_notification_says_restarting_when_restart_requested():
 
     assert len(adapter.sent) == 1
     assert "restarting" in adapter.sent[0]
-    assert "resume" in adapter.sent[0]
+    assert "wait for the current task to finish" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
