@@ -1642,6 +1642,11 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
         last_resume_marked_at=datetime.now(),
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    setattr(
+        runner.session_store,
+        "load_transcript",
+        MagicMock(return_value=_unfinished_history()),
+    )
 
     # Slow mock: hold the task open so we can inspect _running_agents
     # while it's in-flight.
@@ -1688,6 +1693,11 @@ async def test_auto_resume_sentinel_cleaned_on_task_failure():
         last_resume_marked_at=datetime.now(),
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    setattr(
+        runner.session_store,
+        "load_transcript",
+        MagicMock(return_value=_unfinished_history()),
+    )
 
     async def _failing_handle(event):
         raise RuntimeError("adapter exploded")
@@ -1750,6 +1760,11 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
         last_resume_marked_at=datetime.now(),
     )
     runner.session_store._entries = {session_key: pending_entry}
+    setattr(
+        runner.session_store,
+        "load_transcript",
+        MagicMock(return_value=_unfinished_history()),
+    )
 
     # Wire the REAL runner pipeline that _handle_message depends on.
     from gateway.run import GatewayRunner
