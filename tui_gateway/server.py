@@ -146,7 +146,12 @@ try:
 except (ValueError, TypeError):
     _slash_timeout = 45.0
 _SLASH_WORKER_TIMEOUT_S = max(5.0, _slash_timeout)
-
+try:
+    _turn_idle_timeout = float(os.environ.get("HERMES_TUI_TURN_IDLE_TIMEOUT_S") or "600")
+except (ValueError, TypeError):
+    _turn_idle_timeout = 600.0
+_TUI_TURN_IDLE_TIMEOUT_S = max(0.0, _turn_idle_timeout)
+_DETAIL_TEXT_MAX_CHARS = 24_000
 # When a WebSocket client (the dashboard's embedded-chat tab / desktop app)
 # disconnects, ``tui_gateway.ws`` detaches the transport but intentionally
 # leaves the session parked so a quick reconnect can reattach it (see ws.py).
@@ -1782,6 +1787,131 @@ def _start_agent_build(sid: str, session: dict) -> None:
             ready.set()
 
     threading.Thread(target=_build, daemon=True).start()
+
+
+def _run_generation(session: dict) -> int:
+    try:
+        return int(session.get("run_generation", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bump_run_generation_locked(session: dict) -> int:
+    generation = _run_generation(session) + 1
+    session["run_generation"] = generation
+    return generation
+
+
+def _begin_session_run_locked(session: dict, text: Any | None = None) -> int:
+    """Mark a TUI session busy and return the generation owning this run."""
+    now = time.time()
+    generation = _bump_run_generation_locked(session)
+    session["running"] = True
+    session["_turn_cancel_requested"] = False
+    session["last_active"] = now
+    session["run_started_at"] = now
+    session["run_last_activity"] = now
+    if text is not None:
+        _start_inflight_turn(session, text)
+    return generation
+
+
+def _run_current_locked(session: dict, generation: int) -> bool:
+    return _run_generation(session) == int(generation)
+
+
+def _mark_run_activity_locked(session: dict) -> None:
+    now = time.time()
+    session["run_last_activity"] = now
+    session["last_active"] = now
+
+
+def _run_idle_seconds(session: dict, now: float | None = None) -> float:
+    """Best-effort idle age for the current turn, using AIAgent activity when available."""
+    agent = session.get("agent")
+    if agent is not None and hasattr(agent, "get_activity_summary"):
+        try:
+            summary = agent.get_activity_summary()
+            value = summary.get("seconds_since_activity")
+            if isinstance(value, (int, float)) and value >= 0:
+                return float(value)
+        except Exception:
+            pass
+    if now is None:
+        now = time.time()
+    last = session.get("run_last_activity") or session.get("last_active") or session.get("run_started_at")
+    if last is None:
+        return 0.0
+    try:
+        return max(0.0, now - float(last))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _running_turn_is_stale(session: dict, now: float | None = None) -> bool:
+    return bool(
+        session.get("running")
+        and _TUI_TURN_IDLE_TIMEOUT_S > 0
+        and _run_idle_seconds(session, now=now) >= _TUI_TURN_IDLE_TIMEOUT_S
+    )
+
+
+def _quiesce_abandoned_agent(agent: Any, reason: str) -> None:
+    """Stop a detached turn from writing/streaming into a recovered session."""
+    if agent is None:
+        return
+    try:
+        if hasattr(agent, "interrupt"):
+            try:
+                agent.interrupt(reason)
+            except TypeError:
+                agent.interrupt()
+    except Exception:
+        pass
+    # The old worker thread may be blocked inside an API call and unwind later.
+    # Detach persistence + callbacks so late output cannot leak into the fresh
+    # desktop session after we have unlocked it.
+    for attr in (
+        "_session_db",
+        "tool_progress_callback",
+        "tool_start_callback",
+        "tool_complete_callback",
+        "thinking_callback",
+        "status_callback",
+        "step_callback",
+        "background_review_callback",
+        "event_callback",
+        "_stream_callback",
+    ):
+        try:
+            setattr(agent, attr, None)
+        except Exception:
+            pass
+
+
+def _detach_running_agent_locked(session: dict, reason: str) -> Any:
+    """Invalidate a stuck turn and prepare this session to build a fresh agent."""
+    old_agent = session.get("agent")
+    _bump_run_generation_locked(session)
+    session["agent"] = None
+    session["agent_error"] = None
+    session["agent_ready"] = threading.Event()
+    session["running"] = False
+    session["last_active"] = time.time()
+    session["run_started_at"] = None
+    session["run_last_activity"] = None
+    session["abandoned_run_reason"] = reason
+    session["_turn_cancel_requested"] = True
+    session["queued_prompt"] = None
+    _clear_inflight_turn(session)
+    worker = session.get("slash_worker")
+    session["slash_worker"] = None
+    if worker is not None:
+        try:
+            worker.close()
+        except Exception:
+            pass
+    return old_agent
 
 
 def _sess_nowait(params, rid):
@@ -5448,6 +5578,9 @@ def _init_session(
             "inflight_turn": None,
             "created_at": now,
             "last_active": now,
+            "run_generation": 0,
+            "run_started_at": None,
+            "run_last_activity": None,
             "running": False,
             "attached_images": [],
             "image_counter": 0,
@@ -6204,6 +6337,9 @@ def _(rid, params: dict) -> dict:
             "cwd": resolved_cwd,
             "inflight_turn": None,
             "last_active": now,
+            "run_generation": 0,
+            "run_started_at": None,
+            "run_last_activity": None,
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
@@ -6458,6 +6594,9 @@ def _deferred_session_record(
         "image_counter": 0,
         "inflight_turn": None,
         "last_active": now,
+        "run_generation": 0,
+        "run_started_at": None,
+        "run_last_activity": None,
         "lazy": lazy,
         "model_override": model_override,
         "pending_title": None,
@@ -9582,6 +9721,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
         if session.get("running"):
@@ -9600,30 +9740,10 @@ def _(rid, params: dict) -> dict:
         except Exception:
             pass
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    # Safety net: if the turn's run thread is already gone but `running` stayed
-    # stuck (a crash/desync that skipped the run loop's `finally`), force-clear it
-    # so the session can't be permanently bricked at 4009 "session busy" — every
-    # send/restore/resume would otherwise reject until a full backend restart.
-    # Always tell the agent to interrupt when the session claims a run is active:
-    # stale flags are cleared below, and fresh turns clear the interrupt flag at
-    # entry. This keeps a stale/missing thread handle from making Stop a no-op.
-    run_thread = session.get("_run_thread")
-    run_thread_alive = run_thread is not None and run_thread.is_alive()
-    should_interrupt = bool(session.get("running"))
-    if should_interrupt and hasattr(session["agent"], "interrupt"):
-        session["agent"].interrupt()
+    sid = params.get("session_id", "")
     with session["history_lock"]:
-        session["_turn_cancel_requested"] = True
-        session["queued_prompt"] = None
-    if not run_thread_alive:
-        with session["history_lock"]:
-            if session.get("running"):
-                session["running"] = False
-                _clear_inflight_turn(session)
-
+        old_agent = _detach_running_agent_locked(session, "desktop session.interrupt")
+    _quiesce_abandoned_agent(old_agent, "desktop session.interrupt")
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,
     # watchers) are intentionally left running — kill those individually with the
@@ -9632,13 +9752,15 @@ def _(rid, params: dict) -> dict:
     # _clear_pending() would collaterally cancel clarify/sudo/secret
     # prompts on unrelated sessions sharing the same tui_gateway
     # process, silently resolving them to empty strings.
-    _clear_pending(params.get("session_id", ""))
+    _clear_pending(sid)
     try:
         from tools.approval import resolve_gateway_approval
 
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
     except Exception:
         pass
+    _start_agent_build(sid, session)
+    _emit("session.info", sid, _session_info(session.get("agent"), session))
     return _ok(rid, {"status": "interrupted"})
 
 
@@ -9960,6 +10082,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     # Re-bind to the current client transport for this request. This keeps
@@ -9967,10 +10090,14 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
+    stale_agent = None
     while True:
         busy_transport = None
         with session["history_lock"]:
             if session.get("running"):
+                if _running_turn_is_stale(session):
+                    stale_agent = _detach_running_agent_locked(session, "stale desktop turn")
+                    break
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
                 # provider interrupt itself must happen after this lock is
@@ -10015,10 +10142,10 @@ def _(rid, params: dict) -> dict:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
-        session["running"] = True
-        session["_turn_cancel_requested"] = False
-        session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        submit_generation = _begin_session_run_locked(session, text)
+
+    if stale_agent is not None:
+        _quiesce_abandoned_agent(stale_agent, "stale desktop turn")
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
@@ -10039,19 +10166,22 @@ def _(rid, params: dict) -> dict:
 
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
+        with session["history_lock"]:
+            current = _run_current_locked(session, submit_generation)
+        if not current:
+            return
         if err:
-            _emit(
-                "error",
-                sid,
-                {
-                    "message": (err.get("error") or {}).get(
-                        "message", "agent initialization failed"
-                    )
-                },
+            message = (err.get("error") or {}).get(
+                "message", "agent initialization failed"
             )
             with session["history_lock"]:
+                if not _run_current_locked(session, submit_generation):
+                    return
                 session["running"] = False
+                session["run_started_at"] = None
+                session["run_last_activity"] = None
                 _clear_inflight_turn(session)
+            _emit("error", sid, {"message": message})
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
@@ -10313,7 +10443,7 @@ def _notification_poller_loop(
                 process_registry.completion_queue.put(evt)
                 _requeued = True
             else:
-                session["running"] = True
+                _begin_session_run_locked(session, text)
         if _requeued:
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
@@ -10397,7 +10527,7 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
-            session["running"] = True
+            _begin_session_run_locked(session, text)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -10554,6 +10684,7 @@ def _run_prompt_submit(
         session["attached_images"] = []
         if not isinstance(session.get("inflight_turn"), dict):
             _start_inflight_turn(session, text)
+        generation = _run_generation(session)
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -10713,6 +10844,9 @@ def _run_prompt_submit(
 
             def _stream(delta):
                 with session["history_lock"]:
+                    if not _run_current_locked(session, generation):
+                        return
+                    _mark_run_activity_locked(session)
                     _append_inflight_delta(session, delta)
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
@@ -10810,11 +10944,18 @@ def _run_prompt_submit(
                 else:
                     session["model_override"] = _restore
 
+            with session["history_lock"]:
+                if not _run_current_locked(session, generation):
+                    return
+                _mark_run_activity_locked(session)
+
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
                     with session["history_lock"]:
+                        if not _run_current_locked(session, generation):
+                            return
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
                             session["history"] = result["messages"]
@@ -10892,6 +11033,8 @@ def _run_prompt_submit(
             if rendered:
                 payload["rendered"] = rendered
             with session["history_lock"]:
+                if not _run_current_locked(session, generation):
+                    return
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
 
@@ -11054,7 +11197,10 @@ def _run_prompt_submit(
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
-            _emit("error", sid, {"message": str(e)})
+            with session["history_lock"]:
+                current = _run_current_locked(session, generation)
+            if current:
+                _emit("error", sid, {"message": str(e)})
         finally:
             if tts_queue is not None:
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
@@ -11077,11 +11223,17 @@ def _run_prompt_submit(
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
+            emit_info = False
             with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-                _clear_inflight_turn(session)
-            _emit("session.info", sid, _session_info(agent, session))
+                if _run_current_locked(session, generation):
+                    session["running"] = False
+                    session["last_active"] = time.time()
+                    session["run_started_at"] = None
+                    session["run_last_activity"] = None
+                    _clear_inflight_turn(session)
+                    emit_info = True
+            if emit_info:
+                _emit("session.info", sid, _session_info(agent, session))
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -11095,13 +11247,16 @@ def _run_prompt_submit(
         # guard. A real user prompt that races us wins because
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
+        with session["history_lock"]:
+            if not _run_current_locked(session, generation):
+                return
         if goal_followup:
             with session["history_lock"]:
                 if session.get("running"):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
-                session["running"] = True
+                _begin_session_run_locked(session, goal_followup)
             try:
                 _emit("message.start", sid)
                 _run_prompt_submit(rid, sid, session, goal_followup)
@@ -11141,7 +11296,7 @@ def _run_prompt_submit(
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
-                    session["running"] = True
+                    _begin_session_run_locked(session, synth)
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )

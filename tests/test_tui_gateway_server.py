@@ -7342,6 +7342,197 @@ def test_rollback_restore_rejects_full_history_while_running(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_session_interrupt_force_releases_stuck_desktop_turn(monkeypatch):
+    """session.interrupt must unlock even if the worker thread is hung."""
+
+    class _Agent:
+        def __init__(self):
+            self._session_db = object()
+            self.tool_progress_callback = object()
+            self.interrupt_reason = None
+
+        def interrupt(self, reason=None):
+            self.interrupt_reason = reason
+
+    class _Worker:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    agent = _Agent()
+    worker = _Worker()
+    server._sessions["sid"] = _session(
+        agent=agent,
+        running=True,
+        run_generation=1,
+        run_started_at=1.0,
+        run_last_activity=1.0,
+        inflight_turn={"text": "stuck"},
+        slash_worker=worker,
+    )
+    events: list[tuple] = []
+    try:
+        monkeypatch.setattr(server, "_emit", lambda *a: events.append(a))
+        monkeypatch.setattr(
+            server,
+            "_start_agent_build",
+            lambda _sid, session: session.__setitem__("build_requested", True),
+        )
+
+        resp = server.handle_request(
+            {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+
+        assert resp["result"]["status"] == "interrupted"
+        session = server._sessions["sid"]
+        assert session["running"] is False
+        assert session["inflight_turn"] is None
+        assert session["agent"] is None
+        assert session["agent_ready"].is_set() is False
+        assert session["run_generation"] == 2
+        assert session["build_requested"] is True
+        assert worker.closed is True
+        assert agent.interrupt_reason == "desktop session.interrupt"
+        assert agent._session_db is None
+        assert agent.tool_progress_callback is None
+        assert any(evt[0] == "session.info" and evt[2]["running"] is False for evt in events)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_recovers_stale_busy_turn(monkeypatch):
+    """A stale running flag should not leave desktop prompt.submit permanently busy."""
+
+    class _OldAgent:
+        def __init__(self):
+            self._session_db = object()
+            self.interrupt_reason = None
+
+        def interrupt(self, reason=None):
+            self.interrupt_reason = reason
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 999}
+
+    class _NewAgent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            assert prompt == "fresh"
+            return {
+                "final_response": "fresh reply",
+                "messages": [{"role": "assistant", "content": "fresh reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    old_agent = _OldAgent()
+    new_agent = _NewAgent()
+    server._sessions["sid"] = _session(
+        agent=old_agent,
+        running=True,
+        run_generation=1,
+        run_started_at=1.0,
+        run_last_activity=1.0,
+        inflight_turn={"text": "old"},
+    )
+    emits: list[tuple] = []
+
+    def _build(_sid, session):
+        session["agent"] = new_agent
+        session["agent_ready"].set()
+
+    try:
+        monkeypatch.setattr(server, "_TUI_TURN_IDLE_TIMEOUT_S", 10)
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_start_agent_build", _build)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+
+        resp = server.handle_request(
+            {"id": "1", "method": "prompt.submit", "params": {"session_id": "sid", "text": "fresh"}}
+        )
+
+        assert resp["result"]["status"] == "streaming"
+        session = server._sessions["sid"]
+        assert session["running"] is False
+        assert session["history"] == [{"role": "assistant", "content": "fresh reply"}]
+        assert old_agent.interrupt_reason == "stale desktop turn"
+        assert old_agent._session_db is None
+        complete = [evt for evt in emits if evt[0] == "message.complete"]
+        assert len(complete) == 1
+        assert complete[0][2]["text"] == "fresh reply"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_abandoned_turn_cannot_clear_new_run_or_emit_late_completion(monkeypatch):
+    """Late output from a force-interrupted worker must not poison the new turn."""
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingAgent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            started.set()
+            assert release.wait(2), "test timed out waiting to release old run"
+            return {
+                "final_response": "late reply",
+                "messages": [{"role": "assistant", "content": "late reply"}],
+            }
+
+    real_thread = threading.Thread
+    threads: list[threading.Thread] = []
+
+    def _capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    server._sessions["sid"] = _session(
+        agent=_BlockingAgent(),
+        running=True,
+        run_generation=1,
+        inflight_turn={"text": "old"},
+    )
+    emits: list[tuple] = []
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _capture_thread)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+
+        server._run_prompt_submit("r1", "sid", server._sessions["sid"], "old")
+        assert started.wait(2), "old run did not start"
+
+        session = server._sessions["sid"]
+        with session["history_lock"]:
+            server._detach_running_agent_locked(session, "test interrupt")
+            server._begin_session_run_locked(session, "new")
+
+        release.set()
+        for thread in threads:
+            thread.join(2)
+
+        assert session["running"] is True
+        assert session["history"] == []
+        assert not [evt for evt in emits if evt[0] == "message.complete" and evt[2].get("text") == "late reply"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
     """Fix for TUI silent-drop #2: the defensive backstop at prompt.submit
     must attach a 'warning' to message.complete when history was
