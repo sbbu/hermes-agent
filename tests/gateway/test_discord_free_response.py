@@ -1162,12 +1162,12 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatch):
-    """A plain (non-reply) message in a free-response channel still skips backfill.
+async def test_discord_non_reply_free_channel_fetches_plain_backfill(adapter, monkeypatch):
+    """A plain (non-reply) message in a free-response channel gets recent context.
 
-    Guards against the reply gate accidentally widening to every free-channel
-    message — only replies (and the existing mention-gap / thread cases) should
-    hydrate context.
+    Local patch invariant: Jeremy's Discord channels are no-mention/free-response,
+    so ordinary messages still need channel_context. The reply-specific path must
+    not accidentally pass a reply anchor for plain messages.
     """
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
@@ -1180,5 +1180,10 @@ async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatc
 
     await adapter._handle_message(message)
 
-    adapter._fetch_channel_context.assert_not_awaited()
+    adapter._fetch_channel_context.assert_awaited_once()
+    call = adapter._fetch_channel_context.await_args
+    assert call is not None
+    assert call.kwargs.get("reply_target") is None
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context == "[Recent channel messages]\n[Alice] noise"
 
