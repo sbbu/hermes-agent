@@ -14,6 +14,8 @@ Does NOT spawn a real Chromium — we mock ``subprocess.Popen`` where needed.
 
 from __future__ import annotations
 
+import argparse
+import builtins
 import json
 import os
 import signal
@@ -31,9 +33,36 @@ def _isolate_home(tmp_path, monkeypatch):
     yield hermes_home
 
 
+def test_meet_node_fallback_reports_import_error(capsys, monkeypatch):
+    """Top-level ``hermes meet node`` fallback must survive import failures."""
+    from plugins.google_meet import cli as meet_cli
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        missing_node_cli = (
+            name == "plugins.google_meet.node.cli"
+            and "register_cli" in (fromlist or ())
+        )
+        if missing_node_cli:
+            raise RuntimeError("simulated missing optional node module")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    parser = argparse.ArgumentParser(prog="hermes meet")
+    meet_cli.register_cli(parser)
+
+    args = parser.parse_args(["node"])
+    rc = args.func(args)
+
+    assert rc == 1
+    assert "simulated missing optional node module" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # URL safety gate
 # ---------------------------------------------------------------------------
+
 
 def test_is_safe_meet_url_accepts_standard_meet_codes():
     from plugins.google_meet.meet_bot import _is_safe_meet_url
