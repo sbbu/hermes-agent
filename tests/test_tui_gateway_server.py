@@ -4750,6 +4750,32 @@ def test_session_interrupt_force_releases_stuck_desktop_turn(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_quiesce_abandoned_agent_detaches_all_tui_callbacks():
+    """Recovered desktop turns must not let the abandoned worker keep emitting UI events."""
+
+    callback_attrs = set(server._ABANDONED_AGENT_CALLBACK_ATTRS)
+    assert set(server._agent_cbs("sid")) <= callback_attrs
+
+    class _Agent:
+        def __init__(self):
+            self._session_db = object()
+            self.interrupt_reason = None
+            for attr in callback_attrs:
+                setattr(self, attr, lambda *args, **kwargs: None)
+
+        def interrupt(self, reason=None):
+            self.interrupt_reason = reason
+
+    agent = _Agent()
+
+    server._quiesce_abandoned_agent(agent, "stale desktop turn")
+
+    assert agent.interrupt_reason == "stale desktop turn"
+    assert agent._session_db is None
+    for attr in callback_attrs:
+        assert getattr(agent, attr) is None, f"{attr} still attached"
+
+
 def test_prompt_submit_recovers_stale_busy_turn(monkeypatch):
     """A stale running flag should not leave desktop prompt.submit permanently busy."""
 
