@@ -1856,6 +1856,29 @@ def _running_turn_is_stale(session: dict, now: float | None = None) -> bool:
     )
 
 
+_ABANDONED_AGENT_CALLBACK_ATTRS = (
+    "_session_db",
+    "tool_progress_callback",
+    "tool_start_callback",
+    "tool_complete_callback",
+    "tool_gen_callback",
+    "thinking_callback",
+    "reaction_callback",
+    "reasoning_callback",
+    "clarify_callback",
+    "read_terminal_callback",
+    "step_callback",
+    "stream_delta_callback",
+    "interim_assistant_callback",
+    "status_callback",
+    "notice_callback",
+    "notice_clear_callback",
+    "background_review_callback",
+    "event_callback",
+    "_stream_callback",
+)
+
+
 def _quiesce_abandoned_agent(agent: Any, reason: str) -> None:
     """Stop a detached turn from writing/streaming into a recovered session."""
     if agent is None:
@@ -1871,18 +1894,7 @@ def _quiesce_abandoned_agent(agent: Any, reason: str) -> None:
     # The old worker thread may be blocked inside an API call and unwind later.
     # Detach persistence + callbacks so late output cannot leak into the fresh
     # desktop session after we have unlocked it.
-    for attr in (
-        "_session_db",
-        "tool_progress_callback",
-        "tool_start_callback",
-        "tool_complete_callback",
-        "thinking_callback",
-        "status_callback",
-        "step_callback",
-        "background_review_callback",
-        "event_callback",
-        "_stream_callback",
-    ):
+    for attr in _ABANDONED_AGENT_CALLBACK_ATTRS:
         try:
             setattr(agent, attr, None)
         except Exception:
