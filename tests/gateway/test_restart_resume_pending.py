@@ -593,21 +593,23 @@ class TestResumePendingSystemNote:
         assert result == "start a new task"
 
     def test_fresh_resume_mark_fires_despite_stale_transcript(self):
-        """Regression: the recovery note must fire when the restart
-        watchdog just stamped the session, even if the last persisted
-        transcript row is far older than the freshness window.
+        """Recovery fires from the fresh restart mark even if transcript is stale.
 
-        This is the exact gap that produced the blank-turn symptom: an
-        active thread returned to after >1h of silence has a stale
-        transcript clock, but the interruption itself (last_resume_marked_at)
-        is seconds old. The two freshness signals must agree.
+        The local drain patch still requires concrete unfinished gateway work;
+        this guards the upstream freshness fix on that real resumable shape.
         """
         entry = self._pending_entry()
         entry.last_resume_marked_at = datetime.now()  # interrupted just now
 
         history = [
-            {"role": "assistant", "content": "older context",
-             "timestamp": time.time() - 3600},  # transcript clock stale
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
+                ],
+                "timestamp": time.time() - 3600,  # transcript clock stale
+            },
         ]
         result = _simulate_note_injection(
             history=history,
