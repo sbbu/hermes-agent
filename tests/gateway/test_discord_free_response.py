@@ -228,6 +228,10 @@ async def test_discord_free_response_in_server_channels_includes_recent_channel_
     """
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    # Keep this focused on channel-context backfill; upstream now skips agent
+    # invocation when auto-thread creation fails, and the fake channel has no
+    # real thread/send implementation.
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
     channel = FakeHistoryChannel(
         [make_history_message(author=human, content="we were talking about invoices", msg_id=122)],
