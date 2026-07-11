@@ -17106,15 +17106,21 @@ def _(rid, params: dict) -> dict:
     except ImportError:
         return _err(rid, 5001, "shell.exec unavailable: approval safety module not importable")
     try:
+        from agent.redact import redact_sensitive_text
+        from tools.environments.local import _sanitize_subprocess_env
+
+        sanitized_env = _sanitize_subprocess_env(os.environ.copy())
         r = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, env=sanitized_env,
         )
+        stdout = redact_sensitive_text(r.stdout)
+        stderr = redact_sensitive_text(r.stderr)
         return _ok(
             rid,
             {
-                "stdout": r.stdout[-4000:],
-                "stderr": r.stderr[-2000:],
+                "stdout": stdout[-4000:],
+                "stderr": stderr[-2000:],
                 "code": r.returncode,
             },
         )
