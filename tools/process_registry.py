@@ -41,7 +41,12 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell,
+    _resolve_safe_cwd,
+    _safe_getcwd,
+    _sanitize_subprocess_env,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -710,7 +715,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
-            cwd=_resolve_safe_cwd(cwd or os.getcwd()),
+            cwd=_resolve_safe_cwd(cwd or _safe_getcwd()),
             started_at=time.time(),
         )
 

@@ -944,7 +944,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
 
 
 # Environment classes now live in tools/environments/
-from tools.environments.local import LocalEnvironment as _LocalEnvironment
+from tools.environments.local import LocalEnvironment as _LocalEnvironment, _safe_getcwd
 from tools.environments.singularity import SingularityEnvironment as _SingularityEnvironment
 from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
@@ -1243,20 +1243,6 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
             f"Invalid value for {name}: {raw!r} (expected {type_label}). "
             f"Check ~/.hermes/.env or environment variables."
         )
-
-
-def _safe_getcwd() -> str:
-    """Return the current working directory, tolerating a deleted CWD.
-
-    ``os.getcwd()`` raises FileNotFoundError when the process's working
-    directory has been removed out from under it (e.g. a scratch workspace
-    that was cleaned up mid-session). Fall back to TERMINAL_CWD, then the
-    user's home directory, so terminal setup never crashes on a stale CWD.
-    """
-    try:
-        return os.getcwd()
-    except FileNotFoundError:
-        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
 # Path prefixes that identify a *host* working directory which cannot exist

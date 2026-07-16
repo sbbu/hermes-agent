@@ -214,6 +214,29 @@ class TestResolveChildCwd(unittest.TestCase):
         with patch.dict(os.environ, {"TERMINAL_CWD": "/does/not/exist/anywhere"}):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), os.getcwd())
 
+    def test_project_relative_terminal_cwd_falls_back_to_getcwd(self):
+        with patch.dict(os.environ, {"TERMINAL_CWD": "auto"}):
+            self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), os.getcwd())
+
+    def test_project_recovers_when_process_and_terminal_cwd_were_deleted(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as parent:
+            deleted = os.path.join(parent, "deleted", "workspace")
+            with (
+                patch.dict(os.environ, {"TERMINAL_CWD": deleted}),
+                patch("tools.code_execution_tool.os.getcwd", side_effect=FileNotFoundError),
+            ):
+                self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), parent)
+
+    def test_project_recovers_deleted_terminal_cwd_before_process_cwd(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as parent:
+            deleted = os.path.join(parent, "deleted", "workspace")
+            with patch.dict(os.environ, {"TERMINAL_CWD": deleted}):
+                self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), parent)
+
     def test_project_expands_tilde(self):
         import pathlib
         home = str(pathlib.Path.home())

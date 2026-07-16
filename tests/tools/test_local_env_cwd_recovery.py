@@ -52,6 +52,20 @@ class TestResolveSafeCwd:
         assert _resolve_safe_cwd("/no/such/deep/dir") == sep
 
 
+def test_local_environment_init_recovers_from_deleted_process_cwd(tmp_path, monkeypatch):
+    deleted_cwd_path = tmp_path / "deleted" / "workspace"
+
+    def deleted_cwd():
+        raise FileNotFoundError("process cwd was deleted")
+
+    monkeypatch.setattr(os, "getcwd", deleted_cwd)
+    monkeypatch.setenv("TERMINAL_CWD", str(deleted_cwd_path))
+    with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
+        env = LocalEnvironment()
+
+    assert env.cwd == str(tmp_path)
+
+
 def _fake_interrupt():
     return threading.Event()
 
