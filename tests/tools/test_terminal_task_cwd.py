@@ -311,25 +311,62 @@ def test_same_session_recorded_cwd_survives_across_commands(monkeypatch):
     assert calls[1] == ("pwd", {"timeout": 60, "cwd": "/workspace/deep", "bounded_capture": True})
 
 
-def test_safe_getcwd_returns_real_cwd(monkeypatch):
-    monkeypatch.setattr(terminal_tool.os, "getcwd", lambda: "/home/user/project")
-    assert terminal_tool._safe_getcwd() == "/home/user/project"
+def test_safe_getcwd_returns_real_cwd(monkeypatch, tmp_path):
+    monkeypatch.setattr(terminal_tool.os, "getcwd", lambda: str(tmp_path))
+    assert terminal_tool._safe_getcwd() == str(tmp_path)
 
 
-def test_safe_getcwd_falls_back_to_terminal_cwd_when_cwd_deleted(monkeypatch):
+def test_safe_getcwd_falls_back_to_terminal_cwd_when_cwd_deleted(monkeypatch, tmp_path):
     def _boom():
         raise FileNotFoundError("[Errno 2] No such file or directory")
 
     monkeypatch.setattr(terminal_tool.os, "getcwd", _boom)
-    monkeypatch.setenv("TERMINAL_CWD", "/srv/work")
-    assert terminal_tool._safe_getcwd() == "/srv/work"
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    assert terminal_tool._safe_getcwd() == str(tmp_path)
 
 
-def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
+def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch, tmp_path):
     def _boom():
         raise FileNotFoundError()
 
     monkeypatch.setattr(terminal_tool.os, "getcwd", _boom)
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
-    monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: "/home/me")
-    assert terminal_tool._safe_getcwd() == "/home/me"
+    monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: str(tmp_path))
+    assert terminal_tool._safe_getcwd() == str(tmp_path)
+
+
+def test_safe_getcwd_ignores_remote_terminal_cwd(monkeypatch, tmp_path):
+    def _boom():
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(terminal_tool.os, "getcwd", _boom)
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_CWD", "/remote-only/workspace")
+    monkeypatch.setattr(
+        terminal_tool.os.path,
+        "expanduser",
+        lambda p: str(tmp_path) if p == "~" else p,
+    )
+    assert terminal_tool._safe_getcwd() == str(tmp_path)
+
+
+def test_safe_getcwd_ignores_relative_preferred_cwd(monkeypatch, tmp_path):
+    monkeypatch.setattr(terminal_tool.os, "getcwd", lambda: str(tmp_path))
+
+    assert terminal_tool._safe_getcwd("auto") == str(tmp_path)
+
+
+def test_safe_getcwd_ignores_relative_env_cwd_when_process_cwd_deleted(monkeypatch, tmp_path):
+    def _boom():
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(terminal_tool.os, "getcwd", _boom)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", ".")
+    monkeypatch.setattr(
+        terminal_tool.os.path,
+        "expanduser",
+        lambda p: str(tmp_path) if p == "~" else p,
+    )
+
+    assert terminal_tool._safe_getcwd() == str(tmp_path)

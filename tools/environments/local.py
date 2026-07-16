@@ -61,7 +61,8 @@ def _resolve_local_initial_cwd(cwd: str) -> str:
     values once, up front, so both ``subprocess.Popen(cwd=...)`` and the
     in-shell ``cd`` use the same absolute directory.
     """
-    expanded = os.path.expanduser(cwd) if cwd else os.getcwd()
+    current = _safe_getcwd()
+    expanded = os.path.expanduser(cwd) if cwd else current
     if _IS_WINDOWS:
         expanded = _msys_to_windows_path(expanded)
         # Use the Windows-aware check explicitly: when _IS_WINDOWS is
@@ -73,8 +74,7 @@ def _resolve_local_initial_cwd(cwd: str) -> str:
     if os.path.isabs(expanded):
         return expanded
 
-    candidate = os.path.abspath(expanded)
-    current = os.getcwd()
+    candidate = os.path.abspath(os.path.join(current, expanded))
 
     # Common recovery for config values like ``hermes-agent`` when Hermes was
     # launched from that directory already.  ``os.path.abspath`` would point at
@@ -149,6 +149,30 @@ def _cwd_usable(path: str) -> bool:
     X_OK up front lets the caller fall back instead.
     """
     return os.path.isdir(path) and os.access(path, os.X_OK)
+
+
+def _safe_getcwd(preferred: str | None = None) -> str:
+    """Return an existing host cwd, tolerating a deleted process directory.
+
+    ``TERMINAL_CWD`` may name a path inside SSH/container backends, so only use
+    it implicitly for the local backend. Callers may pass a known host-scoped
+    ``preferred`` path when it should take precedence over the process cwd.
+    """
+    preferred = str(preferred or "").strip()
+    expanded_preferred = os.path.expanduser(preferred) if preferred else ""
+    preferred_is_absolute = bool(expanded_preferred and os.path.isabs(expanded_preferred))
+    if preferred_is_absolute:
+        return _resolve_safe_cwd(expanded_preferred)
+    try:
+        return os.getcwd()
+    except OSError:
+        backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+        cwd = os.getenv("TERMINAL_CWD") if backend == "local" else None
+        cwd = str(cwd or "").strip()
+        if cwd and not os.path.isabs(os.path.expanduser(cwd)):
+            cwd = None
+        cwd = cwd or os.path.expanduser("~")
+    return _resolve_safe_cwd(os.path.expanduser(cwd))
 
 
 def _resolve_safe_cwd(cwd: str) -> str:

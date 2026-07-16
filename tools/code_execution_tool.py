@@ -1823,9 +1823,9 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
       (written after every completed terminal command), then the raw
       per-session cwd override registered via ``session.cwd.set`` /
       ``register_task_env_overrides``, then the session's TERMINAL_CWD
-      (same as the terminal tool), or ``os.getcwd()`` if none points at a
-      real dir. Falls back to the staging tmpdir as a last resort so we
-      never invoke Popen with a nonexistent cwd.
+      (same as the terminal tool), or a safe host cwd if none points at a
+      real dir. Falls back to the staging tmpdir as a last resort so we never
+      invoke Popen with a nonexistent or deleted cwd.
 
     This mirrors the resolution ladder file tools and the terminal use
     (record → registered override → TERMINAL_CWD), so all file-writing
@@ -1852,12 +1852,19 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             session_cwd = None
         if session_cwd and os.path.isdir(session_cwd):
             return session_cwd
+    from tools.environments.local import _safe_getcwd
+
+    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
     raw = os.environ.get("TERMINAL_CWD", "").strip()
-    if raw:
+    if raw and backend == "local":
         expanded = os.path.expanduser(raw)
-        if os.path.isdir(expanded):
+        if os.path.isabs(expanded) and os.path.isdir(expanded):
             return expanded
-    here = os.getcwd()
+        if os.path.isabs(expanded):
+            recovered = _safe_getcwd(expanded)
+            if os.path.dirname(recovered) != recovered:
+                return recovered
+    here = _safe_getcwd()
     if os.path.isdir(here):
         return here
     return staging_dir
