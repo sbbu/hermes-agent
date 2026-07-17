@@ -95,12 +95,13 @@ interface SessionActionsOptions {
   busyRef: MutableRefObject<boolean>
   creatingSessionRef: MutableRefObject<boolean>
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
+  getRoutedStoredSessionId: () => string | null
   getRouteToken: () => string
-  getRoutedStoredSessionId: () => null | string
   navigate: NavigateFunction
   onFreshDraftRouteIntent?: () => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   resetViewSync: () => void
+  resolveStoredSessionId: (storedSessionId: string) => string
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
@@ -199,12 +200,13 @@ export function useSessionActions({
   busyRef,
   creatingSessionRef,
   ensureSessionState,
-  getRouteToken,
   getRoutedStoredSessionId,
+  getRouteToken,
   navigate,
   onFreshDraftRouteIntent,
   requestGateway,
   resetViewSync,
+  resolveStoredSessionId,
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId,
   selectedStoredSessionIdRef,
@@ -216,11 +218,12 @@ export function useSessionActions({
   const copy = t.desktop
   const resumeRequestRef = useRef(0)
 
-  // Follow auto-compression's stored-id rotation only while the exact runtime,
-  // selection, and route intent still belong to the rotating conversation.
-  // The previous implementation carried only the next stored id and navigated
-  // unconditionally; a fast A → B → C switch could therefore be overwritten
-  // by A's delayed session.info event and visibly jump back to A.
+  // Follow auto-compression's stored-id rotation. When the active session's
+  // stored id changes (compression ends the SessionDB session and forks a
+  // continuation), re-anchor the selection — and the URL when it still shows
+  // that session — so the next send doesn't hit a stale stored→runtime mapping
+  // and trigger a full thread reload. replace: true because it's the same
+  // conversation, not a new history entry.
   const storedIdRotation = useStore($activeSessionStoredIdRotation)
 
   useEffect(() => {
@@ -228,18 +231,21 @@ export function useSessionActions({
       return
     }
 
-    // Consume the event even when it is stale. Rotation is an edge, not durable
-    // state; replaying it after a later remount/selection would steal focus.
-    setActiveSessionStoredIdRotation(current => (current === storedIdRotation ? null : current))
+    const consumeRotation = () =>
+      setActiveSessionStoredIdRotation(current => (current === storedIdRotation ? null : current))
 
+    // Effects run after paint. If the user selected another conversation (or a
+    // fresh draft) after session.info emitted this rotation, the event is stale:
+    // never overwrite the newer intent or delete/replace anything it owns.
     const selectedStoredSessionId = selectedStoredSessionIdRef.current
-    const routedStoredSessionId = getRoutedStoredSessionId()
 
     if (
       activeSessionIdRef.current !== storedIdRotation.runtimeSessionId ||
-      selectedStoredSessionId !== storedIdRotation.previousStoredSessionId ||
-      (routedStoredSessionId !== null && routedStoredSessionId !== storedIdRotation.previousStoredSessionId)
+      !selectedStoredSessionId ||
+      resolveStoredSessionId(selectedStoredSessionId) !== storedIdRotation.nextStoredSessionId
     ) {
+      consumeRotation()
+
       return
     }
 
@@ -267,13 +273,27 @@ export function useSessionActions({
     setSelectedStoredSessionId(nextId)
     selectedStoredSessionIdRef.current = nextId
 
-    // A route overlay/page has no routed session id, but the underlying selected
-    // chat still needs to follow the continuation. Update that selection in
-    // place without navigating out of the surface the user deliberately opened.
-    if (routedStoredSessionId === previousId) {
+    // The user may be reading Settings, Skills, Cron, or another non-chat
+    // surface while the selected session keeps running underneath it. Update
+    // the remembered selection, but only replace the URL when that old session
+    // is still the route on screen — compression must not eject the user from
+    // an unrelated surface. use-route-resume canonicalizes any stashed/history
+    // route that later returns to the old id.
+    const routedStoredSessionId = getRoutedStoredSessionId()
+
+    if (routedStoredSessionId && resolveStoredSessionId(routedStoredSessionId) === nextId) {
       navigate(sessionRoute(nextId), { replace: true })
     }
-  }, [activeSessionIdRef, getRoutedStoredSessionId, navigate, selectedStoredSessionIdRef, storedIdRotation])
+
+    consumeRotation()
+  }, [
+    activeSessionIdRef,
+    getRoutedStoredSessionId,
+    navigate,
+    resolveStoredSessionId,
+    selectedStoredSessionIdRef,
+    storedIdRotation
+  ])
 
   const startFreshSessionDraft = useCallback(
     (options: boolean | FreshSessionDraftOptions = false) => {

@@ -388,3 +388,42 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
     expect(cache.getRuntimeIdForStoredSession('stored-A')).toBeNull()
   })
 })
+
+describe('useSessionStateCache — stored-id rotation aliases', () => {
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setActiveSessionStoredIdRotation(null)
+  })
+
+  it('removes stale reverse mappings and resolves every old compression tip', () => {
+    let cache!: Cache
+    setActiveSessionId('runtime-A')
+    render(
+      <Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="stored-A" />
+    )
+
+    act(() => {
+      cache.updateSessionState('runtime-A', state => state, 'stored-A')
+      cache.updateSessionState('runtime-A', state => state, 'stored-B')
+    })
+
+    expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
+    expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-B')).toBe('runtime-A')
+    expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-B')
+    expect($activeSessionStoredIdRotation.get()).toEqual({
+      nextStoredSessionId: 'stored-B',
+      previousStoredSessionId: 'stored-A',
+      runtimeSessionId: 'runtime-A'
+    })
+
+    act(() => {
+      cache.updateSessionState('runtime-A', state => state, 'stored-C')
+    })
+
+    expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-B')).toBe(false)
+    expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-C')).toBe('runtime-A')
+    expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-C')
+    expect(cache.resolveStoredSessionId('stored-B')).toBe('stored-C')
+  })
+})

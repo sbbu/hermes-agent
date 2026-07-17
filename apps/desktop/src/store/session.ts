@@ -308,11 +308,9 @@ export interface ActiveSessionStoredIdRotation {
   runtimeSessionId: string
 }
 
-// One-shot event for when auto-compression rotates the active runtime's stored
-// id. Carrying the runtime + previous id is load-bearing: a bare next id cannot
-// tell whether the user has already navigated away while React is waiting to
-// run the route-following effect, which lets a background session steal the
-// foreground route.
+// Edge-triggered handoff for an active session's stored-id rotation. Carry
+// source identity as well as the new id so a delayed React effect cannot apply
+// session A's compression event after the user has already selected session B.
 export const $activeSessionStoredIdRotation = atom<ActiveSessionStoredIdRotation | null>(null)
 export const $messages = atom<ChatMessage[]>([])
 
