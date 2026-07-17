@@ -55,6 +55,7 @@ export function useSessionStateCache({
   const selectedStoredSessionIdRef = useRef<string | null>(null)
   const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
   const runtimeIdByStoredSessionIdRef = useRef(new Map<string, string>())
+  const storedSessionIdRedirectsRef = useRef(new Map<string, string>())
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
   // Runtime id whose transcript currently occupies `$messages` — lets the
@@ -73,45 +74,77 @@ export function useSessionStateCache({
     selectedStoredSessionIdRef.current = selectedStoredSessionId
   }, [selectedStoredSessionId])
 
-  const ensureSessionState = useCallback((sessionId: string, storedSessionId?: string | null) => {
-    const existing = sessionStateByRuntimeIdRef.current.get(sessionId)
+  const resolveStoredSessionId = useCallback((storedSessionId: string): string => {
+    const visited: string[] = []
+    let current = storedSessionId
 
-    if (existing) {
-      if (storedSessionId !== undefined && storedSessionId !== existing.storedSessionId) {
-        // Stored id changed (e.g. auto-compression rotated it). Create a NEW
-        // state object rather than mutating in place — updateSessionState needs
-        // the PREVIOUS state to detect transitions (busy→idle, id rotation).
-        const updated = { ...existing, storedSessionId }
+    while (!visited.includes(current)) {
+      visited.push(current)
+      const next = storedSessionIdRedirectsRef.current.get(current)
 
-        sessionStateByRuntimeIdRef.current.set(sessionId, updated)
-
-        // Drop the obsolete stored→runtime reverse mapping as soon as the id
-        // rotates (e.g. auto-compression forks a continuation). Leaving the
-        // stale key lets getRuntimeIdForStoredSession resolve the old stored id
-        // to this runtime, which the compression route-follow logic relies on
-        // being absent. The rotation signal itself is emitted centrally from
-        // handleTransition (session-states.ts) off the published diff.
-        if (existing.storedSessionId && existing.storedSessionId !== storedSessionId) {
-          runtimeIdByStoredSessionIdRef.current.delete(existing.storedSessionId)
-        }
-
-        if (storedSessionId) {
-          runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
-        }
+      if (!next || next === current) {
+        break
       }
 
-      return sessionStateByRuntimeIdRef.current.get(sessionId)!
+      current = next
     }
 
-    const created = createClientSessionState(storedSessionId ?? null)
-    sessionStateByRuntimeIdRef.current.set(sessionId, created)
-
-    if (storedSessionId) {
-      runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+    // Compression can rotate more than once. Collapse every traversed alias to
+    // the latest known tip so browser-back/overlay returns stay O(1) afterward.
+    for (const alias of visited) {
+      if (alias !== current) {
+        storedSessionIdRedirectsRef.current.set(alias, current)
+      }
     }
 
-    return created
+    return current
   }, [])
+
+  const ensureSessionState = useCallback(
+    (sessionId: string, storedSessionId?: string | null) => {
+      const existing = sessionStateByRuntimeIdRef.current.get(sessionId)
+
+      if (existing) {
+        if (storedSessionId !== undefined && storedSessionId !== existing.storedSessionId) {
+          const previousStoredSessionId = existing.storedSessionId
+          // Stored id changed (e.g. auto-compression rotated it). Create a NEW
+          // state object rather than mutating in place — publishSessionState
+          // needs the previous value to detect transition side-effects.
+          const updated = { ...existing, storedSessionId }
+
+          sessionStateByRuntimeIdRef.current.set(sessionId, updated)
+
+          if (storedSessionId) {
+            runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+          }
+
+          if (previousStoredSessionId) {
+            // The reverse map owns only CURRENT ids. Remove the old key here,
+            // independent of which route is visible, and retain a lightweight
+            // redirect so browser Back or an overlay's stashed return path can
+            // canonicalize without cold-resuming the old compression tip.
+            runtimeIdByStoredSessionIdRef.current.delete(previousStoredSessionId)
+
+            if (storedSessionId) {
+              storedSessionIdRedirectsRef.current.set(previousStoredSessionId, resolveStoredSessionId(storedSessionId))
+            }
+          }
+        }
+
+        return sessionStateByRuntimeIdRef.current.get(sessionId)!
+      }
+
+      const created = createClientSessionState(storedSessionId ?? null)
+      sessionStateByRuntimeIdRef.current.set(sessionId, created)
+
+      if (storedSessionId) {
+        runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+      }
+
+      return created
+    },
+    [resolveStoredSessionId]
+  )
 
   const resetViewSync = useCallback(() => {
     // Drop any RAF-pending transcript stage so a backgrounded turn cannot
@@ -279,6 +312,7 @@ export function useSessionStateCache({
     ensureSessionState,
     getRuntimeIdForStoredSession,
     resetViewSync,
+    resolveStoredSessionId,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,

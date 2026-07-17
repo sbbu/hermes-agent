@@ -11,6 +11,8 @@ interface RouteResumeOptions {
   freshDraftReady: boolean
   gatewayState: string | undefined
   locationPathname: string
+  replaceRoutedSessionId: (sessionId: string) => void
+  resolveStoredSessionId: (sessionId: string) => string
   resumeSession: (sessionId: string, focus: boolean) => Promise<unknown>
   // Stored-session id whose most recent resume failed terminally (set by
   // useSessionActions, mirrored from $resumeFailedSessionId). While this equals
@@ -73,6 +75,8 @@ export function useRouteResume({
   freshDraftReady,
   gatewayState,
   locationPathname,
+  replaceRoutedSessionId,
+  resolveStoredSessionId,
   resumeSession,
   resumeFailedSessionId,
   resumeExhaustedSessionId,
@@ -107,6 +111,19 @@ export function useRouteResume({
     lastPathnameRef.current = locationPathname
     seenGatewayStateRef.current = true
     wasGatewayOpenRef.current = gatewayOpen
+
+    if (currentView === 'chat' && routedSessionId) {
+      const resolvedStoredSessionId = resolveStoredSessionId(routedSessionId)
+
+      if (resolvedStoredSessionId !== routedSessionId) {
+        // Browser Back and overlay close can restore a pre-compression route.
+        // Canonicalize it before the normal resume path inspects cache state;
+        // the next render sees the current id and reuses the live runtime.
+        replaceRoutedSessionId(resolvedStoredSessionId)
+
+        return
+      }
+    }
 
     if (currentView !== 'chat' || !gatewayOpen) {
       return
@@ -169,6 +186,8 @@ export function useRouteResume({
     freshDraftReady,
     gatewayState,
     locationPathname,
+    replaceRoutedSessionId,
+    resolveStoredSessionId,
     resumeSession,
     routedSessionId,
     runtimeIdByStoredSessionIdRef,

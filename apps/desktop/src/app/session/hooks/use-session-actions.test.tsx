@@ -1,6 +1,6 @@
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getSession, getSessionMessages, type SessionInfo } from '@/hermes'
@@ -108,11 +108,12 @@ function Harness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
-    getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
+    getRouteToken: () => 'token',
     navigate: navigate as never,
     requestGateway,
     resetViewSync: vi.fn(),
+    resolveStoredSessionId: storedSessionId => storedSessionId,
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
     selectedStoredSessionId: null,
     selectedStoredSessionIdRef: ref<string | null>(null),
@@ -152,6 +153,7 @@ function StoredIdRotationHarness({
     navigate: navigate as never,
     requestGateway: async () => ({}) as never,
     resetViewSync: vi.fn(),
+    resolveStoredSessionId: storedSessionId => storedSessionId,
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
     selectedStoredSessionId: selectedStoredSessionIdRef.current,
     selectedStoredSessionIdRef,
@@ -586,11 +588,12 @@ function ResumeHarness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
-    getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
+    getRouteToken: () => 'token',
     navigate: vi.fn() as never,
     requestGateway,
     resetViewSync: vi.fn(),
+    resolveStoredSessionId: storedSessionId => storedSessionId,
     runtimeIdByStoredSessionIdRef: runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>()),
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
@@ -993,11 +996,12 @@ function BranchHarness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
-    getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
+    getRouteToken: () => 'token',
     navigate: navigate as never,
     requestGateway,
     resetViewSync: vi.fn(),
+    resolveStoredSessionId: storedSessionId => storedSessionId,
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
     selectedStoredSessionId: null,
     selectedStoredSessionIdRef: ref<string | null>(null),
@@ -1397,5 +1401,145 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).toMatchObject({ cwd: '/clicked-workspace' })
+  })
+})
+
+const resolveDefaultRotationStoredSessionId = (storedSessionId: string) =>
+  storedSessionId === 'stored-old' ? 'stored-new' : storedSessionId
+
+function AliasStoredIdRotationHarness({
+  activeRuntimeSessionId = 'runtime-old',
+  navigate,
+  resolveStoredSessionId = resolveDefaultRotationStoredSessionId,
+  routedStoredSessionId,
+  selectedStoredSessionId = 'stored-old'
+}: {
+  activeRuntimeSessionId?: string
+  navigate: ReturnType<typeof vi.fn>
+  resolveStoredSessionId?: (storedSessionId: string) => string
+  routedStoredSessionId: string | null
+  selectedStoredSessionId?: string
+}) {
+  const activeSessionIdRef = useRef<string | null>(activeRuntimeSessionId)
+  const busyRef = useRef(false)
+  const creatingSessionRef = useRef(false)
+  const runtimeIdByStoredSessionIdRef = useRef(new Map([['stored-old', 'runtime-old']]))
+  const selectedStoredSessionIdRef = useRef<string | null>(selectedStoredSessionId)
+  const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
+
+  useSessionActions({
+    activeSessionId: activeRuntimeSessionId,
+    activeSessionIdRef,
+    busyRef,
+    creatingSessionRef,
+    ensureSessionState: () => ({}) as ClientSessionState,
+    getRoutedStoredSessionId: () => routedStoredSessionId,
+    getRouteToken: () => '/settings::',
+    navigate: navigate as never,
+    requestGateway: async () => ({}) as never,
+    resetViewSync: vi.fn(),
+    resolveStoredSessionId,
+    runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef,
+    sessionStateByRuntimeIdRef,
+    syncSessionStateToView: vi.fn(),
+    updateSessionState: (_sessionId, updater) => updater({} as ClientSessionState)
+  })
+
+  return null
+}
+
+describe('active session stored-id rotation', () => {
+  const rotation = {
+    nextStoredSessionId: 'stored-new',
+    previousStoredSessionId: 'stored-old',
+    runtimeSessionId: 'runtime-old'
+  }
+
+  afterEach(() => {
+    cleanup()
+    setActiveSessionStoredIdRotation(null)
+    setSelectedStoredSessionId(null)
+    vi.restoreAllMocks()
+  })
+
+  it('does not navigate away from a non-chat route', async () => {
+    const navigate = vi.fn()
+    setActiveSessionStoredIdRotation(null)
+    setSelectedStoredSessionId('stored-old')
+    render(<AliasStoredIdRotationHarness navigate={navigate} routedStoredSessionId={null} />)
+
+    act(() => {
+      setActiveSessionStoredIdRotation(rotation)
+    })
+
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect($selectedStoredSessionId.get()).toBe('stored-new')
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('replaces the route when the rotated session is still on screen', async () => {
+    const navigate = vi.fn()
+    setActiveSessionStoredIdRotation(null)
+    setSelectedStoredSessionId('stored-old')
+    render(<AliasStoredIdRotationHarness navigate={navigate} routedStoredSessionId="stored-old" />)
+
+    act(() => {
+      setActiveSessionStoredIdRotation(rotation)
+    })
+
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect($selectedStoredSessionId.get()).toBe('stored-new')
+    expect(navigate).toHaveBeenCalledWith('/stored-new', { replace: true })
+  })
+
+  it('discards a delayed rotation after the user selects another session', async () => {
+    const navigate = vi.fn()
+    setActiveSessionStoredIdRotation(null)
+    setSelectedStoredSessionId('stored-current')
+    render(
+      <AliasStoredIdRotationHarness
+        activeRuntimeSessionId="runtime-current"
+        navigate={navigate}
+        routedStoredSessionId="stored-current"
+        selectedStoredSessionId="stored-current"
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation(rotation)
+    })
+
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect($selectedStoredSessionId.get()).toBe('stored-current')
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('applies the latest edge when multiple rotations batch before the effect runs', async () => {
+    const navigate = vi.fn()
+    setActiveSessionStoredIdRotation(null)
+    setSelectedStoredSessionId('stored-old')
+    render(
+      <AliasStoredIdRotationHarness
+        navigate={navigate}
+        resolveStoredSessionId={storedSessionId =>
+          storedSessionId === 'stored-old' || storedSessionId === 'stored-middle' ? 'stored-newest' : storedSessionId
+        }
+        routedStoredSessionId="stored-old"
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        nextStoredSessionId: 'stored-newest',
+        previousStoredSessionId: 'stored-middle',
+        runtimeSessionId: 'runtime-old'
+      })
+    })
+
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect($selectedStoredSessionId.get()).toBe('stored-newest')
+    expect(navigate).toHaveBeenCalledWith('/stored-newest', { replace: true })
   })
 })
