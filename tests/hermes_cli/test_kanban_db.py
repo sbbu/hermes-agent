@@ -1944,6 +1944,90 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_active_pr_bypassed_by_later_promotion(kanban_home):
+    """A dependency promotion after the PR comment is an intentional rerun.
+
+    Exact-head gate cards commonly comment with the PR URL, wait on a repair
+    child, then return to ready when that child completes.  The PR guard must
+    not strand that promoted card for 24 hours.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="recheck-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Waiting on repair for https://github.com/acme/repo/pull/42",
+        )
+        comment_at = conn.execute(
+            "SELECT MAX(created_at) FROM task_comments WHERE task_id = ?",
+            (t,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (t, comment_at),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_dispatch_spawns_active_pr_task_after_later_promotion(
+    kanban_home, all_assignees_spawnable
+):
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="recheck-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR: https://github.com/acme/repo/pull/42",
+        )
+        comment_at = conn.execute(
+            "SELECT MAX(created_at) FROM task_comments WHERE task_id = ?",
+            (t,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (t, comment_at),
+        )
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert (t, "active_pr") not in result.respawn_guarded
+
+
+def test_respawn_guard_active_pr_still_applies_when_promotion_is_older(kanban_home):
+    """Only a requeue at or after the PR evidence may override the guard."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already-promoted", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (t, now - 2),
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR: https://github.com/acme/repo/pull/42",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+            (now - 1, t),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     kanban_home, all_assignees_spawnable
 ):
