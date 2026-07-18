@@ -352,6 +352,57 @@ class TestRunJobTerminalCwd:
         # And it was restored to the original value in finally.
         assert os.environ["TERMINAL_CWD"] == "/original/cwd"
 
+    def test_prerun_script_uses_job_workdir(self, tmp_path, monkeypatch):
+        """Data-collection scripts share the configured agent workdir."""
+        import cron.scheduler as sched
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+
+        def fake_script(_job, _script_path, *, cwd=None):
+            observed["script_cwd"] = cwd
+            return True, "collected input"
+
+        monkeypatch.setattr(sched, "_run_job_script_with_claim_heartbeat", fake_script)
+        job = {
+            "id": "script-wd",
+            "name": "script workdir",
+            "workdir": str(tmp_path),
+            "script": "collect.py",
+            "schedule_display": "manual",
+        }
+
+        success, _output, response, error = sched.run_job(job)
+
+        assert success is True, f"run_job failed: error={error!r} response={response!r}"
+        assert observed["script_cwd"] == str(tmp_path)
+
+    def test_prerun_without_workdir_keeps_legacy_heartbeat_call(self, monkeypatch):
+        """Pre-run wrappers keep the historical two-argument call shape."""
+        import cron.scheduler as sched
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+        calls = []
+
+        def wrapped(run_job, path):
+            calls.append((run_job["id"], path))
+            return True, "collected input"
+
+        monkeypatch.setattr(sched, "_run_job_script_with_claim_heartbeat", wrapped)
+        job = {
+            "id": "script-default-cwd",
+            "name": "script default workdir",
+            "workdir": None,
+            "script": "collect.py",
+            "schedule_display": "manual",
+        }
+
+        success, _output, response, error = sched.run_job(job)
+
+        assert success is True, f"run_job failed: error={error!r} response={response!r}"
+        assert calls == [("script-default-cwd", "collect.py")]
+
     def test_no_workdir_leaves_terminal_cwd_untouched(self, monkeypatch):
         """When workdir is absent, run_job must not touch TERMINAL_CWD at all —
         whatever value was present before the call should be present after.

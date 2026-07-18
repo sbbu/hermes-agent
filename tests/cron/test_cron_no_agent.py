@@ -261,6 +261,99 @@ def test_run_job_no_agent_script_failure_delivers_error(hermes_env):
     assert "Cron watchdog" in final_response  # alert header
 
 
+def test_run_job_no_agent_workdir_runs_script_in_job_directory(hermes_env):
+    """The job workdir, not the scripts directory, is the script subprocess cwd."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    workdir = hermes_env / "workspace"
+    workdir.mkdir()
+    script_path = hermes_env / "scripts" / "where.py"
+    script_path.write_text("import os\nprint(os.getcwd())\n")
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="where.py",
+        no_agent=True,
+        deliver="local",
+        workdir=str(workdir),
+    )
+
+    success, _doc, final_response, error = run_job(job)
+
+    assert success is True
+    assert final_response == str(workdir)
+    assert error is None
+
+
+def test_run_job_no_agent_workdir_recovers_from_deleted_process_cwd(hermes_env, monkeypatch):
+    """A deleted scheduler cwd must not prevent a script-only job from running."""
+    from cron.jobs import create_job
+    from cron import scheduler
+
+    workdir = hermes_env / "workspace"
+    workdir.mkdir()
+    script_path = hermes_env / "scripts" / "alert.sh"
+    script_path.write_text("#!/bin/bash\necho alert\n")
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="alert.sh",
+        no_agent=True,
+        deliver="local",
+        workdir=str(workdir),
+    )
+
+    def deleted_cwd():
+        raise FileNotFoundError("process cwd was deleted")
+
+    changed_to = []
+    monkeypatch.setattr(scheduler.os, "getcwd", deleted_cwd)
+    monkeypatch.setattr(scheduler.os, "chdir", changed_to.append)
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job_script_with_claim_heartbeat",
+        lambda *_args, **_kwargs: (True, "alert"),
+    )
+
+    success, _doc, final_response, error = scheduler.run_job(job)
+
+    assert success is True
+    assert final_response == "alert"
+    assert error is None
+    assert changed_to == []  # subprocess cwd only; never mutate the scheduler
+
+
+def test_run_job_no_agent_without_workdir_keeps_legacy_heartbeat_call(hermes_env, monkeypatch):
+    """Wrappers with the historical two-argument signature keep working."""
+    from cron.jobs import create_job
+    from cron import scheduler
+
+    script_path = hermes_env / "scripts" / "alert.sh"
+    script_path.write_text("#!/bin/bash\necho alert\n")
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="alert.sh",
+        no_agent=True,
+        deliver="local",
+    )
+    calls = []
+
+    def wrapped(run_job, path):
+        calls.append((run_job["id"], path))
+        return True, "alert"
+
+    monkeypatch.setattr(scheduler, "_run_job_script_with_claim_heartbeat", wrapped)
+
+    success, _doc, final_response, error = scheduler.run_job(job)
+
+    assert success is True
+    assert final_response == "alert"
+    assert error is None
+    assert calls == [(job["id"], "alert.sh")]
+
+
 def test_run_job_no_agent_never_invokes_aiagent(hermes_env):
     """no_agent jobs must NOT import/construct the AIAgent."""
     from cron.jobs import create_job
