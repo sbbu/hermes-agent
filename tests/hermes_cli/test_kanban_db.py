@@ -2005,7 +2005,7 @@ def test_dispatch_spawns_active_pr_task_after_later_promotion(
 
 
 def test_respawn_guard_active_pr_still_applies_when_promotion_is_older(kanban_home):
-    """Only a requeue at or after the PR evidence may override the guard."""
+    """Only a requeue after the PR evidence may override the guard."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="already-promoted", assignee="alice")
         now = int(time.time())
@@ -2026,6 +2026,65 @@ def test_respawn_guard_active_pr_still_applies_when_promotion_is_older(kanban_ho
         )
 
         assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_uses_event_order_within_same_second(kanban_home, monkeypatch):
+    """A same-second requeue before the PR comment must not defeat the guard."""
+    fixed_now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: fixed_now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ordered-events", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted_manual', ?)",
+            (t, fixed_now),
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR: https://github.com/acme/repo/pull/42",
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_honors_same_second_manual_promotion(kanban_home, monkeypatch):
+    """promote_task's promoted_manual event deliberately resumes the card."""
+    fixed_now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: fixed_now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="manual-resume", assignee="alice")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="temporary")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR: https://github.com/acme/repo/pull/42",
+        )
+        promoted, error = kb.promote_task(conn, t, actor="operator")
+
+        assert promoted is True
+        assert error is None
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_recent_success_uses_event_order_within_same_second(kanban_home, monkeypatch):
+    """A pre-completion requeue cannot masquerade as a later rerun request."""
+    fixed_now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: fixed_now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="completed-order", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'status', ?)",
+            (t, fixed_now),
+        )
+        assert kb.complete_task(conn, t, result="done")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t,))
+
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
 
 
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
