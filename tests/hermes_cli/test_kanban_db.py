@@ -2024,6 +2024,25 @@ def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
         assert kb.check_respawn_guard(conn, t) is None
 
 
+def test_respawn_guard_recent_success_bypassed_by_workflow_reopen(kanban_home):
+    """The workflow controller's done -> ready reopen is a deliberate new run."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="repair-pr-feedback", assignee="alice")
+        assert kb.complete_task(conn, t, result="first handoff")
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
+
+        resume_task = getattr(kb, "resume_task")
+        assert resume_task(
+            conn,
+            t,
+            reopen=True,
+            reason="new post-handoff feedback",
+            step_key="implementing",
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
     """A completed run outside the guard window does not block re-spawn."""
     with kb.connect() as conn:

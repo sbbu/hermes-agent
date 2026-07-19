@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+import cli as cli_mod
 from hermes_cli import kanban_db as kb
 from hermes_cli import goals
 
@@ -204,9 +205,61 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_completed_worker_supervisor_cannot_mutate_reopened_task(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="persistent workflow card",
+            assignee="worker",
+            goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        old_run_id = claimed.current_run_id
+        assert old_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="first handoff",
+            expected_run_id=old_run_id,
+        )
+        resume_task = getattr(kb, "resume_task")
+        assert resume_task(
+            conn,
+            tid,
+            reopen=True,
+            reason="new post-handoff feedback",
+            step_key="implementing",
+        )
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(old_run_id))
+    observed = {}
+
+    def fake_loop(**kwargs):
+        observed["status"] = kwargs["task_status_fn"]()
+        with pytest.raises(RuntimeError, match="ownership lost"):
+            kwargs["run_turn"]("stale continuation")
+        kwargs["block_fn"]("stale supervisor must not land")
+        return {"outcome": "stopped"}
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", fake_loop)
+    fake_cli = cli_mod.HermesCLI.__new__(cli_mod.HermesCLI)
+    cli_mod._run_kanban_goal_loop_q(fake_cli, "already done")
+
+    assert observed["status"] == "stale_run"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_step_key == "implementing"
+
+
 def test_loop_continues_then_worker_completes(monkeypatch):
     _patch_judge(monkeypatch, ["continue", "continue"])
-    statuses = iter(["running", "running", "done"])
+    statuses = iter(["running", "running", "running", "running", "done"])
     turns = []
 
     res = goals.run_kanban_goal_loop(
@@ -222,6 +275,25 @@ def test_loop_continues_then_worker_completes(monkeypatch):
     # Two continuation turns fed before the worker completed.
     assert len(turns) == 2
     assert all("not done yet" in p for p in turns)
+
+
+def test_loop_rechecks_ownership_after_judging_before_continuation(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"])
+    statuses = iter(["running", "stale_run"])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-race",
+        goal_text="repair current head",
+        run_turn=lambda p: turns.append(p) or "must not run",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("stale run must not block"),
+        first_response="checking",
+    )
+
+    assert res["outcome"] == "stopped"
+    assert res["reason"] == "status=stale_run"
+    assert turns == []
 
 
 def test_loop_blocks_on_budget_exhaustion(monkeypatch):
@@ -249,7 +321,7 @@ def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
     # Judge says done, but worker never terminated → one finalize nudge,
     # then worker completes.
     _patch_judge(monkeypatch, ["done", "done"])
-    statuses = iter(["running", "done"])
+    statuses = iter(["running", "running", "done"])
     turns = []
 
     res = goals.run_kanban_goal_loop(

@@ -1774,6 +1774,39 @@ def run_kanban_goal_loop(
             return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
 
         # Run another turn in the same session.
+        # Judging can involve a model call. Re-check after that latency so a
+        # controller reopen/new owner cannot inherit this old supervisor's
+        # continuation turn.
+        try:
+            status = task_status_fn()
+        except Exception as exc:
+            _log(f"kanban goal loop: pre-turn status check failed ({exc}); stopping")
+            return {
+                "outcome": "stopped",
+                "turns_used": turns_used,
+                "reason": "status check failed",
+            }
+        if status == "done":
+            return {
+                "outcome": "completed_by_worker",
+                "turns_used": turns_used,
+                "reason": "worker completed the task",
+            }
+        if status == "blocked":
+            return {
+                "outcome": "blocked_by_worker",
+                "turns_used": turns_used,
+                "reason": "worker blocked the task",
+            }
+        if status not in ("running", "ready"):
+            _log(
+                f"kanban goal loop: task {task_id} status={status!r} before continuation; stopping"
+            )
+            return {
+                "outcome": "stopped",
+                "turns_used": turns_used,
+                "reason": f"status={status}",
+            }
         try:
             last_response = run_turn(prompt) or ""
         except Exception as exc:

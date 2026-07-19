@@ -6566,6 +6566,8 @@ _RESPAWN_REQUEUE_EVENT_KINDS = (
     "promoted",
     "promoted_manual",
     "unblocked",
+    "resumed",
+    "reopened",
     "reclaimed",
     "crashed",
     "timed_out",
