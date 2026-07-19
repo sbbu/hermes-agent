@@ -38,6 +38,7 @@ _STATUS_ICONS = {
     "ready":    "▶",
     "running":  "●",
     "scheduled":"⏱",
+    "waiting":  "⏸",
     "blocked":  "⊘",
     "done":     "✓",
     "archived": "—",
@@ -82,6 +83,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "workflow_parent_id": t.workflow_parent_id,
     }
 
 
@@ -312,6 +314,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
+    p_create.add_argument(
+        "--workflow-parent-id", default=None,
+        help="Non-blocking parent used only to group workflow stages",
+    )
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -622,6 +628,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
+
+    p_wait = sub.add_parser("wait", help="Park a task in non-dispatchable Waiting")
+    p_wait.add_argument("task_id")
+    p_wait.add_argument("--reason", default=None, help="Optional audit reason")
+
+    p_resume = sub.add_parser("resume", help="Resume Waiting work")
+    p_resume.add_argument("task_id")
+    p_resume.add_argument(
+        "--reopen", action="store_true",
+        help="Explicitly reopen done work while preserving run history",
+    )
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -1043,6 +1060,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
+            "wait":      _cmd_wait,
+            "resume":    _cmd_resume,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -1484,6 +1503,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_path=ws_path,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
+            workflow_parent_id=getattr(args, "workflow_parent_id", None),
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
@@ -1665,6 +1685,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
+    if task.workflow_parent_id:
+        print(f"  workflow parent: {task.workflow_parent_id}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
@@ -2312,6 +2334,41 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_wait(args: argparse.Namespace) -> int:
+    reason = (getattr(args, "reason", None) or "").strip() or None
+    with kb.connect_closing() as conn:
+        ok = kb.wait_task(conn, args.task_id, reason=reason)
+    if not ok:
+        print(
+            f"cannot wait {args.task_id} (task is running, done, waiting, or archived)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Waiting {args.task_id}" + (f": {reason}" if reason else ""))
+    return 0
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task and task.status == "done" and not args.reopen:
+            print(
+                f"cannot resume {args.task_id}: task is done; pass --reopen explicitly",
+                file=sys.stderr,
+            )
+            return 1
+        old_status = task.status if task else None
+        ok = kb.resume_task(conn, args.task_id, reopen=bool(args.reopen))
+        updated = kb.get_task(conn, args.task_id) if ok else None
+    if not ok:
+        print(f"cannot resume {args.task_id} (not waiting?)", file=sys.stderr)
+        return 1
+    assert updated is not None
+    verb = "Reopened" if old_status == "done" else "Resumed"
+    print(f"{verb} {args.task_id} -> {updated.status}")
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
