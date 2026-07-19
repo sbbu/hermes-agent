@@ -318,6 +318,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--workflow-parent-id", default=None,
         help="Non-blocking parent used only to group workflow stages",
     )
+    p_create.add_argument(
+        "--step-key", default=None,
+        help="Structured current workflow step (does not affect dispatch)",
+    )
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -585,6 +589,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--step-key", default=None,
+        help="Set current_step_key while completing the task",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -632,6 +640,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_wait = sub.add_parser("wait", help="Park a task in non-dispatchable Waiting")
     p_wait.add_argument("task_id")
     p_wait.add_argument("--reason", default=None, help="Optional audit reason")
+    p_wait.add_argument("--step-key", default=None, help="Structured workflow phase")
+    p_wait.add_argument("--summary", default=None, help="Structured transition summary")
+    p_wait.add_argument("--metadata", default=None, help="JSON object stored on a synthetic waiting run")
 
     p_resume = sub.add_parser("resume", help="Resume Waiting work")
     p_resume.add_argument("task_id")
@@ -639,6 +650,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reopen", action="store_true",
         help="Explicitly reopen done work while preserving run history",
     )
+    p_resume.add_argument("--reason", default=None, help="Optional audit reason")
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -1435,6 +1447,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             workflow_parent_id=getattr(args, "workflow_parent_id", None),
+            current_step_key=getattr(args, "step_key", None),
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
@@ -2150,6 +2163,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                step_key=getattr(args, "step_key", None),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2269,11 +2283,27 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
 
 def _cmd_wait(args: argparse.Namespace) -> int:
     reason = (getattr(args, "reason", None) or "").strip() or None
+    metadata = None
+    if args.metadata:
+        try:
+            metadata = json.loads(args.metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
-        ok = kb.wait_task(conn, args.task_id, reason=reason)
+        ok = kb.wait_task(
+            conn,
+            args.task_id,
+            reason=reason,
+            step_key=args.step_key,
+            summary=args.summary,
+            metadata=metadata,
+        )
     if not ok:
         print(
-            f"cannot wait {args.task_id} (task is running, done, waiting, or archived)",
+            f"cannot wait {args.task_id} (task is running or archived)",
             file=sys.stderr,
         )
         return 1
@@ -2291,7 +2321,12 @@ def _cmd_resume(args: argparse.Namespace) -> int:
             )
             return 1
         old_status = task.status if task else None
-        ok = kb.resume_task(conn, args.task_id, reopen=bool(args.reopen))
+        ok = kb.resume_task(
+            conn,
+            args.task_id,
+            reopen=bool(args.reopen),
+            reason=(args.reason or "").strip() or None,
+        )
         updated = kb.get_task(conn, args.task_id) if ok else None
     if not ok:
         print(f"cannot resume {args.task_id} (not waiting?)", file=sys.stderr)

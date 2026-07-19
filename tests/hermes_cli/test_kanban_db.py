@@ -249,6 +249,18 @@ def test_workflow_parent_is_non_blocking_and_exposed(kanban_home):
     assert task.workflow_parent_id == root
 
 
+def test_create_task_accepts_structured_step_key(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="workflow stage",
+            current_step_key="gate:1:0:design:preview",
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task.current_step_key == "gate:1:0:design:preview"
+
+
 def test_create_task_unknown_workflow_parent_errors(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="unknown workflow parent"):
         kb.create_task(
@@ -445,6 +457,53 @@ def test_wait_and_resume_are_non_dispatchable_and_parent_gated(kanban_home):
         assert kb.wait_task(conn, task_id, reason="second gate") is True
         assert kb.resume_task(conn, task_id) is True
         assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_wait_done_persists_phase_metadata_and_can_complete_waiting(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="persistent builder", assignee="builder")
+        kb.claim_task(conn, task_id)
+        kb.complete_task(
+            conn,
+            task_id,
+            summary="implementation complete",
+            metadata={"outcome": "awaiting_gates", "cycle": 1},
+        )
+
+        assert kb.wait_task(
+            conn,
+            task_id,
+            reason="serial gates",
+            step_key="internal_review",
+            summary="parked for gates",
+            metadata={"outcome": "awaiting_gates", "cycle": 1, "next_gate": 0},
+        )
+        parked = kb.get_task(conn, task_id)
+        assert parked is not None
+        assert parked.status == "waiting"
+        assert parked.current_step_key == "internal_review"
+        latest = kb.list_runs(conn, task_id)[-1]
+        assert latest.outcome == "waiting"
+        assert latest.metadata["next_gate"] == 0
+
+        assert kb.wait_task(
+            conn,
+            task_id,
+            step_key="codex_review",
+            metadata={"outcome": "codex_wait", "head_sha": "abc"},
+        )
+        assert kb.get_task(conn, task_id).current_step_key == "codex_review"
+        assert kb.complete_task(
+            conn,
+            task_id,
+            step_key="human_review",
+            summary="handoff",
+            metadata={"outcome": "handoff", "head_sha": "abc"},
+        )
+        done = kb.get_task(conn, task_id)
+        assert done is not None
+        assert done.status == "done"
+        assert done.current_step_key == "human_review"
 
 
 def test_resume_done_requires_explicit_reopen_and_preserves_runs(kanban_home):
