@@ -71,6 +71,26 @@ async def test_drain_queue_mode_queues_follow_up_without_interrupt():
     assert any("queued for the next turn" in message for message in adapter.sent)
 
 
+@pytest.mark.parametrize(
+    ("restart_requested", "busy_mode", "discard"),
+    [
+        (True, "queue", False),
+        (True, "steer", False),
+        (True, "interrupt", True),
+        (False, "queue", True),
+    ],
+)
+def test_drain_pending_policy_preserves_only_restart_queues(
+    restart_requested, busy_mode, discard
+):
+    runner, _adapter = make_restart_runner()
+    runner._draining = True
+    runner._restart_requested = restart_requested
+    runner._busy_input_mode = busy_mode
+
+    assert runner._should_discard_pending_during_drain() is discard
+
+
 @pytest.mark.asyncio
 async def test_draining_rejects_new_session_messages():
     runner, _adapter = make_restart_runner()

@@ -5015,9 +5015,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _queue_during_drain_enabled(self) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
-        # to be lost during restart — queue them for the newly-spawned gateway
-        # process to pick up.  "interrupt" mode drops them (current behaviour).
+        # to be lost during restart — finish them before the old gateway reaches
+        # its safe point. "interrupt" mode keeps the historical discard policy.
         return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
+
+    def _should_discard_pending_during_drain(self) -> bool:
+        """Whether a pending follow-up must be dropped during shutdown drain."""
+        return self._draining and not self._queue_during_drain_enabled()
 
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
@@ -6030,7 +6034,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = (
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the "
+                    "next turn before restart completes."
+                )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -11214,7 +11221,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if self._queue_during_drain_enabled():
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the "
+                    "next turn before restart completes."
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
@@ -22793,7 +22801,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-            if self._draining and (pending_event or pending):
+            if self._should_discard_pending_during_drain() and (
+                pending_event or pending
+            ):
                 logger.info(
                     "Discarding pending follow-up for session %s during gateway %s",
                     session_key or "?",
