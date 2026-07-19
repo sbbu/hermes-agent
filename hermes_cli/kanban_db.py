@@ -2810,6 +2810,7 @@ def create_task(
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     workflow_parent_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2960,6 +2961,8 @@ def create_task(
         workflow_parent_id = str(workflow_parent_id).strip() or None
     if workflow_parent_id and not get_task(conn, workflow_parent_id):
         raise ValueError(f"unknown workflow parent task: {workflow_parent_id}")
+    if current_step_key is not None:
+        current_step_key = str(current_step_key).strip() or None
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3106,8 +3109,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id, workflow_parent_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, workflow_parent_id,
+                        current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3133,6 +3137,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         workflow_parent_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -3158,6 +3163,7 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "workflow_parent_id": workflow_parent_id,
+                        "current_step_key": current_step_key,
                     },
                 )
             return task_id
@@ -4629,8 +4635,9 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    step_key: Optional[str] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition ``running|ready|blocked|waiting -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -4690,6 +4697,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    normalized_step = str(step_key).strip() if step_key else None
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4702,11 +4710,12 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       current_step_key = COALESCE(?, current_step_key)
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'waiting')
                 """,
-                (result, now, task_id),
+                (result, now, normalized_step, task_id),
             )
         else:
             cur = conn.execute(
@@ -4719,12 +4728,13 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       current_step_key = COALESCE(?, current_step_key)
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'waiting')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now, normalized_step, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -5759,18 +5769,38 @@ def wait_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
+    step_key: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
 ) -> bool:
-    """Park non-running workflow work in non-dispatchable ``waiting``."""
+    """Park non-running workflow work and persist its structured phase evidence."""
+    normalized_step = str(step_key).strip() if step_key else None
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'waiting' "
-            "WHERE id = ? AND status IN "
-            "('triage', 'todo', 'scheduled', 'ready', 'blocked', 'review')",
-            (task_id,),
+            "UPDATE tasks SET status = 'waiting', completed_at = NULL, result = NULL, "
+            "current_step_key = COALESCE(?, current_step_key), claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ? AND status NOT IN ('running', 'archived')",
+            (normalized_step, task_id),
         )
         if cur.rowcount != 1:
             return False
-        _append_event(conn, task_id, "waiting", {"reason": reason})
+        run_id = None
+        if summary or metadata:
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="waiting",
+                summary=summary,
+                metadata=metadata,
+            )
+        _append_event(
+            conn,
+            task_id,
+            "waiting",
+            {"reason": reason, "step_key": normalized_step, "summary": summary},
+            run_id=run_id,
+        )
         return True
 
 
@@ -5779,6 +5809,7 @@ def resume_task(
     task_id: str,
     *,
     reopen: bool = False,
+    reason: Optional[str] = None,
 ) -> bool:
     """Resume waiting work, or explicitly reopen done work preserving runs."""
     with write_txn(conn):
@@ -5809,7 +5840,7 @@ def resume_task(
             conn,
             task_id,
             "reopened" if old_status == "done" else "resumed",
-            {"status": new_status},
+            {"status": new_status, "reason": reason},
         )
         return True
 
