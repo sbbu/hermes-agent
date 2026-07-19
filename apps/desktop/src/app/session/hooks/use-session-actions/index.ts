@@ -238,11 +238,14 @@ export function useSessionActions({
     // fresh draft) after session.info emitted this rotation, the event is stale:
     // never overwrite the newer intent or delete/replace anything it owns.
     const selectedStoredSessionId = selectedStoredSessionIdRef.current
+    const routedStoredSessionId = getRoutedStoredSessionId()
 
     if (
       activeSessionIdRef.current !== storedIdRotation.runtimeSessionId ||
       !selectedStoredSessionId ||
-      resolveStoredSessionId(selectedStoredSessionId) !== storedIdRotation.nextStoredSessionId
+      resolveStoredSessionId(selectedStoredSessionId) !== storedIdRotation.nextStoredSessionId ||
+      (routedStoredSessionId !== null &&
+        resolveStoredSessionId(routedStoredSessionId) !== storedIdRotation.nextStoredSessionId)
     ) {
       consumeRotation()
 
@@ -279,7 +282,6 @@ export function useSessionActions({
     // is still the route on screen — compression must not eject the user from
     // an unrelated surface. use-route-resume canonicalizes any stashed/history
     // route that later returns to the old id.
-    const routedStoredSessionId = getRoutedStoredSessionId()
 
     if (routedStoredSessionId && resolveStoredSessionId(routedStoredSessionId) === nextId) {
       navigate(sessionRoute(nextId), { replace: true })

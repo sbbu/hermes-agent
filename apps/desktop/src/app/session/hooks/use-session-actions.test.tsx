@@ -153,7 +153,11 @@ function StoredIdRotationHarness({
     navigate: navigate as never,
     requestGateway: async () => ({}) as never,
     resetViewSync: vi.fn(),
-    resolveStoredSessionId: storedSessionId => storedSessionId,
+    resolveStoredSessionId: storedSessionId => {
+      const rotation = $activeSessionStoredIdRotation.get()
+
+      return rotation?.previousStoredSessionId === storedSessionId ? rotation.nextStoredSessionId : storedSessionId
+    },
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
     selectedStoredSessionId: selectedStoredSessionIdRef.current,
     selectedStoredSessionIdRef,
