@@ -363,7 +363,16 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         assert info["tools"] == {"core": ["terminal"]}
         assert info["usage"]["total"] == 140
         assert "credential_warning" not in info
-        assert emitted[-1] == ("session.info", "iso-sid", info)
+        event, event_sid, emitted_info = emitted[-1]
+        assert (event, event_sid) == ("session.info", "iso-sid")
+        # Runtime/update metadata can refresh between the emitted snapshot and
+        # this second _session_info() call. Assert the host-owned mirror
+        # contract rather than volatile process metadata.
+        assert emitted_info["model"] == info["model"]
+        assert emitted_info["provider"] == info["provider"]
+        assert emitted_info["system_prompt"] == info["system_prompt"]
+        assert emitted_info["tools"] == info["tools"]
+        assert emitted_info["usage"] == info["usage"]
     finally:
         server._sessions.pop("iso-sid", None)
 
@@ -7360,21 +7369,24 @@ def test_session_interrupt_force_releases_stuck_desktop_turn(monkeypatch):
     worker = _Worker()
     server._sessions["sid"] = _session(
         agent=agent,
+        agent_build_started=True,
+        agent_build_generation=4,
         running=True,
         run_generation=1,
         run_started_at=1.0,
         run_last_activity=1.0,
         inflight_turn={"text": "stuck"},
+        queued_prompt={"text": "discard me", "transport": None},
         slash_worker=worker,
     )
     events: list[tuple] = []
     try:
         monkeypatch.setattr(server, "_emit", lambda *a: events.append(a))
-        monkeypatch.setattr(
-            server,
-            "_start_agent_build",
-            lambda _sid, session: session.__setitem__("build_requested", True),
-        )
+        def _request_build(_sid, session):
+            assert session["agent_build_started"] is False
+            session["build_requested"] = True
+
+        monkeypatch.setattr(server, "_start_agent_build", _request_build)
 
         resp = server.handle_request(
             {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
@@ -7386,7 +7398,10 @@ def test_session_interrupt_force_releases_stuck_desktop_turn(monkeypatch):
         assert session["inflight_turn"] is None
         assert session["agent"] is None
         assert session["agent_ready"].is_set() is False
+        assert session["agent_build_started"] is False
+        assert session["agent_build_generation"] == 5
         assert session["run_generation"] == 2
+        assert session["queued_prompt"] is None
         assert session["build_requested"] is True
         assert worker.closed is True
         assert agent.interrupt_reason == "desktop session.interrupt"
@@ -7423,8 +7438,8 @@ def test_quiesce_abandoned_agent_detaches_all_tui_callbacks():
         assert getattr(agent, attr) is None, f"{attr} still attached"
 
 
-def test_prompt_submit_recovers_stale_busy_turn(monkeypatch):
-    """A stale running flag should not leave desktop prompt.submit permanently busy."""
+def test_prompt_submit_recovers_stale_busy_turn_without_dropping_queue(monkeypatch):
+    """Stale recovery rebuilds the agent and preserves accepted prompt text."""
 
     class _OldAgent:
         def __init__(self):
@@ -7442,14 +7457,14 @@ def test_prompt_submit_recovers_stale_busy_turn(monkeypatch):
         provider = "test-provider"
 
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
-            assert prompt == "fresh"
+            assert prompt == "queued first\n\nfresh"
             return {
                 "final_response": "fresh reply",
                 "messages": [{"role": "assistant", "content": "fresh reply"}],
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, daemon=None, **_kwargs):
             self._target = target
 
         def start(self):
@@ -7464,6 +7479,9 @@ def test_prompt_submit_recovers_stale_busy_turn(monkeypatch):
         run_started_at=1.0,
         run_last_activity=1.0,
         inflight_turn={"text": "old"},
+        queued_prompt={"text": "queued first", "transport": "old-ws"},
+        agent_build_started=True,
+        agent_build_generation=7,
     )
     emits: list[tuple] = []
 
@@ -7488,6 +7506,8 @@ def test_prompt_submit_recovers_stale_busy_turn(monkeypatch):
         session = server._sessions["sid"]
         assert session["running"] is False
         assert session["history"] == [{"role": "assistant", "content": "fresh reply"}]
+        assert session.get("queued_prompt") is None
+        assert session["transport"] == "old-ws"
         assert old_agent.interrupt_reason == "stale desktop turn"
         assert old_agent._session_db is None
         complete = [evt for evt in emits if evt[0] == "message.complete"]
@@ -7495,6 +7515,267 @@ def test_prompt_submit_recovers_stale_busy_turn(monkeypatch):
         assert complete[0][2]["text"] == "fresh reply"
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_compute_host_late_completion_cannot_clear_replacement_run(monkeypatch):
+    session = _session(
+        running=True,
+        run_generation=2,
+        run_started_at=2.0,
+        run_last_activity=2.0,
+        inflight_turn={"user": "replacement"},
+        history_version=4,
+    )
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda *args: events.append(args))
+
+    server._on_compute_host_turn_done(
+        "old-rid",
+        "sid",
+        session,
+        {
+            "type": "turn.end",
+            "session_key": "old-key",
+            "history_version": 9,
+        },
+        run_generation=1,
+    )
+
+    assert session["running"] is True
+    assert session["session_key"] == "session-key"
+    assert session["history_version"] == 4
+    assert session["inflight_turn"] == {"user": "replacement"}
+    assert events == []
+
+
+def test_stale_compute_host_turn_is_force_released_before_resubmit(monkeypatch):
+    calls = []
+
+    class _Supervisor:
+        def force_release(self, sid):
+            calls.append(("force_release", sid))
+            return {"type": "force_release.ack", "applied": True}
+
+        def submit_turn(self, frame, *, on_complete=None):
+            calls.append(("submit_turn", frame["sid"], frame["text"]))
+            return frame["request_id"]
+
+    supervisor = _Supervisor()
+    ready = threading.Event()
+    ready.set()
+    server._sessions["host-sid"] = _session(
+        agent=None,
+        agent_ready=ready,
+        agent_build_started=True,
+        agent_build_generation=2,
+        running=True,
+        run_generation=1,
+        run_started_at=1.0,
+        run_last_activity=1.0,
+        inflight_turn={"user": "stuck"},
+        queued_prompt={"text": "accepted", "transport": "ws-old"},
+        _compute_host_active=True,
+    )
+    try:
+        monkeypatch.setattr(server, "_TUI_TURN_IDLE_TIMEOUT_S", 10)
+        monkeypatch.setattr(
+            server,
+            "_load_dashboard_process_isolation_config",
+            lambda: {"turn_isolation": True},
+        )
+        monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *_a: supervisor)
+
+        resp = server.handle_request(
+            {
+                "id": "new-rid",
+                "method": "prompt.submit",
+                "params": {"session_id": "host-sid", "text": "replacement"},
+            }
+        )
+
+        assert resp is not None
+        assert resp["result"] == {"status": "streaming", "turn_isolation": True}
+        assert calls == [
+            ("force_release", "host-sid"),
+            ("submit_turn", "host-sid", "accepted\n\nreplacement"),
+        ]
+        assert server._sessions["host-sid"]["running"] is True
+    finally:
+        server._sessions.pop("host-sid", None)
+
+
+def test_stale_compute_host_recovery_honors_concurrent_interrupt(monkeypatch):
+    calls = []
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        running=True,
+        run_generation=1,
+        run_started_at=1.0,
+        run_last_activity=1.0,
+        inflight_turn={"user": "stuck"},
+        _compute_host_active=True,
+    )
+
+    class _Supervisor:
+        def force_release(self, _sid):
+            with session["history_lock"]:
+                server._bump_run_generation_locked(session)
+                session["running"] = False
+                server._clear_inflight_turn(session)
+            return {"type": "force_release.ack", "applied": True}
+
+        def submit_turn(self, *_args, **_kwargs):
+            calls.append("submitted")
+
+    server._sessions["host-cancelled"] = session
+    try:
+        monkeypatch.setattr(server, "_TUI_TURN_IDLE_TIMEOUT_S", 10)
+        monkeypatch.setattr(
+            server,
+            "_load_dashboard_process_isolation_config",
+            lambda: {"turn_isolation": True},
+        )
+        monkeypatch.setattr(
+            server,
+            "_get_compute_host_supervisor",
+            lambda *_a: _Supervisor(),
+        )
+
+        resp = server.handle_request(
+            {
+                "id": "cancelled-rid",
+                "method": "prompt.submit",
+                "params": {"session_id": "host-cancelled", "text": "do not run"},
+            }
+        )
+
+        assert resp is not None
+        assert resp["error"]["code"] == 4020
+        assert calls == []
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("host-cancelled", None)
+
+
+def test_compute_host_release_failure_restores_preaccepted_queue(monkeypatch):
+    submitted = []
+
+    class _Supervisor:
+        def force_release(self, _sid):
+            with session["history_lock"]:
+                server._enqueue_prompt(session, "during wait", "ws-new")
+            return {"type": "control.error", "message": "host unavailable"}
+
+        def submit_turn(self, frame, *, on_complete=None):
+            submitted.append(frame["text"])
+            return frame["request_id"]
+
+    supervisor = _Supervisor()
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        running=True,
+        run_generation=1,
+        run_started_at=1.0,
+        run_last_activity=1.0,
+        inflight_turn={"user": "stuck"},
+        queued_prompt={"text": "accepted", "transport": "ws-old"},
+        _compute_host_active=True,
+    )
+    server._sessions["host-retry"] = session
+    try:
+        monkeypatch.setattr(server, "_TUI_TURN_IDLE_TIMEOUT_S", 10)
+        monkeypatch.setattr(
+            server,
+            "_load_dashboard_process_isolation_config",
+            lambda: {"turn_isolation": True},
+        )
+        monkeypatch.setattr(
+            server,
+            "_get_compute_host_supervisor",
+            lambda *_a: supervisor,
+        )
+
+        failed = server.handle_request(
+            {
+                "id": "failed-rid",
+                "method": "prompt.submit",
+                "params": {"session_id": "host-retry", "text": "failed-new"},
+            }
+        )
+        assert failed is not None
+        assert failed["error"]["code"] == 5020
+        assert session["queued_prompt"] == {
+            "text": "accepted\n\nduring wait",
+            "transport": "ws-new",
+        }
+
+        retried = server.handle_request(
+            {
+                "id": "retry-rid",
+                "method": "prompt.submit",
+                "params": {"session_id": "host-retry", "text": "retry"},
+            }
+        )
+        assert retried is not None
+        assert retried["result"]["status"] == "streaming"
+        assert submitted == ["accepted\n\nduring wait\n\nretry"]
+    finally:
+        server._sessions.pop("host-retry", None)
+
+
+def test_compute_host_interrupt_force_releases_without_waiting(monkeypatch):
+    calls = []
+
+    class _Supervisor:
+        def force_release(self, sid, **kwargs):
+            calls.append((sid, kwargs))
+            return {"status": "sent"}
+
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        running=True,
+        run_generation=3,
+        run_started_at=1.0,
+        run_last_activity=1.0,
+        inflight_turn={"user": "running"},
+        queued_prompt={"text": "discard", "transport": None},
+        _compute_host_active=True,
+    )
+    server._sessions["host-interrupt"] = session
+    try:
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a: True)
+        monkeypatch.setattr(
+            server,
+            "_get_compute_host_supervisor",
+            lambda *_a: _Supervisor(),
+        )
+        monkeypatch.setattr(server, "_clear_pending", lambda *_a: None)
+
+        resp = server.handle_request(
+            {
+                "id": "stop-host",
+                "method": "session.interrupt",
+                "params": {"session_id": "host-interrupt"},
+            }
+        )
+
+        assert resp is not None
+        assert resp["result"]["status"] == "interrupted"
+        assert calls == [
+            (
+                "host-interrupt",
+                {"wait": False, "clear_queued_prompt": True},
+            )
+        ]
+        assert session["run_generation"] == 4
+        assert session["running"] is False
+        assert session["inflight_turn"] is None
+        assert session["queued_prompt"] is None
+    finally:
+        server._sessions.pop("host-interrupt", None)
 
 
 def test_abandoned_turn_cannot_clear_new_run_or_emit_late_completion(monkeypatch):

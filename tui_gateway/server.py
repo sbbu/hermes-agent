@@ -1383,9 +1383,20 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         session["_metadata_mirror_updated_at"] = time.time()
 
 
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+def _on_compute_host_turn_done(
+    rid: str,
+    sid: str,
+    session: dict,
+    frame: dict,
+    *,
+    run_generation: int | None = None,
+) -> None:
     is_error = frame.get("type") == "turn.error"
     with session["history_lock"]:
+        if run_generation is not None and not _run_current_locked(
+            session, run_generation
+        ):
+            return
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
         if frame.get("history_version") is not None:
@@ -1412,9 +1423,17 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     _drain_queued_prompt(rid, sid, session)
 
 
-def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _submit_prompt_to_compute_host(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    expected_generation: int | None = None,
+) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(rid, sid, session, text)
+    supervisor = _get_compute_host_supervisor(cfg)
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
@@ -1423,15 +1442,33 @@ def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any)
         # duplicate terminal error.
         if done.get("reason") == "send_failed":
             return
-        _on_compute_host_turn_done(rid, sid, session, done)
+        _on_compute_host_turn_done(
+            rid,
+            sid,
+            session,
+            done,
+            run_generation=run_generation,
+        )
 
-    try:
-        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
-    except Exception as exc:
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
-    with session["history_lock"]:
-        session["_compute_host_active"] = True
-        session["attached_images"] = []
+    submit_lock = session.setdefault("compute_host_submit_lock", threading.Lock())
+    with submit_lock:
+        with session["history_lock"]:
+            if expected_generation is not None and (
+                _sessions.get(sid) is not session
+                or not _run_current_locked(session, expected_generation)
+            ):
+                return _err(rid, 4020, "session changed during stale-turn recovery")
+            run_generation = int(session.get("run_generation", 0) or 0)
+        try:
+            # The per-session submit lock makes generation check + pipe write
+            # atomic with session.interrupt without holding history_lock across
+            # the transport callback boundary.
+            supervisor.submit_turn(frame, on_complete=_complete)
+        except Exception as exc:
+            return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        with session["history_lock"]:
+            session["_compute_host_active"] = True
+            session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -1642,6 +1679,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
         if ready.is_set() or session.get("agent_build_started"):
             return
         session["agent_build_started"] = True
+        try:
+            build_generation = int(session.get("agent_build_generation", 0) or 0) + 1
+        except (TypeError, ValueError):
+            build_generation = 1
+        session["agent_build_generation"] = build_generation
         # An upgrading lazy session is now genuinely mid-construction — restore
         # its "still starting" eviction exemption.
         session.pop("lazy", None)
@@ -1704,7 +1746,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
+            with current["agent_build_lock"]:
+                if int(current.get("agent_build_generation", 0) or 0) != build_generation:
+                    _quiesce_abandoned_agent(agent, "superseded agent build")
+                    return
+                current["agent"] = agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -1773,8 +1819,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            if int(current.get("agent_build_generation", 0) or 0) == build_generation:
+                current["agent_error"] = str(e)
+                _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -1907,20 +1954,33 @@ def _quiesce_abandoned_agent(agent: Any, reason: str) -> None:
             pass
 
 
-def _detach_running_agent_locked(session: dict, reason: str) -> Any:
+def _detach_running_agent_locked(
+    session: dict,
+    reason: str,
+    *,
+    clear_queued_prompt: bool = True,
+) -> Any:
     """Invalidate a stuck turn and prepare this session to build a fresh agent."""
     old_agent = session.get("agent")
     _bump_run_generation_locked(session)
     session["agent"] = None
     session["agent_error"] = None
     session["agent_ready"] = threading.Event()
+    session["agent_build_started"] = False
+    try:
+        session["agent_build_generation"] = int(
+            session.get("agent_build_generation", 0) or 0
+        ) + 1
+    except (TypeError, ValueError):
+        session["agent_build_generation"] = 1
     session["running"] = False
     session["last_active"] = time.time()
     session["run_started_at"] = None
     session["run_last_activity"] = None
     session["abandoned_run_reason"] = reason
     session["_turn_cancel_requested"] = True
-    session["queued_prompt"] = None
+    if clear_queued_prompt:
+        session["queued_prompt"] = None
     _clear_inflight_turn(session)
     worker = session.get("slash_worker")
     session["slash_worker"] = None
@@ -9655,14 +9715,32 @@ def _(rid, params: dict) -> dict:
     assert session is not None
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
-        if session.get("running"):
-            try:
-                _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
-            except Exception as exc:
-                return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
-        with session["history_lock"]:
-            session["_turn_cancel_requested"] = True
-            session["queued_prompt"] = None
+        supervisor = _get_compute_host_supervisor()
+        release_error = None
+        submit_lock = session.setdefault("compute_host_submit_lock", threading.Lock())
+        with submit_lock:
+            with session["history_lock"]:
+                was_running = bool(session.get("running"))
+                _bump_run_generation_locked(session)
+                session["running"] = False
+                session["run_started_at"] = None
+                session["run_last_activity"] = None
+                session["_turn_cancel_requested"] = True
+                session["queued_prompt"] = None
+                _clear_inflight_turn(session)
+            if was_running:
+                try:
+                    # The generation bump and control-frame write share one
+                    # linearization boundary with prompt.submit's guarded send.
+                    supervisor.force_release(
+                        sid,
+                        wait=False,
+                        clear_queued_prompt=True,
+                    )
+                except Exception as exc:
+                    release_error = exc
+        if release_error is not None:
+            return _err(rid, 5019, f"compute-host interrupt failed: {release_error}")
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -10022,65 +10100,166 @@ def _(rid, params: dict) -> dict:
     if (t := current_transport()) is not None:
         session["transport"] = t
     stale_agent = None
+    stale_detected = False
+    stale_compute_host = False
+    accepted_before_recovery = None
+    claim_error = None
+    claimed = False
+    submit_generation = None
     while True:
+        busy = False
         busy_transport = None
         with session["history_lock"]:
             if session.get("running"):
                 if _running_turn_is_stale(session):
-                    stale_agent = _detach_running_agent_locked(session, "stale desktop turn")
-                    break
-                # Don't reject a mid-turn prompt — queue it (and, by default,
-                # interrupt the live turn) so it runs as the next turn. The
-                # provider interrupt itself must happen after this lock is
-                # released: a non-interruptible tool may keep it waiting.
-                busy_transport = t or session.get("transport")
-            else:
-                break
-        busy_response = _handle_busy_submit(rid, sid, session, text, busy_transport)
+                    stale_detected = True
+                    stale_compute_host = turn_isolation
+                    stale_agent = _detach_running_agent_locked(
+                        session,
+                        "stale desktop turn",
+                        clear_queued_prompt=False,
+                    )
+                else:
+                    # Don't reject a mid-turn prompt — queue it (and, by default,
+                    # interrupt the live turn) so it runs as the next turn. The
+                    # provider interrupt itself must happen after this lock is
+                    # released: a non-interruptible tool may keep it waiting.
+                    busy = True
+                    busy_transport = t or session.get("transport")
+
+            if not busy:
+                # A watch session's run lives in the PARENT turn, so its own
+                # running flag is False — without this, typing mid-run builds a
+                # second agent racing the in-flight child on the same stored
+                # session (interleaved transcript, stale fork).
+                if session.get("lazy") and _child_run_active(
+                    str(session.get("session_key") or "")
+                ):
+                    claim_error = _err(
+                        rid, 4009, "subagent still running — wait for it to finish"
+                    )
+                elif truncate_user_ordinal is not None:
+                    ordinal = None
+                    try:
+                        ordinal = int(truncate_user_ordinal)
+                    except (TypeError, ValueError):
+                        claim_error = _err(
+                            rid,
+                            4004,
+                            "truncate_before_user_ordinal must be an integer",
+                        )
+                    if claim_error is None and ordinal is not None:
+                        history = session.get("history", [])
+                        user_indices = [
+                            i for i, m in enumerate(history) if m.get("role") == "user"
+                        ]
+                        if ordinal < 0 or ordinal >= len(user_indices):
+                            claim_error = _err(
+                                rid,
+                                4018,
+                                "target user message is no longer in session history",
+                            )
+                        else:
+                            truncated = history[: user_indices[ordinal]]
+                            session["history"] = truncated
+                            session["history_version"] = int(
+                                session.get("history_version", 0)
+                            ) + 1
+                            if (db := _get_db()) is not None:
+                                try:
+                                    db.replace_messages(
+                                        session["session_key"], truncated
+                                    )
+                                except Exception as exc:
+                                    print(
+                                        "[tui_gateway] prompt.submit: "
+                                        f"replace_messages failed: {exc}",
+                                        file=sys.stderr,
+                                    )
+
+                if claim_error is None:
+                    # A previously accepted queued prompt is older than this
+                    # submission. Merge them losslessly so idle recovery cannot
+                    # run the newer text first.
+                    if session.get("queued_prompt"):
+                        if stale_detected:
+                            accepted_before_recovery = dict(session["queued_prompt"])
+                        accepted = session["queued_prompt"]
+                        recovery_transport = (
+                            t
+                            or session.get("transport")
+                            or accepted.get("transport")
+                        )
+                        _enqueue_prompt(
+                            session,
+                            text,
+                            recovery_transport,
+                        )
+                        queued = session.pop("queued_prompt")
+                        text = queued["text"]
+                        if queued.get("transport") is not None:
+                            session["transport"] = queued["transport"]
+                    submit_generation = _begin_session_run_locked(session, text)
+                    claimed = True
+
+        if claimed or claim_error is not None:
+            break
+        busy_response = _handle_busy_submit(
+            rid, sid, session, text, busy_transport
+        )
         if busy_response is not None:
             return busy_response
         # The old turn finished between the two lock acquisitions. Retry the
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
 
-    with session["history_lock"]:
-        # A watch session's run lives in the PARENT turn, so its own running
-        # flag is False — without this, typing mid-run builds a second agent
-        # racing the in-flight child on the same stored session (interleaved
-        # transcript, stale fork). After the run completes, submitting is fine:
-        # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
-            return _err(rid, 4009, "subagent still running — wait for it to finish")
-        if truncate_user_ordinal is not None:
-            try:
-                ordinal = int(truncate_user_ordinal)
-            except (TypeError, ValueError):
-                return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
-            history = session.get("history", [])
-            user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
-            # Reject out-of-range ordinals on BOTH ends. A negative value would
-            # otherwise sail past the upper-bound check and hit Python's negative
-            # indexing below (user_indices[-1] -> the LAST user turn), silently
-            # truncating history to everything before it and persisting that loss
-            # via replace_messages — an unrecoverable overwrite of the session DB.
-            if ordinal < 0 or ordinal >= len(user_indices):
-                return _err(rid, 4018, "target user message is no longer in session history")
-            truncated = history[: user_indices[ordinal]]
-            session["history"] = truncated
-            session["history_version"] = int(session.get("history_version", 0)) + 1
-            if (db := _get_db()) is not None:
-                try:
-                    db.replace_messages(session["session_key"], truncated)
-                except Exception as exc:
-                    print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
-        submit_generation = _begin_session_run_locked(session, text)
-
     if stale_agent is not None:
         _quiesce_abandoned_agent(stale_agent, "stale desktop turn")
+    if claim_error is not None:
+        return claim_error
+    assert submit_generation is not None
+
+    if stale_compute_host:
+        try:
+            release = _get_compute_host_supervisor(isolation_cfg).force_release(sid)
+        except Exception as exc:
+            release = {"type": "control.error", "message": str(exc)}
+        if release.get("type") == "control.error":
+            with session["history_lock"]:
+                if _run_current_locked(session, submit_generation):
+                    session["running"] = False
+                    session["run_started_at"] = None
+                    session["run_last_activity"] = None
+                    _clear_inflight_turn(session)
+                    concurrent_queue = session.get("queued_prompt")
+                    if accepted_before_recovery is not None:
+                        session["queued_prompt"] = accepted_before_recovery
+                        if concurrent_queue is not None:
+                            _enqueue_prompt(
+                                session,
+                                concurrent_queue["text"],
+                                concurrent_queue.get("transport"),
+                            )
+                    elif concurrent_queue is None:
+                        session.pop("queued_prompt", None)
+            return _err(
+                rid,
+                5020,
+                "compute-host stale recovery failed: "
+                + str(release.get("message") or "unknown error"),
+            )
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid,
+            sid,
+            session,
+            text,
+            expected_generation=submit_generation,
+        )
         if not isolated_response.get("error"):
+            return isolated_response
+        if isolated_response["error"].get("code") == 4020:
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",

@@ -106,6 +106,142 @@ def test_compute_host_interrupt_control_is_not_queued_behind_turn():
         host.close()
 
 
+def test_compute_host_force_release_rebuilds_only_the_stuck_session(monkeypatch):
+    from tui_gateway import server
+
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+
+    class _OldAgent:
+        def __init__(self):
+            self._session_db = object()
+            self.interrupted = False
+
+        def interrupt(self, *_args, **_kwargs):
+            self.interrupted = True
+
+    old_agent = _OldAgent()
+    replacement = object()
+    ready = threading.Event()
+    ready.set()
+    session = {
+        "agent": old_agent,
+        "agent_ready": ready,
+        "agent_build_started": True,
+        "agent_build_generation": 1,
+        "session_key": "key",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "run_generation": 1,
+        "running": True,
+        "inflight_turn": {"user": "stuck"},
+        "slash_worker": None,
+    }
+    server._sessions["real-sid"] = session
+
+    def _build(_sid, current):
+        current["agent"] = replacement
+        current["agent_ready"].set()
+
+    monkeypatch.setattr(server, "_start_agent_build", _build)
+    try:
+        host.handle_frame(
+            {
+                "type": "force_release",
+                "sid": "real-sid",
+                "request_id": "release-1",
+            }
+        )
+        ack = _wait_for_frame(
+            out,
+            lambda frame: frame.get("type") == "force_release.ack",
+        )
+    finally:
+        server._sessions.pop("real-sid", None)
+        host.close()
+
+    assert ack["request_id"] == "release-1"
+    assert ack["applied"] is True
+    assert old_agent.interrupted is True
+    assert old_agent._session_db is None
+    assert session["agent"] is replacement
+    assert session["running"] is False
+    assert "real-sid" in host._force_release_bypass
+
+
+def test_force_released_turn_bypasses_exhausted_executor(monkeypatch):
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    replacement_started = threading.Event()
+
+    def _block_worker():
+        blocker_started.set()
+        release_blocker.wait(timeout=2)
+
+    host._executor.submit(_block_worker)
+    assert blocker_started.wait(timeout=1)
+    monkeypatch.setattr(
+        host,
+        "_run_real_turn",
+        lambda _frame: replacement_started.set(),
+    )
+    with host._force_release_lock:
+        host._force_release_bypass.add("wedged")
+    try:
+        host.handle_frame(
+            {
+                "type": "turn.start",
+                "sid": "wedged",
+                "request_id": "replacement",
+            }
+        )
+        assert replacement_started.wait(timeout=1)
+    finally:
+        release_blocker.set()
+        host.close()
+
+
+def test_supervisor_force_release_waits_for_matching_ack(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    sent = []
+
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+
+    def _send(frame):
+        sent.append(frame)
+        supervisor._handle_host_frame(
+            {
+                "type": "force_release.ack",
+                "sid": frame["sid"],
+                "request_id": frame["request_id"],
+                "applied": True,
+            }
+        )
+
+    monkeypatch.setattr(supervisor, "_send_frame", _send)
+
+    ack = supervisor.force_release("sid")
+
+    assert ack["applied"] is True
+    assert sent[0]["type"] == "force_release"
+    assert sent[0]["sid"] == "sid"
+
+    sent.clear()
+    result = supervisor.force_release(
+        "sid-no-wait",
+        wait=False,
+        clear_queued_prompt=True,
+    )
+    assert result["status"] == "sent"
+    assert sent[0]["clear_queued_prompt"] is True
+
+
 def test_compute_host_flushes_sessions_on_orphan_shutdown(monkeypatch):
     from tui_gateway import server
 

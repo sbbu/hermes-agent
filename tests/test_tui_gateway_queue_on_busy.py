@@ -216,6 +216,77 @@ def test_busy_interrupt_mode_queues_multimodal_payload_instead_of_redirect(monke
     assert session["queued_prompt"]["text"] == rich
 
 
+def test_prompt_submit_claim_is_atomic_across_concurrent_clients(monkeypatch):
+    """Only one idle submit may claim the run; the racer is queued."""
+
+    real_thread = threading.Thread
+    first_release = threading.Barrier(2)
+
+    class _GateLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._seen: set[int] = set()
+            self._seen_lock = threading.Lock()
+
+        def __enter__(self):
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            ident = threading.get_ident()
+            with self._seen_lock:
+                first = ident not in self._seen
+                self._seen.add(ident)
+            self._lock.release()
+            if first:
+                first_release.wait(timeout=2)
+
+    class _NoopThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            return None
+
+    session = _session(history_lock=_GateLock())
+    server._sessions["sid"] = session
+    responses = {}
+
+    def _submit(rid, text):
+        responses[rid] = server.handle_request(
+            {
+                "id": rid,
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": text},
+            }
+        )
+
+    callers = [
+        real_thread(target=_submit, args=("one", "first")),
+        real_thread(target=_submit, args=("two", "second")),
+    ]
+    try:
+        monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a, **_k: False)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_k: None)
+        monkeypatch.setattr(server.threading, "Thread", _NoopThread)
+
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(timeout=2)
+
+        assert all(not caller.is_alive() for caller in callers)
+        statuses = sorted(resp["result"]["status"] for resp in responses.values())
+        assert statuses == ["queued", "streaming"]
+        assert session["run_generation"] == 1
+        assert session["queued_prompt"]["text"] in {"first", "second"}
+        assert session["inflight_turn"]["user"] in {"first", "second"}
+        assert session["queued_prompt"]["text"] != session["inflight_turn"]["user"]
+    finally:
+        server._sessions.pop("sid", None)
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
