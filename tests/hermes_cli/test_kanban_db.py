@@ -200,6 +200,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "workflow_parent_id" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
@@ -234,6 +235,25 @@ def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
 def test_create_task_unknown_parent_errors(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
         kb.create_task(conn, title="orphan", parents=["t_ghost"])
+
+
+def test_workflow_parent_is_non_blocking_and_exposed(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="workflow root")
+        child = kb.create_task(
+            conn, title="workflow stage", workflow_parent_id=root,
+        )
+        task = kb.get_task(conn, child)
+
+    assert task.status == "ready"
+    assert task.workflow_parent_id == root
+
+
+def test_create_task_unknown_workflow_parent_errors(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="unknown workflow parent"):
+        kb.create_task(
+            conn, title="orphan stage", workflow_parent_id="t_ghost",
+        )
 
 
 def test_workspace_kind_validation(kanban_home):
@@ -407,6 +427,42 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
 
         events = kb.list_events(conn, t)
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+
+
+def test_wait_and_resume_are_non_dispatchable_and_parent_gated(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        task_id = kb.create_task(conn, title="stage", parents=[parent])
+
+        assert kb.wait_task(conn, task_id, reason="external gate") is True
+        assert kb.get_task(conn, task_id).status == "waiting"
+        assert kb.claim_task(conn, task_id) is None
+
+        assert kb.resume_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id).status == "todo"
+
+        kb.complete_task(conn, parent)
+        assert kb.wait_task(conn, task_id, reason="second gate") is True
+        assert kb.resume_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_resume_done_requires_explicit_reopen_and_preserves_runs(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="retry stage", assignee="builder")
+        kb.claim_task(conn, task_id)
+        kb.complete_task(conn, task_id, result="first result")
+        run_ids_before = [run.id for run in kb.list_runs(conn, task_id)]
+
+        assert kb.resume_task(conn, task_id) is False
+        assert kb.get_task(conn, task_id).status == "done"
+        assert kb.resume_task(conn, task_id, reopen=True) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.completed_at is None
+        assert task.result is None
+        assert [run.id for run in kb.list_runs(conn, task_id)] == run_ids_before
 
 
 def test_unblock_scheduled_rechecks_parent_gate(kanban_home):

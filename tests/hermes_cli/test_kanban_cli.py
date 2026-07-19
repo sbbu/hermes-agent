@@ -130,6 +130,40 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
     assert "child" in ready_list
 
 
+def test_run_slash_workflow_parent_create_list_show(kanban_home):
+    import re
+
+    root_out = kc.run_slash("create 'workflow root'")
+    root = re.search(r"(t_[a-f0-9]+)", root_out).group(1)
+    child_out = kc.run_slash(
+        f"create 'workflow stage' --workflow-parent-id {root} --json"
+    )
+    child = json.loads(child_out)
+    assert child["workflow_parent_id"] == root
+    assert child["status"] == "ready"
+
+    listed = json.loads(kc.run_slash("list --json"))
+    stage = next(row for row in listed if row["title"] == "workflow stage")
+    assert stage["workflow_parent_id"] == root
+    assert f"workflow parent: {root}" in kc.run_slash(f"show {stage['id']}")
+
+
+def test_run_slash_wait_resume_and_explicit_done_reopen(kanban_home):
+    import re
+
+    out = kc.run_slash("create 'factory stage' --assignee builder")
+    task_id = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    assert "Waiting" in kc.run_slash(f"wait {task_id} --reason 'external gate'")
+    assert "waiting" in kc.run_slash(f"show {task_id}")
+    assert "Resumed" in kc.run_slash(f"resume {task_id}")
+
+    kc.run_slash(f"complete {task_id} --result done")
+    refused = kc.run_slash(f"resume {task_id}")
+    assert "--reopen" in refused
+    assert "Reopened" in kc.run_slash(f"resume {task_id} --reopen")
+    assert "ready" in kc.run_slash(f"show {task_id}")
+
+
 def test_run_slash_show_includes_comments(kanban_home):
     out = kc.run_slash("create 'x'")
     import re

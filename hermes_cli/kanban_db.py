@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "waiting", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -922,6 +922,8 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Workflow grouping only; unlike task_links this never gates dispatch.
+    workflow_parent_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1010,6 +1012,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            workflow_parent_id=(
+                row["workflow_parent_id"] if "workflow_parent_id" in keys else None
             ),
         )
 
@@ -1193,7 +1198,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Workflow grouping only; deliberately separate from blocking task_links.
+    workflow_parent_id   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2345,6 +2352,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "workflow_parent_id" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "workflow_parent_id", "workflow_parent_id TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2768,6 +2780,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    workflow_parent_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2860,6 +2873,10 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    if workflow_parent_id:
+        workflow_parent_id = str(workflow_parent_id).strip() or None
+    if workflow_parent_id and not get_task(conn, workflow_parent_id):
+        raise ValueError(f"unknown workflow parent task: {workflow_parent_id}")
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3006,8 +3023,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, workflow_parent_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3032,6 +3049,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_parent_id,
                     ),
                 )
                 for pid in parents:
@@ -3053,6 +3071,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "workflow_parent_id": workflow_parent_id,
                     },
                 )
             return task_id
@@ -5645,6 +5664,66 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
+        )
+        return True
+
+
+def wait_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
+    """Park non-running workflow work in non-dispatchable ``waiting``."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'waiting' "
+            "WHERE id = ? AND status IN "
+            "('triage', 'todo', 'scheduled', 'ready', 'blocked', 'review')",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "waiting", {"reason": reason})
+        return True
+
+
+def resume_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reopen: bool = False,
+) -> bool:
+    """Resume waiting work, or explicitly reopen done work preserving runs."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        old_status = row["status"]
+        if old_status == "done":
+            if not reopen:
+                return False
+        elif old_status != "waiting":
+            return False
+        undone_parent = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parent else "ready"
+        conn.execute(
+            "UPDATE tasks SET status = ?, completed_at = NULL, result = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "current_run_id = NULL WHERE id = ?",
+            (new_status, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "reopened" if old_status == "done" else "resumed",
+            {"status": new_status},
         )
         return True
 
