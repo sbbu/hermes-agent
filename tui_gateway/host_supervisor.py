@@ -161,8 +161,18 @@ class HostSupervisor:
         self._closing = False
         self._stopped_respawning = False
         self._restart_times: list[float] = []
-        self._pending_turns: dict[str, tuple[str, Callable[[dict], None] | None]] = {}
-        self._pending_controls: dict[str, queue.Queue[dict]] = {}
+        self._pending_turns: dict[
+            str,
+            tuple[
+                subprocess.Popen[str] | None,
+                str,
+                Callable[[dict], None] | None,
+            ],
+        ] = {}
+        self._pending_controls: dict[
+            str,
+            tuple[subprocess.Popen[str] | None, queue.Queue[dict]],
+        ] = {}
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
 
@@ -243,10 +253,10 @@ class HostSupervisor:
         payload = dict(frame)
         payload["type"] = "turn.start"
         payload["request_id"] = request_id
-        with self._lock:
-            self._pending_turns[request_id] = (sid, on_complete)
         try:
-            self._send_frame(payload)
+            with self._lock:
+                self._pending_turns[request_id] = (self._proc, sid, on_complete)
+                self._send_frame(payload)
         except Exception as exc:
             with self._lock:
                 self._pending_turns.pop(request_id, None)
@@ -278,18 +288,18 @@ class HostSupervisor:
         self.start()
         request_id = uuid.uuid4().hex
         q: queue.Queue[dict] | None = queue.Queue(maxsize=1) if wait else None
-        if q is not None:
-            with self._lock:
-                self._pending_controls[request_id] = q
         try:
-            self._send_frame(
-                {
-                    "type": "force_release",
-                    "sid": sid,
-                    "request_id": request_id,
-                    "clear_queued_prompt": clear_queued_prompt,
-                }
-            )
+            with self._lock:
+                if q is not None:
+                    self._pending_controls[request_id] = (self._proc, q)
+                self._send_frame(
+                    {
+                        "type": "force_release",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "clear_queued_prompt": clear_queued_prompt,
+                    }
+                )
             if q is None:
                 return {"status": "sent", "request_id": request_id}
             return q.get(timeout=timeout)
@@ -299,12 +309,24 @@ class HostSupervisor:
                     self._pending_controls.pop(request_id, None)
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:
-        return self.control(
+        response = self.control(
             sid,
             route_name="reload.mcp",
             payload={"type": "reload_mcp", "sid": sid, "request_id": request_id or uuid.uuid4().hex},
             wait=True,
         )
+        if response.get("type") in {"control.error", "error"}:
+            raise RuntimeError(str(response.get("message") or "compute-host reload failed"))
+        nested_response = response.get("response")
+        if isinstance(nested_response, dict) and nested_response.get("error"):
+            nested_error = nested_response["error"]
+            message = (
+                nested_error.get("message")
+                if isinstance(nested_error, dict)
+                else nested_error
+            )
+            raise RuntimeError(str(message or "compute-host reload failed"))
+        return response
 
     def control(
         self,
@@ -327,16 +349,18 @@ class HostSupervisor:
         q: queue.Queue[dict] | None = None
         if wait:
             q = queue.Queue(maxsize=1)
-            with self._lock:
-                self._pending_controls[request_id] = q
-        self._send_frame(frame)
-        if not wait or q is None:
-            return {"status": "sent", "request_id": request_id}
         try:
+            with self._lock:
+                if q is not None:
+                    self._pending_controls[request_id] = (self._proc, q)
+                self._send_frame(frame)
+            if not wait or q is None:
+                return {"status": "sent", "request_id": request_id}
             return q.get(timeout=timeout)
         finally:
-            with self._lock:
-                self._pending_controls.pop(request_id, None)
+            if q is not None:
+                with self._lock:
+                    self._pending_controls.pop(request_id, None)
 
     def _spawn_locked(self, *, reason: str) -> None:
         if self._stopped_respawning:
@@ -363,12 +387,30 @@ class HostSupervisor:
             start_new_session=True,
         )
         self._proc = proc
-        self._stdout_thread = _Thread(target=self._drain_stdout, args=(proc,), name="compute-host-stdout", daemon=True)
-        self._stderr_thread = _Thread(target=self._drain_stderr, args=(proc,), name="compute-host-stderr", daemon=True)
-        self._wait_thread = _Thread(target=self._wait_for_exit, args=(proc,), name="compute-host-wait", daemon=True)
-        self._stdout_thread.start()
-        self._stderr_thread.start()
-        self._wait_thread.start()
+        stdout_thread = _Thread(
+            target=self._drain_stdout,
+            args=(proc,),
+            name="compute-host-stdout",
+            daemon=True,
+        )
+        stderr_thread = _Thread(
+            target=self._drain_stderr,
+            args=(proc,),
+            name="compute-host-stderr",
+            daemon=True,
+        )
+        wait_thread = _Thread(
+            target=self._wait_for_exit,
+            args=(proc, stdout_thread),
+            name="compute-host-wait",
+            daemon=True,
+        )
+        self._stdout_thread = stdout_thread
+        self._stderr_thread = stderr_thread
+        self._wait_thread = wait_thread
+        stdout_thread.start()
+        stderr_thread.start()
+        wait_thread.start()
         if not self._hello_event.wait(timeout=10.0):
             self._terminate_process(proc)
             raise RuntimeError(f"compute host did not send hello; stderr={self._stderr_tail[-5:]}")
@@ -425,7 +467,7 @@ class HostSupervisor:
                 logger.warning("compute host emitted invalid json: %r", raw[:200])
                 continue
             if isinstance(frame, dict):
-                self._handle_host_frame(frame)
+                self._handle_host_frame(frame, proc=proc)
 
     def _drain_stderr(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stderr is not None
@@ -435,7 +477,12 @@ class HostSupervisor:
                 self._stderr_tail = (self._stderr_tail + [text])[-80:]
                 logger.warning("compute host stderr: %s", text)
 
-    def _handle_host_frame(self, frame: dict[str, Any]) -> None:
+    def _handle_host_frame(
+        self,
+        frame: dict[str, Any],
+        *,
+        proc: subprocess.Popen[str] | None = None,
+    ) -> None:
         ftype = str(frame.get("type") or "")
         if ftype == "hello":
             self._hello = dict(frame)
@@ -451,7 +498,7 @@ class HostSupervisor:
                 self.rpc_sink(message)
             return
         if ftype in {"turn.end", "turn.error"}:
-            self._complete_turn(frame)
+            self._complete_turn(frame, proc=proc)
             return
         if ftype in {
             "control.ack",
@@ -463,7 +510,12 @@ class HostSupervisor:
         }:
             request_id = str(frame.get("request_id") or "")
             with self._lock:
-                q = self._pending_controls.get(request_id)
+                pending = self._pending_controls.get(request_id)
+                if pending is not None and (proc is None or pending[0] is proc):
+                    self._pending_controls.pop(request_id, None)
+                    q = pending[1]
+                else:
+                    q = None
             if q is not None:
                 try:
                     q.put_nowait(frame)
@@ -473,42 +525,106 @@ class HostSupervisor:
         if ftype == "error" and frame.get("request_id"):
             request_id = str(frame.get("request_id") or "")
             with self._lock:
-                q = self._pending_controls.get(request_id)
+                pending = self._pending_controls.get(request_id)
+                if pending is not None and (proc is None or pending[0] is proc):
+                    self._pending_controls.pop(request_id, None)
+                    q = pending[1]
+                else:
+                    q = None
             if q is not None:
                 try:
                     q.put_nowait(frame)
                 except queue.Full:
                     pass
 
-    def _complete_turn(self, frame: dict[str, Any]) -> None:
+    def _complete_turn(
+        self,
+        frame: dict[str, Any],
+        *,
+        proc: subprocess.Popen[str] | None = None,
+    ) -> None:
         request_id = str(frame.get("request_id") or "")
         with self._lock:
-            pending = self._pending_turns.pop(request_id, None)
+            pending = self._pending_turns.get(request_id)
+            if pending is not None and (proc is None or pending[0] is proc):
+                self._pending_turns.pop(request_id, None)
+            else:
+                pending = None
         if pending is None:
             return
-        _sid, cb = pending
+        _owner_proc, _sid, cb = pending
         if cb is not None:
             try:
                 cb(frame)
             except Exception:
                 logger.exception("compute host turn completion callback failed")
 
-    def _wait_for_exit(self, proc: subprocess.Popen[str]) -> None:
+    def _wait_for_exit(
+        self,
+        proc: subprocess.Popen[str],
+        stdout_thread: threading.Thread | None = None,
+    ) -> None:
         code = proc.wait()
-        if self._closing:
-            return
-        with self._lock:
-            if self._proc is not proc:
-                return
-            self._proc = None
-        self._remove_registry()
-        self._fail_pending_turns(reason="crash", message=f"compute host exited with code {code}")
-        self._maybe_respawn_after_crash()
+        # A child can flush its terminal response immediately before exit. Let
+        # that process' stdout reader claim completed requests before synthesizing
+        # crash errors for whatever remains unresolved. This is deliberately an
+        # unbounded join: frame handling is ordered, and the production websocket
+        # sink has its own bounded write timeout; timing out here can overtake a
+        # terminal ack queued behind a slow event and falsely fail the request.
+        if stdout_thread is not None and stdout_thread is not threading.current_thread():
+            stdout_thread.join()
 
-    def _fail_pending_turns(self, *, reason: str, message: str) -> None:
+        pending_turns: dict[str, tuple[str, Callable[[dict], None] | None]] = {}
+        pending_controls: dict[str, queue.Queue[dict]] = {}
         with self._lock:
-            pending = self._pending_turns
-            self._pending_turns = {}
+            current_process = self._proc is proc
+            if current_process:
+                self._proc = None
+            closing = self._closing
+            for request_id, (owner_proc, sid, callback) in list(
+                self._pending_turns.items()
+            ):
+                if owner_proc is proc:
+                    pending_turns[request_id] = (sid, callback)
+                    self._pending_turns.pop(request_id, None)
+            for request_id, (owner_proc, response_queue) in list(
+                self._pending_controls.items()
+            ):
+                if owner_proc is proc:
+                    pending_controls[request_id] = response_queue
+                    self._pending_controls.pop(request_id, None)
+
+        if current_process:
+            self._remove_registry()
+        reason = "shutdown" if closing else "crash"
+        message = (
+            f"compute host shut down with code {code}"
+            if closing
+            else f"compute host exited with code {code}"
+        )
+        # Wake bounded control RPCs before invoking arbitrary turn callbacks.
+        self._fail_pending_controls(
+            pending_controls,
+            reason=reason,
+            message=message,
+        )
+        try:
+            self._fail_pending_turns(
+                pending_turns,
+                reason=reason,
+                message=message,
+            )
+        finally:
+            if current_process and not closing:
+                self._maybe_respawn_after_crash()
+
+    def _fail_pending_turns(
+        self,
+        pending: dict[str, tuple[str, Callable[[dict], None] | None]],
+        *,
+        reason: str,
+        message: str,
+    ) -> None:
         for request_id, (sid, cb) in pending.items():
             frame = {
                 "type": "turn.error",
@@ -517,22 +633,47 @@ class HostSupervisor:
                 "reason": reason,
                 "message": message,
             }
-            self.rpc_sink(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {
-                        "type": "error",
-                        "session_id": sid,
-                        "payload": {"message": message, "reason": reason},
-                    },
-                }
-            )
+            try:
+                self.rpc_sink(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "type": "error",
+                            "session_id": sid,
+                            "payload": {"message": message, "reason": reason},
+                        },
+                    }
+                )
+            except Exception:
+                logger.exception("compute host crash event sink failed")
             if cb is not None:
                 try:
                     cb(frame)
                 except Exception:
                     logger.exception("compute host error callback failed")
+
+    def _fail_pending_controls(
+        self,
+        pending: dict[str, queue.Queue[dict]],
+        *,
+        reason: str,
+        message: str,
+    ) -> None:
+        """Wake synchronous control callers when their child exits."""
+        for request_id, response_queue in pending.items():
+            try:
+                response_queue.put_nowait(
+                    {
+                        "type": "control.error",
+                        "request_id": request_id,
+                        "reason": reason,
+                        "message": message,
+                    }
+                )
+            except queue.Full:
+                # A terminal response won the race with process exit.
+                pass
 
     def _maybe_respawn_after_crash(self) -> None:
         now = time.monotonic()
