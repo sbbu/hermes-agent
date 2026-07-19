@@ -15990,6 +15990,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         return
+    run_id_raw = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        expected_run_id = int(run_id_raw) if run_id_raw else None
+    except ValueError:
+        expected_run_id = None
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -16017,6 +16022,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     def _run_turn(prompt: str) -> str:
+        status = _task_status()
+        if status not in ("running", "ready"):
+            raise RuntimeError(
+                f"kanban run ownership lost before continuation: status={status}"
+            )
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
@@ -16036,6 +16046,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         c = _kb.connect()
         try:
             t = _kb.get_task(c, task_id)
+            if (
+                t is not None
+                and expected_run_id is not None
+                and t.status in ("running", "ready")
+                and t.current_run_id != expected_run_id
+            ):
+                # The controller reopened the card or a newer worker owns it.
+                # This completed worker's goal-loop supervisor is permanently
+                # stale and must not nudge, continue, or block the new run.
+                return "stale_run"
             return t.status if t is not None else None
         finally:
             try:
@@ -16046,7 +16066,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            _kb.block_task(
+                c,
+                task_id,
+                reason=reason,
+                expected_run_id=expected_run_id,
+            )
         finally:
             try:
                 c.close()
