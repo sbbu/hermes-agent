@@ -515,10 +515,16 @@ def test_resume_done_requires_explicit_reopen_and_preserves_runs(kanban_home):
 
         assert kb.resume_task(conn, task_id) is False
         assert kb.get_task(conn, task_id).status == "done"
-        assert kb.resume_task(conn, task_id, reopen=True) is True
+        assert kb.resume_task(
+            conn,
+            task_id,
+            reopen=True,
+            step_key="implementing",
+        ) is True
 
         task = kb.get_task(conn, task_id)
         assert task.status == "ready"
+        assert task.current_step_key == "implementing"
         assert task.completed_at is None
         assert task.result is None
         assert [run.id for run in kb.list_runs(conn, task_id)] == run_ids_before

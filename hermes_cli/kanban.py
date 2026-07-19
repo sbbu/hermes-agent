@@ -651,6 +651,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Explicitly reopen done work while preserving run history",
     )
     p_resume.add_argument("--reason", default=None, help="Optional audit reason")
+    p_resume.add_argument("--step-key", default=None, help="Structured workflow phase")
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -2326,6 +2327,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
             args.task_id,
             reopen=bool(args.reopen),
             reason=(args.reason or "").strip() or None,
+            step_key=args.step_key,
         )
         updated = kb.get_task(conn, args.task_id) if ok else None
     if not ok:
