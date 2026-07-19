@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -160,8 +161,22 @@ def test_run_slash_wait_resume_and_explicit_done_reopen(kanban_home):
     kc.run_slash(f"complete {task_id} --result done")
     refused = kc.run_slash(f"resume {task_id}")
     assert "--reopen" in refused
-    assert "Reopened" in kc.run_slash(f"resume {task_id} --reopen")
-    assert "ready" in kc.run_slash(f"show {task_id}")
+    assert "Reopened" in kc.run_slash(
+        f"resume {task_id} --reopen --step-key implementing"
+    )
+    reopened = json.loads(kc.run_slash(f"show {task_id} --json"))
+    assert reopened["task"]["status"] == "ready"
+    assert reopened["task"]["current_step_key"] == "implementing"
+
+
+def test_top_level_main_propagates_failed_kanban_exit_status(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import main as main_module
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "kanban", "resume", "t_missing"])
+
+    assert main_module.main() == 1
 
 
 def test_run_slash_show_includes_comments(kanban_home):

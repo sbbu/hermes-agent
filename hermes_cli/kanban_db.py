@@ -5810,8 +5810,10 @@ def resume_task(
     *,
     reopen: bool = False,
     reason: Optional[str] = None,
+    step_key: Optional[str] = None,
 ) -> bool:
     """Resume waiting work, or explicitly reopen done work preserving runs."""
+    normalized_step = str(step_key).strip() if step_key else None
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -5833,14 +5835,15 @@ def resume_task(
         conn.execute(
             "UPDATE tasks SET status = ?, completed_at = NULL, result = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-            "current_run_id = NULL WHERE id = ?",
-            (new_status, task_id),
+            "current_run_id = NULL, "
+            "current_step_key = COALESCE(?, current_step_key) WHERE id = ?",
+            (new_status, normalized_step, task_id),
         )
         _append_event(
             conn,
             task_id,
             "reopened" if old_status == "done" else "resumed",
-            {"status": new_status, "reason": reason},
+            {"status": new_status, "reason": reason, "step_key": normalized_step},
         )
         return True
 
