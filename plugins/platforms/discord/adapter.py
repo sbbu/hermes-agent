@@ -2176,7 +2176,7 @@ class DiscordAdapter(BasePlatformAdapter):
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(
-            message, claim=False,
+            message, claim=True,
         )
         if not admitted:
             return False

@@ -389,6 +389,38 @@ async def test_recovered_mention_reuses_live_auth_and_mention_gates(adapter, mon
 
 
 @pytest.mark.asyncio
+async def test_recovery_claims_dedup_before_async_dispatch(adapter):
+    """A live MESSAGE_CREATE race cannot dispatch a recovering message twice."""
+    bot_user = adapter._client.user
+    message = make_message(
+        message_id=103,
+        content=f"<@{bot_user.id}> recover once",
+        mentions=[bot_user],
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_dispatch(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+        return True
+
+    adapter._handle_message = AsyncMock(side_effect=slow_dispatch)
+    recovery = asyncio.create_task(adapter._dispatch_recovered_message(message))
+    await started.wait()
+
+    live_admitted, _role_authorized = adapter._discord_message_admission(
+        message,
+        claim=True,
+    )
+    assert live_admitted is False
+
+    release.set()
+    assert await recovery is True
+    assert adapter._dedup.contains(str(message.id)) is True
+
+
+@pytest.mark.asyncio
 async def test_recovery_does_not_treat_unmentioned_message_as_dispatched(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
