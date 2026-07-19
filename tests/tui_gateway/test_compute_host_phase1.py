@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -476,6 +477,216 @@ def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
     assert result == "pid-reuse-ignored"
     assert killed == []
     assert not registry.exists()
+
+
+def test_supervisor_crash_releases_pending_control_waiter(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+
+    class _ExitedProcess:
+        def wait(self):
+            return 7
+
+    proc: Any = _ExitedProcess()
+    supervisor._proc = proc
+    frame_sent = threading.Event()
+    result: dict[str, Any] = {}
+
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(supervisor, "_send_frame", lambda _frame: frame_sent.set())
+    monkeypatch.setattr(supervisor, "_remove_registry", lambda: None)
+    monkeypatch.setattr(supervisor, "_maybe_respawn_after_crash", lambda: None)
+
+    def _wait_for_control() -> None:
+        try:
+            result["frame"] = supervisor.control(
+                "sid",
+                route_name="session.compress",
+                timeout=1.0,
+            )
+        except Exception as exc:
+            result["error"] = exc
+
+    waiter = threading.Thread(target=_wait_for_control)
+    waiter.start()
+    assert frame_sent.wait(timeout=1)
+
+    supervisor._wait_for_exit(proc)
+    waiter.join(timeout=1)
+
+    assert not waiter.is_alive()
+    assert "error" not in result
+    assert result["frame"]["type"] == "control.error"
+    assert result["frame"]["request_id"]
+    assert result["frame"]["reason"] == "crash"
+    assert result["frame"]["message"] == "compute host exited with code 7"
+    assert supervisor._pending_controls == {}
+
+
+def test_supervisor_crash_does_not_fail_replacement_controls(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+
+    class _ExitedProcess:
+        def wait(self):
+            return 7
+
+    old_proc: Any = _ExitedProcess()
+    new_proc: Any = object()
+    supervisor._proc = old_proc
+    sent_frames: list[dict] = []
+    first_sent = threading.Event()
+    second_sent = threading.Event()
+    results: dict[str, Any] = {}
+
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(supervisor, "_remove_registry", lambda: None)
+    monkeypatch.setattr(supervisor, "_maybe_respawn_after_crash", lambda: None)
+
+    def _send(frame: dict) -> None:
+        sent_frames.append(frame)
+        (first_sent if len(sent_frames) == 1 else second_sent).set()
+
+    monkeypatch.setattr(supervisor, "_send_frame", _send)
+
+    def _control(name: str) -> None:
+        results[name] = supervisor.control(
+            "sid",
+            route_name="session.compress",
+            timeout=1.0,
+        )
+
+    old_waiter = threading.Thread(target=_control, args=("old",))
+    old_waiter.start()
+    assert first_sent.wait(timeout=1)
+
+    with supervisor._lock:
+        supervisor._proc = new_proc
+    new_waiter = threading.Thread(target=_control, args=("new",))
+    new_waiter.start()
+    assert second_sent.wait(timeout=1)
+
+    supervisor._wait_for_exit(old_proc)
+    old_waiter.join(timeout=1)
+    assert results["old"]["type"] == "control.error"
+    assert new_waiter.is_alive(), "old host crash failed a replacement-host control"
+
+    supervisor._handle_host_frame(
+        {
+            "type": "control.ack",
+            "request_id": sent_frames[1]["request_id"],
+        },
+        proc=new_proc,
+    )
+    new_waiter.join(timeout=1)
+
+    assert not new_waiter.is_alive()
+    assert results["new"]["type"] == "control.ack"
+    assert supervisor._pending_controls == {}
+
+
+def test_supervisor_drains_terminal_control_ack_before_crash_error(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+
+    class _ExitedProcess:
+        def wait(self):
+            return 7
+
+    proc: Any = _ExitedProcess()
+    supervisor._proc = proc
+    sent: dict[str, Any] = {}
+    frame_sent = threading.Event()
+    result: dict[str, Any] = {}
+
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(supervisor, "_remove_registry", lambda: None)
+    monkeypatch.setattr(supervisor, "_maybe_respawn_after_crash", lambda: None)
+
+    def _send(frame: dict) -> None:
+        sent.update(frame)
+        frame_sent.set()
+
+    monkeypatch.setattr(supervisor, "_send_frame", _send)
+
+    waiter = threading.Thread(
+        target=lambda: result.update(
+            response=supervisor.control(
+                "sid",
+                route_name="session.compress",
+                timeout=1.0,
+            )
+        )
+    )
+    waiter.start()
+    assert frame_sent.wait(timeout=1)
+
+    class _StdoutDrain:
+        def join(self, *args, **kwargs) -> None:
+            result["join_call"] = (args, kwargs)
+            supervisor._handle_host_frame(
+                {"type": "control.ack", "request_id": sent["request_id"]},
+                proc=proc,
+            )
+
+    stdout_thread: Any = _StdoutDrain()
+    supervisor._wait_for_exit(proc, stdout_thread)
+    waiter.join(timeout=1)
+
+    assert not waiter.is_alive()
+    assert result["join_call"] == ((), {})
+    assert result["response"]["type"] == "control.ack"
+    assert supervisor._pending_controls == {}
+
+
+def test_supervisor_reload_mcp_raises_on_host_control_error(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "control",
+        lambda *_args, **_kwargs: {
+            "type": "control.error",
+            "message": "compute host exited",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="compute host exited"):
+        supervisor.reload_mcp("sid")
+
+
+def test_supervisor_reload_mcp_raises_on_nested_rpc_error(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "control",
+        lambda *_args, **_kwargs: {
+            "type": "reload_mcp.ack",
+            "response": {
+                "jsonrpc": "2.0",
+                "error": {"code": 5015, "message": "MCP discovery failed"},
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="MCP discovery failed"):
+        supervisor.reload_mcp("sid")
 
 
 def test_supervisor_crash_emits_turn_error_and_respawns(tmp_path):
