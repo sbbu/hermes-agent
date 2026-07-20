@@ -4516,6 +4516,27 @@ class TestWebServerEndpoints:
         assert model_cfg.get("api_key") == "sk-other"
         assert model_cfg.get("base_url") == "https://llm.other.corp/v1"
 
+    def test_custom_endpoints_profile_query_isolates_config(self):
+        assert self.client.post("/api/profiles", json={"name": "analyst"}).status_code == 200
+
+        created = self.client.post(
+            "/api/providers/custom-endpoints?profile=analyst",
+            json={
+                "id": "profile-proxy",
+                "name": "Profile Proxy",
+                "base_url": "http://127.0.0.1:8082/v1",
+                "model": "profile-model",
+            },
+        )
+        assert created.status_code == 200
+
+        analyst = self.client.get("/api/providers/custom-endpoints?profile=analyst")
+        default = self.client.get("/api/providers/custom-endpoints")
+        assert analyst.status_code == 200
+        assert default.status_code == 200
+        assert any(item["id"] == "profile-proxy" for item in analyst.json()["endpoints"])
+        assert all(item["id"] != "profile-proxy" for item in default.json()["endpoints"])
+
     def test_set_model_main_preserves_base_url_for_named_custom_provider(self):
         """Selecting a named custom endpoint from the Desktop model picker
         should keep its endpoint URL attached to model config.
