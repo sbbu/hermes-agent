@@ -1,14 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  activateCustomEndpoint,
   checkHermesUpdate,
+  deleteCustomEndpoint,
   getActionStatus,
+  getCustomEndpoints,
   getMemoryProviderConfig,
   getStatus,
   restartGateway,
+  saveCustomEndpoint,
   saveMemoryProviderConfig,
   setApiRequestProfile,
-  updateHermes
+  updateHermes,
+  validateCustomEndpoint
 } from './hermes'
 
 // Contract: every backend-targeted action helper must carry the active gateway
@@ -40,6 +45,26 @@ describe('backend action helpers are profile-scoped', () => {
 
     void getMemoryProviderConfig('honcho')
     void saveMemoryProviderConfig('honcho', { workspace: 'w' })
+
+    for (const call of api.mock.calls) {
+      expect(call[0].profile).toBe('coder')
+    }
+  })
+
+  it('forwards the active profile to custom endpoint calls', () => {
+    setApiRequestProfile('coder')
+
+    const endpoint = {
+      base_url: 'http://127.0.0.1:8080/v1',
+      model: 'test-model',
+      name: 'Test endpoint'
+    }
+
+    void getCustomEndpoints()
+    void saveCustomEndpoint(endpoint)
+    void validateCustomEndpoint(endpoint)
+    void activateCustomEndpoint('test-endpoint')
+    void deleteCustomEndpoint('test-endpoint')
 
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBe('coder')
