@@ -300,8 +300,74 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
     assert server._drain_queued_prompt("r1", "sid", session) is True
     assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
     assert session["running"] is True
+    assert session["run_generation"] == 1
     assert session["queued_prompt"] is None
     assert session["transport"] == "ws-9"
+
+
+def test_compute_host_drain_honors_concurrent_interrupt(monkeypatch):
+    """Stop after queue claim must fence the pending compute-host pipe write."""
+    frame_started = threading.Event()
+    release_frame = threading.Event()
+    submitted = []
+    emitted = []
+
+    class _Supervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            submitted.append(frame)
+
+        def force_release(self, _sid, **_kwargs):
+            return {"status": "sent"}
+
+    def _blocked_frame(rid, sid, _session, text):
+        frame_started.set()
+        assert release_frame.wait(timeout=2)
+        return {"request_id": rid, "sid": sid, "text": text}
+
+    session = _session(
+        run_generation=0,
+        queued_prompt={"text": "do not run", "transport": "ws-9"},
+    )
+    server._sessions["sid"] = session
+    try:
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+        monkeypatch.setattr(server, "_compute_host_turn_frame", _blocked_frame)
+        monkeypatch.setattr(
+            server, "_load_dashboard_process_isolation_config", lambda: {}
+        )
+        monkeypatch.setattr(
+            server, "_get_compute_host_supervisor", lambda *_args: _Supervisor()
+        )
+        monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+        drain = threading.Thread(
+            target=server._drain_queued_prompt,
+            args=("r1", "sid", session),
+        )
+        drain.start()
+        assert frame_started.wait(timeout=2)
+
+        interrupted = server.handle_request(
+            {
+                "id": "stop",
+                "method": "session.interrupt",
+                "params": {"session_id": "sid"},
+            }
+        )
+        release_frame.set()
+        drain.join(timeout=2)
+
+        assert interrupted is not None
+        assert interrupted["result"]["status"] == "interrupted"
+        assert not drain.is_alive()
+        assert submitted == []
+        assert emitted == []
+        assert session["run_generation"] == 2
+        assert session["running"] is False
+        assert session.get("inflight_turn") is None
+    finally:
+        release_frame.set()
+        server._sessions.pop("sid", None)
 
 
 def test_drain_noop_when_nothing_queued(monkeypatch):
