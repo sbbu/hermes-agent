@@ -6270,18 +6270,33 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued or session.get("running"):
             return False
         session["queued_prompt"] = None
-        session["running"] = True
+        submit_generation = _begin_session_run_locked(session, queued["text"])
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
         if _session_uses_compute_host(session):
-            resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
+            resp = _submit_prompt_to_compute_host(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                expected_generation=submit_generation,
+            )
             if resp.get("error"):
-                message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
+                message = str(
+                    ((resp.get("error") or {}).get("message"))
+                    or "queued prompt failed"
+                )
+                emit_error = False
                 with session["history_lock"]:
-                    session["running"] = False
-                    _clear_inflight_turn(session)
-                _emit("error", sid, {"message": message})
+                    if _run_current_locked(session, submit_generation):
+                        session["running"] = False
+                        session["run_started_at"] = None
+                        session["run_last_activity"] = None
+                        _clear_inflight_turn(session)
+                        emit_error = True
+                if emit_error:
+                    _emit("error", sid, {"message": message})
         else:
             _run_prompt_submit(rid, sid, session, queued["text"])
     except Exception as exc:
@@ -6291,7 +6306,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             file=sys.stderr,
         )
         with session["history_lock"]:
-            session["running"] = False
+            if _run_current_locked(session, submit_generation):
+                session["running"] = False
+                session["run_started_at"] = None
+                session["run_last_activity"] = None
+                _clear_inflight_turn(session)
     return True
 
 
