@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple, Union, overload
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -944,6 +944,46 @@ def _global_auth_file_path() -> Optional[Path]:
     return global_root / "auth.json"
 
 
+# Codex OAuth refresh tokens rotate on every refresh and are single-use. Named
+# profiles therefore cannot safely own copied Codex token chains: whichever
+# profile refreshes first invalidates every sibling copy. Keep one canonical
+# Codex auth store at the global root while preserving normal profile-local
+# ownership for providers whose credentials are intentionally isolated.
+_GLOBAL_SHARED_AUTH_PROVIDERS = frozenset({"openai-codex"})
+
+
+def _auth_store_path_for_provider(provider_id: str) -> Path:
+    """Return the canonical auth store for one provider.
+
+    In classic mode this is always the active ``auth.json``. In named-profile
+    mode, providers with process-shared rotating grants use the global root so
+    reads, writes, and refresh locking all target the same file.
+    """
+    active_path = _auth_file_path()
+    normalized = str(provider_id or "").strip().lower()
+    if normalized in _GLOBAL_SHARED_AUTH_PROVIDERS:
+        global_path = _global_auth_file_path()
+        if global_path is not None:
+            # This helper is a write target as well as a read target. Preserve
+            # the auth-store pytest seat belt that ``_global_auth_file_path``
+            # intentionally omits for its legacy read-only fallback callers.
+            if os.environ.get("PYTEST_CURRENT_TEST"):
+                real_home_auth = (
+                    Path.home() / ".hermes" / "auth.json"
+                ).resolve(strict=False)
+                try:
+                    resolved = global_path.resolve(strict=False)
+                except Exception:
+                    resolved = global_path
+                if resolved == real_home_auth:
+                    raise RuntimeError(
+                        "Refusing to touch real global auth store during test run: "
+                        f"{global_path}. Set HOME/global root to a tmp_path."
+                    )
+            return global_path
+    return active_path
+
+
 def _load_global_auth_store() -> Dict[str, Any]:
     """Load the global-root auth store (read-only fallback).
 
@@ -1215,6 +1255,17 @@ def _load_provider_state_with_source(
     the profile would leave the global/root store stale and cause the next
     process to replay an already-consumed refresh token.
     """
+    owner_path = _auth_store_path_for_provider(provider_id)
+    active_path = _auth_file_path()
+    if not _same_path(owner_path, active_path):
+        owner_store = _load_auth_store(owner_path)
+        owner_providers = owner_store.get("providers")
+        if isinstance(owner_providers, dict):
+            owner_state = owner_providers.get(provider_id)
+            if isinstance(owner_state, dict):
+                return dict(owner_state), owner_path
+        return None, owner_path
+
     providers = auth_store.get("providers")
     if isinstance(providers, dict):
         state = providers.get(provider_id)
@@ -1400,21 +1451,26 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+@overload
+def read_credential_pool(provider_id: None = None) -> Dict[str, Any]: ...
+
+
+@overload
+def read_credential_pool(provider_id: str) -> List[Dict[str, Any]]: ...
+
+
+def read_credential_pool(
+    provider_id: Optional[str] = None,
+) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
     """Return the persisted credential pool, or one provider slice.
 
-    In profile mode, the profile's credential pool is authoritative. If a
-    provider has no entries in the profile, entries from the global-root
-    ``auth.json`` are used as a read-only fallback — so workers spawned in a
-    profile can see providers that were only authenticated at global scope.
+    In profile mode, the profile's credential pool is authoritative except for
+    providers in ``_GLOBAL_SHARED_AUTH_PROVIDERS``. Those providers always read
+    the global-root pool because copying a rotating single-use OAuth grant into
+    multiple profiles creates mutually invalidating token chains. Other
+    providers fall back to global only when the profile has no local entries.
 
-    Profile entries always win: the global fallback only applies per-provider
-    when the profile has zero entries for that provider. Once the user runs
-    ``hermes auth add <provider>`` inside the profile, profile entries
-    fully shadow global for that provider on the next read.
-
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
-    See issue #18594 follow-up.
+    Writes use the same provider owner via ``write_credential_pool``.
     """
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
@@ -1429,8 +1485,18 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
 
     if provider_id is None:
         merged = dict(pool)
+        if _global_auth_file_path() is not None:
+            for shared_provider in _GLOBAL_SHARED_AUTH_PROVIDERS:
+                # Global ownership means even a non-empty stale profile copy
+                # must not shadow the canonical token chain.
+                merged.pop(shared_provider, None)
+                shared_entries = global_pool.get(shared_provider)
+                if isinstance(shared_entries, list) and shared_entries:
+                    merged[shared_provider] = list(shared_entries)
         for gp_key, gp_entries in global_pool.items():
             if not isinstance(gp_entries, list) or not gp_entries:
+                continue
+            if gp_key in _GLOBAL_SHARED_AUTH_PROVIDERS:
                 continue
             # Per-provider shadowing: profile wins whenever it has ANY entries.
             existing = merged.get(gp_key)
@@ -1438,6 +1504,14 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
                 continue
             merged[gp_key] = list(gp_entries)
         return merged
+
+    normalized_provider = str(provider_id or "").strip().lower()
+    if (
+        normalized_provider in _GLOBAL_SHARED_AUTH_PROVIDERS
+        and _global_auth_file_path() is not None
+    ):
+        global_entries = global_pool.get(normalized_provider)
+        return list(global_entries) if isinstance(global_entries, list) else []
 
     provider_entries = pool.get(provider_id)
     if isinstance(provider_entries, list) and provider_entries:
@@ -1468,8 +1542,9 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    target_path = _auth_store_path_for_provider(provider_id)
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1495,24 +1570,26 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
     """Mark a credential source as suppressed so it won't be re-seeded."""
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    target_path = _auth_store_path_for_provider(provider_id)
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         suppressed = auth_store.setdefault("suppressed_sources", {})
         provider_list = suppressed.setdefault(provider_id, [])
         if source not in provider_list:
             provider_list.append(source)
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=target_path)
 
 
 def is_source_suppressed(provider_id: str, source: str) -> bool:
     """Check if a credential source has been suppressed by the user."""
     try:
-        auth_store = _load_auth_store()
+        target_path = _auth_store_path_for_provider(provider_id)
+        auth_store = _load_auth_store(target_path)
         suppressed = auth_store.get("suppressed_sources", {})
         return source in suppressed.get(provider_id, [])
     except Exception:
@@ -1524,8 +1601,9 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
 
     Returns True if a marker was cleared, False if no marker existed.
     """
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    target_path = _auth_store_path_for_provider(provider_id)
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         suppressed = auth_store.get("suppressed_sources")
         if not isinstance(suppressed, dict):
             return False
@@ -1537,22 +1615,17 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
             suppressed.pop(provider_id, None)
         if not suppressed:
             auth_store.pop("suppressed_sources", None)
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=target_path)
         return True
 
 
 def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     """Return persisted auth state for a provider, or None.
 
-    In profile mode, ``_load_provider_state`` already falls back to the
-    global-root ``auth.json`` per-provider when the profile has no entry —
-    so this is now a thin convenience wrapper. Profile state always wins
-    when present. Writes (``_save_auth_store`` / ``persist_*_credentials``)
-    are unchanged — they still target the profile only. This mirrors
-    ``read_credential_pool``'s per-provider shadowing semantics so that
-    ``_seed_from_singletons`` can reseed a profile's credential pool from
-    global-scope provider state (e.g. a globally-authenticated Anthropic
-    OAuth or Nous device-code session). See issue #18594 follow-up.
+    In profile mode most providers use profile-first/global-fallback semantics.
+    Providers in ``_GLOBAL_SHARED_AUTH_PROVIDERS`` instead resolve directly
+    from their canonical global owner so stale profile copies cannot shadow a
+    rotating token chain.
     """
     auth_store = _load_auth_store()
     return _load_provider_state(auth_store, provider_id)
@@ -1649,17 +1722,16 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
 
 
 def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
-    """
-    Clear auth state for a provider. Used by `hermes logout`.
-    If provider_id is None, clears the active provider.
-    Returns True if something was cleared.
-    """
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        target = provider_id or auth_store.get("active_provider")
-        if not target:
-            return False
+    """Clear auth state for a provider. Used by ``hermes logout``."""
+    active_path = _auth_file_path()
+    active_store = _load_auth_store(active_path)
+    target = provider_id or active_store.get("active_provider")
+    if not target:
+        return False
 
+    target_path = _auth_store_path_for_provider(target)
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         providers = auth_store.get("providers", {})
         if not isinstance(providers, dict):
             providers = {}
@@ -1677,15 +1749,24 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
         if target in pool:
             del pool[target]
             cleared = True
-
         if auth_store.get("active_provider") == target:
             auth_store["active_provider"] = None
             cleared = True
+        if cleared:
+            _save_auth_store(auth_store, target_path=target_path)
 
-        if not cleared:
-            return False
-        _save_auth_store(auth_store)
-    return True
+        # A named profile still owns its active-provider preference even when
+        # the provider's credentials live globally. Clear that pointer too,
+        # taking the documented global-owner -> profile lock order.
+        if not _same_path(target_path, active_path):
+            with _auth_store_lock(target_path=active_path):
+                profile_store = _load_auth_store(active_path)
+                if profile_store.get("active_provider") == target:
+                    profile_store["active_provider"] = None
+                    _save_auth_store(profile_store, target_path=active_path)
+                    cleared = True
+
+    return cleared
 
 
 def deactivate_provider() -> None:
@@ -3322,11 +3403,12 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
     """
+    owner_path = _auth_store_path_for_provider("openai-codex")
     if _lock:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _auth_store_lock(target_path=owner_path):
+            auth_store = _load_auth_store(owner_path)
     else:
-        auth_store = _load_auth_store()
+        auth_store = _load_auth_store(owner_path)
     state = _load_provider_state(auth_store, "openai-codex")
     if not state:
         raise AuthError(
@@ -3467,11 +3549,12 @@ def _sync_codex_pool_entries(
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+    """Save Codex OAuth tokens to the canonical Hermes auth store."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    owner_path = _auth_store_path_for_provider("openai-codex")
+    with _auth_store_lock(target_path=owner_path):
+        auth_store = _load_auth_store(owner_path)
         state = _load_provider_state(auth_store, "openai-codex") or {}
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
@@ -3491,7 +3574,7 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=owner_path)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
@@ -3837,8 +3920,16 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
-        # Re-read under lock to avoid racing with other Hermes processes
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        # Re-read under the canonical provider lock to avoid racing with other
+        # Hermes processes or named profiles sharing this Codex token chain.
+        owner_path = _auth_store_path_for_provider("openai-codex")
+        with _auth_store_lock(
+            timeout_seconds=max(
+                float(AUTH_LOCK_TIMEOUT_SECONDS),
+                refresh_timeout_seconds + 5.0,
+            ),
+            target_path=owner_path,
+        ):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
@@ -4077,8 +4168,9 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        owner_path = _auth_store_path_for_provider("openai-codex")
+        with _auth_store_lock(target_path=owner_path):
+            auth_store = _load_auth_store(owner_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             return None
@@ -4136,8 +4228,9 @@ def _pool_codex_access_token() -> str:
     the original AuthError).
     """
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        owner_path = _auth_store_path_for_provider("openai-codex")
+        with _auth_store_lock(target_path=owner_path):
+            auth_store = _load_auth_store(owner_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             return ""
