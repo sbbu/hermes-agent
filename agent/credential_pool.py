@@ -765,8 +765,9 @@ class CredentialPool:
         if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            owner_path = auth_mod._auth_store_path_for_provider("openai-codex")
+            with _auth_store_lock(target_path=owner_path):
+                auth_store = _load_auth_store(owner_path)
                 state = _load_provider_state(auth_store, "openai-codex")
             if not isinstance(state, dict):
                 return entry
@@ -866,6 +867,49 @@ class CredentialPool:
         except Exception as exc:
             logger.debug("Failed to sync xAI OAuth entry from auth.json: %s", exc)
         return entry
+
+    def _sync_codex_entry_from_pool_store(
+        self, entry: PooledCredential
+    ) -> PooledCredential:
+        """Adopt a Codex token pair rotated by another profile or process.
+
+        Called while the canonical Codex auth-store lock is held. Manual Codex
+        pool entries have no singleton shadow, so the persisted pool row is the
+        only authoritative place to discover a refresh performed elsewhere.
+        """
+        if self.provider != "openai-codex":
+            return entry
+        try:
+            persisted = next(
+                (
+                    payload
+                    for payload in read_credential_pool(self.provider)
+                    if isinstance(payload, dict) and payload.get("id") == entry.id
+                ),
+                None,
+            )
+            if not isinstance(persisted, dict):
+                return entry
+            stored = PooledCredential.from_dict(self.provider, persisted)
+            if (
+                stored.access_token != entry.access_token
+                or stored.refresh_token != entry.refresh_token
+            ):
+                logger.debug(
+                    "Pool entry %s: adopting Codex OAuth tokens rotated by another pool instance",
+                    entry.id,
+                )
+                self._replace_entry(entry, stored)
+                return stored
+        except Exception as exc:
+            logger.debug("Failed to sync Codex entry from credential pool: %s", exc)
+        return entry
+
+    def _sync_codex_entry_for_refresh(
+        self, entry: PooledCredential
+    ) -> PooledCredential:
+        pooled = self._sync_codex_entry_from_pool_store(entry)
+        return self._sync_codex_entry_from_auth_store(pooled)
 
     def _sync_xai_oauth_entry_from_pool_store(
         self, entry: PooledCredential
@@ -1006,6 +1050,35 @@ class CredentialPool:
         # device-code sources (nous, openai-codex, xAI) use ``device_code``.
         if entry.source != "device_code":
             return
+        if self.provider == "openai-codex":
+            try:
+                owner_path = auth_mod._auth_store_path_for_provider("openai-codex")
+                with _auth_store_lock(target_path=owner_path):
+                    auth_store = _load_auth_store(owner_path)
+                    state = _load_provider_state(auth_store, "openai-codex")
+                    if not isinstance(state, dict):
+                        return
+                    tokens = state.get("tokens")
+                    if not isinstance(tokens, dict):
+                        return
+                    tokens["access_token"] = entry.access_token
+                    if entry.refresh_token:
+                        tokens["refresh_token"] = entry.refresh_token
+                    if entry.last_refresh:
+                        state["last_refresh"] = entry.last_refresh
+                    _store_provider_state(
+                        auth_store,
+                        "openai-codex",
+                        state,
+                        set_active=False,
+                    )
+                    _save_auth_store(auth_store, target_path=owner_path)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to sync openai-codex pool entry back to auth store: %s",
+                    exc,
+                )
+            return
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
@@ -1110,12 +1183,14 @@ class CredentialPool:
         # winner persisted and skips the POST.
         if self.provider in ("openai-codex", "xai-oauth"):
             sync_entry = (
-                self._sync_codex_entry_from_auth_store
+                self._sync_codex_entry_for_refresh
                 if self.provider == "openai-codex"
                 else self._sync_xai_oauth_entry_from_pool_store
             )
+            owner_path = auth_mod._auth_store_path_for_provider(self.provider)
             with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+                target_path=owner_path,
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
@@ -1374,8 +1449,11 @@ class CredentialPool:
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        owner_path = auth_mod._auth_store_path_for_provider(
+                            "openai-codex"
+                        )
+                        with _auth_store_lock(target_path=owner_path):
+                            auth_store = _load_auth_store(owner_path)
                             state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1395,7 +1473,10 @@ class CredentialPool:
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
                                         _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                                        _save_auth_store(
+                                            auth_store,
+                                            target_path=owner_path,
+                                        )
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc

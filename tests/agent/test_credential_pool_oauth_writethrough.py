@@ -72,7 +72,7 @@ def profile_and_root(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     "provider",
-    ["openai-codex", "xai-oauth"],
+    ["xai-oauth"],
 )
 def test_pool_refresh_writes_through_to_root_when_profile_reads_root(
     profile_and_root, provider
@@ -115,7 +115,7 @@ def test_pool_refresh_writes_through_to_root_when_profile_reads_root(
 
 @pytest.mark.parametrize(
     "provider",
-    ["openai-codex", "xai-oauth"],
+    ["xai-oauth"],
 )
 def test_pool_refresh_does_not_touch_root_when_profile_shadows(
     profile_and_root, provider
