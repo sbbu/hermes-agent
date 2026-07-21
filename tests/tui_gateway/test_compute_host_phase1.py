@@ -463,20 +463,469 @@ def test_append_log_record_single_write_lines(tmp_path):
     assert all(line.endswith("x" * 2000) for line in lines)
 
 
-def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
+def test_compute_host_windows_pid_probes_use_psutil_without_signaling(monkeypatch):
+    from gateway import status as gateway_status
+    from tui_gateway import host_supervisor
+
+    process_calls: list[int] = []
+    pid_exists_calls: list[int] = []
+
+    class _Process:
+        def __init__(self, pid):
+            process_calls.append(pid)
+
+        def cmdline(self):
+            return [r"C:\Python311\python.exe", "-m", "tui_gateway.compute_host"]
+
+    class _Psutil:
+        Process = _Process
+
+    monkeypatch.setattr(host_supervisor.sys, "platform", "win32")
+    monkeypatch.setattr(
+        gateway_status,
+        "_pid_exists",
+        lambda pid: pid_exists_calls.append(pid) or True,
+    )
+    monkeypatch.setitem(sys.modules, "psutil", _Psutil)
+    monkeypatch.setattr(
+        host_supervisor.os,
+        "kill",
+        lambda *_args: pytest.fail("Windows PID probes must not call os.kill"),
+    )
+    monkeypatch.setattr(
+        host_supervisor.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: pytest.fail("Windows PID probes must not call ps"),
+    )
+
+    assert host_supervisor._pid_alive(4321) is True
+    assert host_supervisor.is_compute_host_identity(4321) is True
+    assert pid_exists_calls == [4321]
+    assert process_calls == [4321]
+
+
+def test_compute_host_windows_pid_probe_failure_is_fail_closed(monkeypatch):
+    from gateway import status as gateway_status
+    from tui_gateway import host_supervisor
+
+    monkeypatch.setattr(host_supervisor.sys, "platform", "win32")
+    monkeypatch.setattr(
+        gateway_status,
+        "_pid_exists",
+        lambda _pid: (_ for _ in ()).throw(OSError("probe unavailable")),
+    )
+    monkeypatch.setattr(
+        host_supervisor.os,
+        "kill",
+        lambda *_args: pytest.fail("Windows fallback must not call os.kill"),
+    )
+
+    assert host_supervisor._pid_alive(4321) is True
+
+
+def test_compute_host_termination_preserves_process_identity(monkeypatch, tmp_path):
+    from tui_gateway import host_supervisor
+
+    events: list[object] = []
+
+    class _TimeoutExpired(Exception):
+        pass
+
+    class _NoSuchProcess(Exception):
+        pass
+
+    class _Process:
+        def __init__(self, pid):
+            events.append(("process", pid))
+
+        def create_time(self):
+            return 12.34
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            if events.count("terminate") and "kill" not in events:
+                raise _TimeoutExpired()
+
+        def kill(self):
+            events.append("kill")
+
+    class _Psutil:
+        Process = _Process
+        TimeoutExpired = _TimeoutExpired
+        NoSuchProcess = _NoSuchProcess
+
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setitem(sys.modules, "psutil", _Psutil)
+    monkeypatch.setattr(host_supervisor, "_pid_start_time", lambda _pid: 1234)
+
+    assert supervisor._terminate_pid(
+        4321,
+        timeout=0,
+        expected_start_time=1234,
+    ) is True
+    assert events == [
+        ("process", 4321),
+        "terminate",
+        ("wait", 0),
+        "kill",
+        ("wait", 2),
+    ]
+
+
+def _write_host_registry(
+    path: Path,
+    *,
+    process_start_time: int | None,
+    host_pid: int | None = None,
+    started_at: float = 100.0,
+    owner_pid: int | None = None,
+    owner_start_time: int | None = None,
+    boot_id: str = "stale",
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "host_pid": os.getpid() if host_pid is None else host_pid,
+                "boot_id": boot_id,
+                "process_start_time": process_start_time,
+                "started_at": started_at,
+                "owner_pid": owner_pid,
+                "owner_start_time": owner_start_time,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_supervisor_reconcile_preserves_live_owner(tmp_path, monkeypatch):
+    from tui_gateway import host_supervisor
+
     registry = tmp_path / "dashboard-compute-host.json"
-    registry.write_text(json.dumps({"host_pid": os.getpid(), "boot_id": "stale"}), encoding="utf-8")
+    owner_pid = os.getpid() + 100000
+    _write_host_registry(
+        registry,
+        process_start_time=111,
+        owner_pid=owner_pid,
+        owner_start_time=777,
+    )
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(host_supervisor, "_pid_alive", lambda _pid: True)
 
-    killed: list[int] = []
-    supervisor = HostSupervisor(registry_path=registry, argv=[sys.executable, "-c", ""], autostart=False)
-    monkeypatch.setattr(supervisor, "_pid_matches_compute_host", lambda _pid: False)
-    monkeypatch.setattr(supervisor, "_terminate_pid", lambda pid, **_kw: killed.append(pid))
+    def _start_time(pid):
+        if pid == owner_pid:
+            return 777
+        pytest.fail("live owner must short-circuit child reconciliation")
 
-    result = supervisor.reconcile_startup_orphan()
+    monkeypatch.setattr(host_supervisor, "_pid_start_time", _start_time)
 
-    assert result == "pid-reuse-ignored"
-    assert killed == []
+    assert supervisor.reconcile_startup_orphan() == "owned-by-live-supervisor"
+    assert registry.exists()
+
+
+def test_supervisor_owned_registry_removal_preserves_replacement(tmp_path):
+    registry = tmp_path / "dashboard-compute-host.json"
+    _write_host_registry(
+        registry,
+        host_pid=222,
+        process_start_time=2222,
+        boot_id="replacement",
+    )
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    owned_proc: Any = object()
+    supervisor._owned_registry_identity = (111, 1111, "old")
+    supervisor._owned_registry_proc = owned_proc
+
+    supervisor._remove_registry_for_proc(owned_proc)
+
+    assert json.loads(registry.read_text(encoding="utf-8"))["host_pid"] == 222
+    assert supervisor._owned_registry_identity is None
+    assert supervisor._owned_registry_proc is None
+
+
+def test_supervisor_stale_waiter_cannot_clear_replacement_ownership(tmp_path):
+    registry = tmp_path / "dashboard-compute-host.json"
+    _write_host_registry(
+        registry,
+        host_pid=222,
+        process_start_time=2222,
+        boot_id="replacement",
+    )
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    stale_proc: Any = object()
+    replacement_proc: Any = object()
+    replacement_identity = (222, 2222, "replacement")
+    supervisor._owned_registry_identity = replacement_identity
+    supervisor._owned_registry_proc = replacement_proc
+
+    supervisor._remove_registry_for_proc(stale_proc)
+
+    assert registry.exists()
+    assert supervisor._owned_registry_identity == replacement_identity
+    assert supervisor._owned_registry_proc is replacement_proc
+
+
+def test_supervisor_reaps_child_rejected_after_hello(tmp_path, monkeypatch):
+    from tui_gateway import host_supervisor
+
+    created: list[Any] = []
+    real_popen = host_supervisor.subprocess.Popen
+
+    def _popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(host_supervisor.subprocess, "Popen", _popen)
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        expected_build_sha="definitely-not-the-current-build",
+        autostart=False,
+    )
+
+    with pytest.raises(RuntimeError, match="build mismatch"):
+        supervisor.start()
+
+    assert len(created) == 1
+    assert created[0].poll() is not None
+    assert supervisor._proc is None
+    assert not supervisor.registry_path.exists()
+
+
+def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
+    from tui_gateway import host_supervisor
+
+    registry = tmp_path / "dashboard-compute-host.json"
+    _write_host_registry(registry, process_start_time=111)
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(host_supervisor, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(host_supervisor, "_pid_start_time", lambda _pid: 222)
+    monkeypatch.setattr(
+        host_supervisor,
+        "_pid_command",
+        lambda _pid: pytest.fail("start-time mismatch must short-circuit command probing"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_terminate_pid",
+        lambda *_args, **_kwargs: pytest.fail("reused PID must not be signaled"),
+    )
+
+    assert supervisor.reconcile_startup_orphan() == "pid-reuse-ignored"
     assert not registry.exists()
+
+
+def test_supervisor_legacy_registry_clears_unrelated_reused_pid(
+    tmp_path,
+    monkeypatch,
+):
+    from tui_gateway import host_supervisor
+
+    registry = tmp_path / "dashboard-compute-host.json"
+    _write_host_registry(registry, process_start_time=None)
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(host_supervisor, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        host_supervisor,
+        "_pid_command",
+        lambda _pid: "python unrelated_service.py",
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_terminate_pid",
+        lambda *_args, **_kwargs: pytest.fail("unrelated PID must not be signaled"),
+    )
+
+    assert supervisor.reconcile_startup_orphan() == "pid-reuse-ignored"
+    assert not registry.exists()
+
+
+def test_supervisor_legacy_registry_terminates_matching_process_instance(
+    tmp_path,
+    monkeypatch,
+):
+    from tui_gateway import host_supervisor
+
+    registry = tmp_path / "dashboard-compute-host.json"
+    _write_host_registry(
+        registry,
+        process_start_time=None,
+        started_at=100.0,
+    )
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    calls: list[int | None] = []
+    monkeypatch.setattr(host_supervisor, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(host_supervisor, "_pid_start_time", lambda _pid: 111)
+    monkeypatch.setattr(host_supervisor, "_pid_create_time", lambda _pid: 99.0)
+    monkeypatch.setattr(
+        host_supervisor,
+        "_pid_command",
+        lambda _pid: "python -m tui_gateway.compute_host",
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_terminate_pid",
+        lambda _pid, *, timeout, expected_start_time: calls.append(
+            expected_start_time
+        )
+        or True,
+    )
+
+    assert supervisor.reconcile_startup_orphan() == "terminated"
+    assert calls == [111]
+    assert not registry.exists()
+
+
+def test_supervisor_legacy_registry_rejects_process_created_after_registry(
+    tmp_path,
+    monkeypatch,
+):
+    from tui_gateway import host_supervisor
+
+    registry = tmp_path / "dashboard-compute-host.json"
+    _write_host_registry(
+        registry,
+        process_start_time=None,
+        started_at=100.0,
+    )
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(host_supervisor, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(host_supervisor, "_pid_start_time", lambda _pid: 111)
+    monkeypatch.setattr(host_supervisor, "_pid_create_time", lambda _pid: 100.1)
+    monkeypatch.setattr(
+        host_supervisor,
+        "_pid_command",
+        lambda _pid: pytest.fail("reused PID must short-circuit command probing"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_terminate_pid",
+        lambda *_args, **_kwargs: pytest.fail("reused PID must not be signaled"),
+    )
+
+    assert supervisor.reconcile_startup_orphan() == "pid-reuse-ignored"
+    assert not registry.exists()
+
+
+def test_supervisor_startup_reconcile_fails_closed_when_identity_unknown(
+    tmp_path,
+    monkeypatch,
+):
+    from tui_gateway import host_supervisor
+
+    registry = tmp_path / "dashboard-compute-host.json"
+    _write_host_registry(registry, process_start_time=111)
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(host_supervisor, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(host_supervisor, "_pid_start_time", lambda _pid: 111)
+    monkeypatch.setattr(host_supervisor, "_pid_command", lambda _pid: "")
+    monkeypatch.setattr(
+        supervisor,
+        "_terminate_pid",
+        lambda *_args, **_kwargs: pytest.fail("unverified PID must not be signaled"),
+    )
+
+    assert supervisor.reconcile_startup_orphan() == "identity-unverified"
+    assert registry.exists()
+    monkeypatch.setattr(supervisor, "reconcile_startup_orphan", lambda: "identity-unverified")
+    monkeypatch.setattr(
+        supervisor,
+        "_spawn_locked",
+        lambda **_kwargs: pytest.fail("startup must not spawn beside an unverified host"),
+    )
+    with pytest.raises(RuntimeError, match="identity could not be verified"):
+        supervisor.start()
+
+
+def test_supervisor_startup_reconcile_terminates_matching_process_instance(
+    tmp_path,
+    monkeypatch,
+):
+    from tui_gateway import host_supervisor
+
+    registry = tmp_path / "dashboard-compute-host.json"
+    _write_host_registry(registry, process_start_time=111)
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    calls: list[tuple[int, float, int | None]] = []
+    monkeypatch.setattr(host_supervisor, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(host_supervisor, "_pid_start_time", lambda _pid: 111)
+    monkeypatch.setattr(
+        host_supervisor,
+        "_pid_command",
+        lambda _pid: "python -m tui_gateway.compute_host",
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_terminate_pid",
+        lambda pid, *, timeout, expected_start_time: calls.append(
+            (pid, timeout, expected_start_time)
+        )
+        or True,
+    )
+
+    assert supervisor.reconcile_startup_orphan() == "terminated"
+    assert calls == [(os.getpid(), 10.0, 111)]
+    assert not registry.exists()
+
+
+def test_supervisor_registry_persists_process_identity(tmp_path, monkeypatch):
+    from tui_gateway import host_supervisor
+
+    registry = tmp_path / "dashboard-compute-host.json"
+    supervisor = HostSupervisor(
+        registry_path=registry,
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    proc: Any = type("_Proc", (), {"pid": 4321})()
+    supervisor._proc = proc
+    monkeypatch.setattr(host_supervisor, "_pid_start_time", lambda _pid: 111)
+
+    supervisor._persist_registry()
+
+    assert json.loads(registry.read_text(encoding="utf-8"))["process_start_time"] == 111
 
 
 def test_supervisor_crash_releases_pending_control_waiter(tmp_path, monkeypatch):

@@ -12,13 +12,13 @@ import json
 import logging
 import os
 import queue
-import signal
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,8 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
 _REGISTRY_NAME = "dashboard-compute-host.json"
 _RESPAWN_WINDOW_SECS = 300.0
 _SHUTDOWN_TIMEOUT_SECS = 10.0
+_LEGACY_REGISTRY_START_TOLERANCE_S = 30.0
+_REGISTRY_LOCK_TIMEOUT_SECS = 20.0
 
 
 def append_log_record(path: str | Path, record: str) -> None:
@@ -83,11 +85,42 @@ def _default_registry_path() -> Path:
     return get_hermes_home() / "state" / _REGISTRY_NAME
 
 
+@contextmanager
+def _registry_file_lock(registry_path: Path):
+    """Serialize registry reconcile/write/remove across dashboard processes."""
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+
+    lock_path = registry_path.with_suffix(registry_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    deadline = time.monotonic() + _REGISTRY_LOCK_TIMEOUT_SECS
+    try:
+        while not _try_acquire_file_lock(handle):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out acquiring compute-host registry lock: {lock_path}")
+            time.sleep(0.05)
+        try:
+            yield
+        finally:
+            _release_file_lock(handle)
+    finally:
+        handle.close()
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
+        from gateway.status import _pid_exists
+
+        return bool(_pid_exists(pid))
+    except Exception:
+        # Failure must be conservative on Windows: treating an unknown PID as
+        # dead would discard the registry and spawn a second compute host.
+        if sys.platform == "win32":
+            return True
+    try:
+        os.kill(pid, 0)  # windows-footgun: ok — guarded by the win32 branch
         return True
     except ProcessLookupError:
         return False
@@ -97,9 +130,34 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _pid_start_time(pid: int) -> int | None:
+    try:
+        from gateway.status import get_process_start_time
+
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _pid_create_time(pid: int) -> float | None:
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
+
+
 def _pid_command(pid: int) -> str:
     if pid <= 0:
         return ""
+    if sys.platform == "win32":
+        try:
+            import psutil  # type: ignore
+
+            return " ".join(str(part) for part in psutil.Process(pid).cmdline())
+        except Exception:
+            return ""
     # Linux fast path.
     proc_cmdline = Path("/proc") / str(pid) / "cmdline"
     try:
@@ -175,6 +233,8 @@ class HostSupervisor:
         ] = {}
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
+        self._owned_registry_identity: tuple[int, int | None, str] | None = None
+        self._owned_registry_proc: subprocess.Popen[str] | None = None
 
         if autostart:
             self.start()
@@ -197,8 +257,23 @@ class HostSupervisor:
             if self.is_running():
                 return
             self._closing = False
-            self.reconcile_startup_orphan()
-            self._spawn_locked(reason="startup")
+            self._start_locked(reason="startup")
+
+    def _start_locked(self, *, reason: str) -> None:
+        with _registry_file_lock(self.registry_path):
+            reconciliation = self._reconcile_startup_orphan_locked()
+            if reconciliation in {
+                "identity-unverified",
+                "termination-failed",
+                "owned-by-live-supervisor",
+                "owner-unverified",
+            }:
+                raise RuntimeError(
+                    "compute host startup blocked because the registered host "
+                    "identity could not be verified or terminated, or another "
+                    "live supervisor owns it"
+                )
+            self._spawn_locked(reason=reason, registry_lock_held=True)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -213,32 +288,103 @@ class HostSupervisor:
         except Exception:
             self._terminate_process(proc)
         finally:
-            self._remove_registry()
+            self._remove_registry_for_proc(proc)
 
     def reconcile_startup_orphan(self) -> str:
         """Terminate a stale registered host, guarding against PID reuse."""
+        with _registry_file_lock(self.registry_path):
+            return self._reconcile_startup_orphan_locked()
+
+    def _reconcile_startup_orphan_locked(self) -> str:
         try:
             data = json.loads(self.registry_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return "none"
         except Exception:
-            self._remove_registry()
+            self._remove_registry_locked()
             return "invalid-registry"
+
+        try:
+            owner_pid = int(data.get("owner_pid") or 0)
+        except (TypeError, ValueError):
+            owner_pid = 0
+        if owner_pid > 0 and owner_pid != os.getpid() and _pid_alive(owner_pid):
+            owner_start = data.get("owner_start_time")
+            current_owner_start = _pid_start_time(owner_pid)
+            try:
+                owner_start = int(owner_start) if owner_start is not None else None
+            except (TypeError, ValueError):
+                owner_start = None
+            if owner_start is None or current_owner_start is None:
+                return "owner-unverified"
+            if owner_start == current_owner_start:
+                return "owned-by-live-supervisor"
 
         try:
             pid = int(data.get("host_pid") or 0)
         except Exception:
             pid = 0
         if pid <= 0 or not _pid_alive(pid):
-            self._remove_registry()
+            self._remove_registry_locked()
             return "not-running"
-        if not self._pid_matches_compute_host(pid):
-            # PID was reused by another process. Never signal it.
-            self._remove_registry()
-            return "pid-reuse-ignored"
 
-        self._terminate_pid(pid, timeout=_SHUTDOWN_TIMEOUT_SECS)
-        self._remove_registry()
+        recorded_start = data.get("process_start_time")
+        current_start = _pid_start_time(pid)
+        try:
+            recorded_start = (
+                int(recorded_start) if recorded_start is not None else None
+            )
+        except (TypeError, ValueError):
+            recorded_start = None
+
+        expected_start: int | None = None
+        if recorded_start is not None:
+            if current_start is not None and current_start != recorded_start:
+                self._remove_registry_locked()
+                return "pid-reuse-ignored"
+            if current_start is not None:
+                expected_start = recorded_start
+        else:
+            # Pre-fingerprint registries still record when the host completed
+            # startup.  Compare that wall time to the live process creation
+            # time, then capture the current platform-native fingerprint for
+            # psutil's guarded termination path.
+            try:
+                registry_started_at = float(data.get("started_at"))
+            except (TypeError, ValueError):
+                registry_started_at = None
+            process_created_at = _pid_create_time(pid)
+            if registry_started_at is not None and process_created_at is not None:
+                startup_delta = registry_started_at - process_created_at
+                if not (
+                    0.0
+                    <= startup_delta
+                    <= _LEGACY_REGISTRY_START_TOLERANCE_S
+                ):
+                    self._remove_registry_locked()
+                    return "pid-reuse-ignored"
+                if current_start is not None:
+                    expected_start = current_start
+
+        command = _pid_command(pid)
+        if not command:
+            return "identity-unverified"
+        if "tui_gateway.compute_host" not in command:
+            self._remove_registry_locked()
+            return "pid-reuse-ignored"
+        if expected_start is None:
+            # A matching live PID without a stable instance fingerprint is
+            # ambiguous. Keep the registry and refuse to spawn beside it.
+            return "identity-unverified"
+
+        terminated = self._terminate_pid(
+            pid,
+            timeout=_SHUTDOWN_TIMEOUT_SECS,
+            expected_start_time=expected_start,
+        )
+        if not terminated:
+            return "termination-failed"
+        self._remove_registry_locked()
         return "terminated"
 
     def submit_turn(
@@ -362,7 +508,12 @@ class HostSupervisor:
                 with self._lock:
                     self._pending_controls.pop(request_id, None)
 
-    def _spawn_locked(self, *, reason: str) -> None:
+    def _spawn_locked(
+        self,
+        *,
+        reason: str,
+        registry_lock_held: bool = False,
+    ) -> None:
         if self._stopped_respawning:
             raise RuntimeError("compute host respawn disabled after crash loop")
         self._hello_event.clear()
@@ -411,11 +562,20 @@ class HostSupervisor:
         stdout_thread.start()
         stderr_thread.start()
         wait_thread.start()
-        if not self._hello_event.wait(timeout=10.0):
+        try:
+            if not self._hello_event.wait(timeout=10.0):
+                raise RuntimeError(
+                    f"compute host did not send hello; stderr={self._stderr_tail[-5:]}"
+                )
+            self._validate_hello()
+            self._persist_registry(lock_held=registry_lock_held)
+        except Exception:
+            # Detach before termination so the exit waiter cannot treat this
+            # rejected child as the active host or schedule a crash respawn.
+            if self._proc is proc:
+                self._proc = None
             self._terminate_process(proc)
-            raise RuntimeError(f"compute host did not send hello; stderr={self._stderr_tail[-5:]}")
-        self._validate_hello()
-        self._persist_registry()
+            raise
         logger.info("compute host started pid=%s reason=%s", proc.pid, reason)
 
     def _validate_hello(self) -> None:
@@ -429,26 +589,83 @@ class HostSupervisor:
         if self.expected_build_sha != "unknown" and got_sha not in {"", "unknown", self.expected_build_sha}:
             raise RuntimeError(f"compute host build mismatch: {got_sha} != {self.expected_build_sha}")
 
-    def _persist_registry(self) -> None:
+    def _persist_registry(self, *, lock_held: bool = False) -> None:
+        if lock_held:
+            self._persist_registry_locked()
+            return
+        with _registry_file_lock(self.registry_path):
+            self._persist_registry_locked()
+
+    def _persist_registry_locked(self) -> None:
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.registry_path.with_suffix(self.registry_path.suffix + ".tmp")
+        host_pid = self.pid
+        process_start_time = _pid_start_time(host_pid)
+        boot_id = str(self._hello.get("boot_id") or "")
         payload = {
-            "host_pid": self.pid,
-            "boot_id": self._hello.get("boot_id") or "",
+            "host_pid": host_pid,
+            "process_start_time": process_start_time,
+            "owner_pid": os.getpid(),
+            "owner_start_time": _pid_start_time(os.getpid()),
+            "boot_id": boot_id,
             "build_sha": self._hello.get("build_sha") or "",
             "started_at": time.time(),
             "argv": self.argv,
         }
         tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         tmp.replace(self.registry_path)
+        self._owned_registry_identity = (host_pid, process_start_time, boot_id)
+        self._owned_registry_proc = self._proc
 
     def _remove_registry(self) -> None:
+        proc = self._owned_registry_proc
+        if proc is not None:
+            self._remove_registry_for_proc(proc)
+
+    def _remove_registry_for_proc(self, proc: subprocess.Popen[str]) -> None:
+        with self._lock:
+            if self._owned_registry_proc is not proc:
+                return
+            identity = self._owned_registry_identity
+        if identity is None:
+            return
+        with _registry_file_lock(self.registry_path):
+            self._remove_registry_locked(expected_identity=identity)
+        with self._lock:
+            if (
+                self._owned_registry_proc is proc
+                and self._owned_registry_identity == identity
+            ):
+                self._owned_registry_identity = None
+                self._owned_registry_proc = None
+
+    def _remove_registry_locked(
+        self,
+        *,
+        expected_identity: tuple[int, int | None, str] | None = None,
+    ) -> bool:
+        if expected_identity is not None:
+            try:
+                current = json.loads(self.registry_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return True
+            except Exception:
+                return False
+            current_identity = (
+                int(current.get("host_pid") or 0),
+                current.get("process_start_time"),
+                str(current.get("boot_id") or ""),
+            )
+            if current_identity != expected_identity:
+                return False
         try:
             self.registry_path.unlink()
+            return True
         except FileNotFoundError:
-            pass
+            return True
         except Exception:
             logger.debug("failed to remove compute host registry", exc_info=True)
+            return False
 
     def _send_frame(self, frame: dict[str, Any]) -> None:
         with self._lock:
@@ -595,7 +812,7 @@ class HostSupervisor:
                     self._pending_controls.pop(request_id, None)
 
         if current_process:
-            self._remove_registry()
+            self._remove_registry_for_proc(proc)
         reason = "shutdown" if closing else "crash"
         message = (
             f"compute host shut down with code {code}"
@@ -692,34 +909,50 @@ class HostSupervisor:
                 if self._closing or self._stopped_respawning or self._proc is not None:
                     return
                 try:
-                    self._spawn_locked(reason="crash")
+                    self._start_locked(reason="crash")
                 except Exception:
                     logger.exception("compute host respawn failed")
 
         _Thread(target=_respawn, name="compute-host-respawn", daemon=True).start()
 
-    def _pid_matches_compute_host(self, pid: int) -> bool:
-        return is_compute_host_identity(pid)
+    def _terminate_pid(
+        self,
+        pid: int,
+        *,
+        timeout: float = _SHUTDOWN_TIMEOUT_SECS,
+        expected_start_time: int | None = None,
+    ) -> bool:
+        """Terminate one verified process instance without crossing PID reuse."""
+        if expected_start_time is None:
+            return False
+        try:
+            import psutil  # type: ignore
+        except ImportError:
+            logger.debug("psutil unavailable; refusing unguarded PID termination")
+            return False
 
-    def _terminate_pid(self, pid: int, *, timeout: float = _SHUTDOWN_TIMEOUT_SECS) -> None:
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
+            proc = psutil.Process(pid)
+            if _pid_start_time(pid) != expected_start_time:
+                return False
+            proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+            except psutil.TimeoutExpired:
+                # psutil's Process object retains PID + creation-time identity;
+                # kill() refuses a recycled PID before signaling it.
+                proc.kill()
+                proc.wait(timeout=2)
+            return True
+        except psutil.NoSuchProcess:
+            return True
         except Exception:
-            logger.debug("failed to SIGTERM compute host pid=%s", pid, exc_info=True)
-            return
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not _pid_alive(pid):
-                return
-            time.sleep(0.05)
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        except Exception:
-            logger.debug("failed to SIGKILL compute host pid=%s", pid, exc_info=True)
+            logger.debug(
+                "failed to terminate verified compute host pid=%s",
+                pid,
+                exc_info=True,
+            )
+            return False
 
     def _terminate_process(self, proc: subprocess.Popen[str]) -> None:
         if proc.poll() is not None:
