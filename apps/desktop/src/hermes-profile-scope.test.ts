@@ -11,6 +11,7 @@ import {
   restartGateway,
   saveCustomEndpoint,
   saveMemoryProviderConfig,
+  searchSessions,
   setApiRequestProfile,
   updateHermes,
   validateCustomEndpoint
@@ -69,6 +70,24 @@ describe('backend action helpers are profile-scoped', () => {
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBe('coder')
     }
+  })
+
+  it('routes session search to the selected profile backend', () => {
+    setApiRequestProfile('coder')
+
+    void searchSessions('needle')
+
+    expect(api).toHaveBeenLastCalledWith({
+      path: '/api/sessions/search?q=needle',
+      profile: 'coder'
+    })
+
+    void searchSessions('other', 'research')
+
+    expect(api).toHaveBeenLastCalledWith({
+      path: '/api/sessions/search?q=other',
+      profile: 'research'
+    })
   })
 
   it('forwards the active profile to every backend action', () => {
