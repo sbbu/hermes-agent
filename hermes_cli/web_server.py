@@ -13500,7 +13500,11 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
             source=SOURCE_MANUAL,
             access_token=api_key,
         )
-        pool.add_entry(entry)
+        if pool.add_entry(entry) is None:
+            raise HTTPException(
+                status_code=409,
+                detail="credential owner changed while saving; reload and retry",
+            )
         # Re-adding a credential is an explicit re-engagement signal: lift
         # every suppression for this provider so a source deleted earlier
         # (via DELETE below or `hermes auth remove`) can seed again.
@@ -13508,11 +13512,10 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
         if not provider.startswith(CUSTOM_POOL_PREFIX):
             try:
                 from hermes_cli.auth import (
-                    _load_auth_store,
+                    list_suppressed_credential_sources,
                     unsuppress_credential_source,
                 )
-                suppressed = _load_auth_store().get("suppressed_sources", {})
-                for src in list(suppressed.get(provider, []) or []):
+                for src in list_suppressed_credential_sources(provider):
                     unsuppress_credential_source(provider, src)
             except Exception:
                 _log.exception("unsuppress after pool add failed (non-fatal)")

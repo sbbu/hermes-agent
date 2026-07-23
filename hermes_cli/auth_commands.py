@@ -185,11 +185,10 @@ def auth_add_command(args) -> None:
     if not provider.startswith(CUSTOM_POOL_PREFIX):
         try:
             from hermes_cli.auth import (
-                _load_auth_store,
+                list_suppressed_credential_sources,
                 unsuppress_credential_source,
             )
-            suppressed = _load_auth_store().get("suppressed_sources", {})
-            for src in list(suppressed.get(provider, []) or []):
+            for src in list_suppressed_credential_sources(provider):
                 unsuppress_credential_source(provider, src)
         except Exception:
             pass
@@ -217,7 +216,10 @@ def auth_add_command(args) -> None:
             access_token=token,
             base_url=_provider_base_url(provider),
         )
-        pool.add_entry(entry)
+        if pool.add_entry(entry) is None:
+            raise SystemExit(
+                f"{provider} credential owner changed while saving; retry `hermes auth add`."
+            )
         print(f'Added {provider} credential #{len(pool.entries())}: "{label}"')
         return
 
@@ -335,13 +337,14 @@ def auth_add_command(args) -> None:
             base_url=creds.get("base_url"),
             last_refresh=creds.get("last_refresh"),
         )
-        first_credential = not pool.entries()
-        pool.add_entry(entry)
-        # Adding the first Codex credential should make it the active provider
-        # (the old singleton save path did this implicitly via
-        # _save_provider_state). Subsequent adds leave the active provider as-is.
-        if first_credential:
-            auth_mod.mark_provider_active_if_unset(provider)
+        if pool.add_entry(entry) is None:
+            raise SystemExit(
+                "Codex credential owner changed during login; retry `hermes auth add openai-codex`."
+            )
+        # The shared pool may already contain accounts from other profiles;
+        # every successful add still needs to activate Codex locally when this
+        # profile has no explicit active provider.
+        auth_mod.mark_provider_active_if_unset(provider)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 

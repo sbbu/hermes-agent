@@ -950,6 +950,7 @@ def _global_auth_file_path() -> Optional[Path]:
 # Codex auth store at the global root while preserving normal profile-local
 # ownership for providers whose credentials are intentionally isolated.
 _GLOBAL_SHARED_AUTH_PROVIDERS = frozenset({"openai-codex"})
+_SHARED_AUTH_OWNER_MARKERS_KEY = "shared_auth_owners"
 
 
 def _auth_store_path_for_provider(provider_id: str) -> Path:
@@ -982,6 +983,655 @@ def _auth_store_path_for_provider(provider_id: str) -> Path:
                     )
             return global_path
     return active_path
+
+
+def _provider_state_has_credentials(state: Any) -> bool:
+    if not isinstance(state, dict):
+        return False
+    tokens = state.get("tokens")
+    if isinstance(tokens, dict) and any(
+        isinstance(value := tokens.get(key), str) and bool(value.strip())
+        for key in ("access_token", "refresh_token", "id_token")
+    ):
+        return True
+    return any(
+        isinstance(value := state.get(key), str) and bool(value.strip())
+        for key in ("api_key", "access_token", "refresh_token")
+    )
+
+
+def _pool_entry_has_credentials(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return any(
+        isinstance(value := entry.get(key), str) and bool(value.strip())
+        for key in ("api_key", "access_token", "refresh_token")
+    )
+
+
+def _store_has_provider_credentials(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+) -> bool:
+    providers = auth_store.get("providers")
+    state = providers.get(provider_id) if isinstance(providers, dict) else None
+    if _provider_state_has_credentials(state):
+        return True
+    pool = auth_store.get("credential_pool")
+    entries = pool.get(provider_id) if isinstance(pool, dict) else None
+    if not isinstance(entries, list):
+        return False
+    return any(_pool_entry_has_credentials(entry) for entry in entries)
+
+
+def _store_has_shared_auth_owner(auth_store: Dict[str, Any], provider_id: str) -> bool:
+    markers = auth_store.get(_SHARED_AUTH_OWNER_MARKERS_KEY)
+    if not isinstance(markers, dict):
+        return False
+    marker = markers.get(provider_id)
+    return marker is True or isinstance(marker, dict)
+
+
+def _shared_auth_owner_generation(auth_store: Dict[str, Any], provider_id: str) -> int:
+    markers = auth_store.get(_SHARED_AUTH_OWNER_MARKERS_KEY)
+    marker = markers.get(provider_id) if isinstance(markers, dict) else None
+    if not isinstance(marker, dict):
+        return 0
+    generation = marker.get("generation")
+    return generation if isinstance(generation, int) and generation >= 0 else 0
+
+
+def _shared_auth_owner_state_digest(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+) -> str:
+    providers = auth_store.get("providers")
+    pool = auth_store.get("credential_pool")
+    suppressed = auth_store.get("suppressed_sources")
+    payload = {
+        "provider": providers.get(provider_id) if isinstance(providers, dict) else None,
+        "pool": pool.get(provider_id) if isinstance(pool, dict) else None,
+        "suppressed": (
+            suppressed.get(provider_id) if isinstance(suppressed, dict) else None
+        ),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _shared_auth_owner_deleted(auth_store: Dict[str, Any], provider_id: str) -> bool:
+    markers = auth_store.get(_SHARED_AUTH_OWNER_MARKERS_KEY)
+    marker = markers.get(provider_id) if isinstance(markers, dict) else None
+    return isinstance(marker, dict) and marker.get("deleted") is True
+
+
+def _shared_auth_legacy_migration_closed(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+) -> bool:
+    markers = auth_store.get(_SHARED_AUTH_OWNER_MARKERS_KEY)
+    marker = markers.get(provider_id) if isinstance(markers, dict) else None
+    return isinstance(marker, dict) and marker.get("legacy_migration_closed") is True
+
+
+def _credential_token_fingerprint(token: str) -> str:
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _codex_token_account_identity(token: str) -> Optional[str]:
+    claims = _decode_jwt_claims(token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    account_id = (
+        auth_claims.get("chatgpt_account_id")
+        if isinstance(auth_claims, dict)
+        else None
+    )
+    for value in (account_id, claims.get("email"), claims.get("sub")):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _shared_auth_revoked_token_fingerprints(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+) -> set[str]:
+    markers = auth_store.get(_SHARED_AUTH_OWNER_MARKERS_KEY)
+    marker = markers.get(provider_id) if isinstance(markers, dict) else None
+    values = marker.get("revoked_access_token_hashes") if isinstance(marker, dict) else None
+    return {str(value) for value in values} if isinstance(values, list) else set()
+
+
+def _mark_shared_auth_owner(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+    *,
+    deleted: bool = False,
+    advance_generation: bool = False,
+    close_legacy_migration: bool = False,
+) -> bool:
+    markers = auth_store.setdefault(_SHARED_AUTH_OWNER_MARKERS_KEY, {})
+    if not isinstance(markers, dict):
+        markers = {}
+        auth_store[_SHARED_AUTH_OWNER_MARKERS_KEY] = markers
+    generation = _shared_auth_owner_generation(auth_store, provider_id)
+    if advance_generation:
+        generation += 1
+    existing_marker = markers.get(provider_id)
+    desired: Dict[str, Any] = {
+        "generation": generation,
+        "deleted": bool(deleted),
+    }
+    if isinstance(existing_marker, dict):
+        if existing_marker.get("legacy_migration_closed") is True:
+            desired["legacy_migration_closed"] = True
+        revoked = existing_marker.get("revoked_access_token_hashes")
+        if isinstance(revoked, list) and revoked:
+            desired["revoked_access_token_hashes"] = list(revoked)
+        state_digest = existing_marker.get("state_digest")
+        if isinstance(state_digest, str) and state_digest:
+            desired["state_digest"] = state_digest
+    if close_legacy_migration:
+        desired["legacy_migration_closed"] = True
+    desired["state_digest"] = _shared_auth_owner_state_digest(auth_store, provider_id)
+    if markers.get(provider_id) == desired:
+        return False
+    markers[provider_id] = desired
+    return True
+
+
+def _reconcile_shared_auth_owner_digest(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+) -> Tuple[bool, bool]:
+    """Return ``(external_change, metadata_changed)`` for owner state."""
+    markers = auth_store.get(_SHARED_AUTH_OWNER_MARKERS_KEY)
+    marker = markers.get(provider_id) if isinstance(markers, dict) else None
+    if not isinstance(marker, dict):
+        return False, False
+    actual = _shared_auth_owner_state_digest(auth_store, provider_id)
+    recorded = marker.get("state_digest")
+    if not isinstance(recorded, str) or not recorded:
+        marker["state_digest"] = actual
+        return False, True
+    if recorded == actual:
+        return False, False
+    _mark_shared_auth_owner(
+        auth_store,
+        provider_id,
+        deleted=_shared_auth_owner_deleted(auth_store, provider_id),
+        advance_generation=True,
+    )
+    marker = auth_store[_SHARED_AUTH_OWNER_MARKERS_KEY][provider_id]
+    assert isinstance(marker, dict)
+    marker["state_digest"] = actual
+    return True, True
+
+
+def _record_shared_auth_token_revocations(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+    access_tokens: Iterable[str],
+) -> bool:
+    _mark_shared_auth_owner(auth_store, provider_id)
+    markers = auth_store[_SHARED_AUTH_OWNER_MARKERS_KEY]
+    marker = markers[provider_id]
+    assert isinstance(marker, dict)
+    revoked = marker.setdefault("revoked_access_token_hashes", [])
+    if not isinstance(revoked, list):
+        revoked = []
+        marker["revoked_access_token_hashes"] = revoked
+    changed = False
+    for token in access_tokens:
+        if not token:
+            continue
+        fingerprint = _credential_token_fingerprint(token)
+        if fingerprint not in revoked:
+            revoked.append(fingerprint)
+            changed = True
+    return changed
+
+
+def _merge_legacy_shared_profile_extras(
+    provider_id: str,
+    active_path: Path,
+    owner_path: Path,
+) -> bool:
+    """Merge independent profile accounts/suppressions into an initialized owner."""
+    active_snapshot = _load_auth_store(active_path)
+    snapshot_pool = active_snapshot.get("credential_pool")
+    snapshot_entries = (
+        snapshot_pool.get(provider_id) if isinstance(snapshot_pool, dict) else None
+    )
+    has_independent = isinstance(snapshot_entries, list) and any(
+        _pool_entry_has_credentials(entry) for entry in snapshot_entries
+    )
+    snapshot_providers = active_snapshot.get("providers")
+    snapshot_state = (
+        snapshot_providers.get(provider_id)
+        if isinstance(snapshot_providers, dict)
+        else None
+    )
+    has_profile_singleton = _provider_state_has_credentials(snapshot_state)
+    snapshot_suppressed = active_snapshot.get("suppressed_sources")
+    snapshot_sources = (
+        snapshot_suppressed.get(provider_id)
+        if isinstance(snapshot_suppressed, dict)
+        else None
+    )
+    if not has_independent and not has_profile_singleton and not (
+        isinstance(snapshot_sources, list) and snapshot_sources
+    ):
+        return False
+
+    with _auth_store_lock(target_path=active_path):
+        with _auth_store_lock(target_path=owner_path):
+            owner_store = _load_auth_store(owner_path)
+            if not (
+                _store_has_shared_auth_owner(owner_store, provider_id)
+                or _store_has_provider_credentials(owner_store, provider_id)
+            ):
+                return False
+            if _shared_auth_owner_deleted(owner_store, provider_id):
+                # A global logout is an explicit revocation boundary. Passive
+                # reads from stale sibling profiles must never reactivate it;
+                # only an explicit add/reauth may clear the tombstone.
+                return False
+            if _shared_auth_legacy_migration_closed(owner_store, provider_id):
+                return False
+            active_store = _load_auth_store(active_path)
+            active_pool = active_store.get("credential_pool")
+            profile_entries = (
+                active_pool.get(provider_id)
+                if isinstance(active_pool, dict)
+                else None
+            )
+            independent_entries = [
+                entry
+                for entry in profile_entries
+                if _pool_entry_has_credentials(entry)
+            ] if isinstance(profile_entries, list) else []
+            active_providers = active_store.get("providers")
+            profile_state = (
+                active_providers.get(provider_id)
+                if isinstance(active_providers, dict)
+                else None
+            )
+            profile_singleton = (
+                profile_state if _provider_state_has_credentials(profile_state) else None
+            )
+
+            active_suppressed = active_store.get("suppressed_sources")
+            profile_suppressed = (
+                active_suppressed.get(provider_id)
+                if isinstance(active_suppressed, dict)
+                else None
+            )
+            if not independent_entries and profile_singleton is None and not (
+                isinstance(profile_suppressed, list) and profile_suppressed
+            ):
+                return False
+
+            owner_changed = False
+            active_changed = False
+            added_credentials = False
+            if independent_entries or profile_singleton is not None:
+                owner_pool = owner_store.setdefault("credential_pool", {})
+                if not isinstance(owner_pool, dict):
+                    owner_pool = {}
+                    owner_store["credential_pool"] = owner_pool
+                owner_entries = owner_pool.get(provider_id)
+                if not isinstance(owner_entries, list):
+                    owner_entries = []
+                    owner_pool[provider_id] = owner_entries
+                existing_ids = {
+                    str(entry.get("id"))
+                    for entry in owner_entries
+                    if isinstance(entry, dict) and entry.get("id")
+                }
+                existing_by_id = {
+                    str(entry.get("id")): entry
+                    for entry in owner_entries
+                    if isinstance(entry, dict) and entry.get("id")
+                }
+                existing_access_tokens = {
+                    str(entry.get("access_token"))
+                    for entry in owner_entries
+                    if isinstance(entry, dict) and entry.get("access_token")
+                }
+                owner_providers = owner_store.get("providers")
+                owner_state = (
+                    owner_providers.get(provider_id)
+                    if isinstance(owner_providers, dict)
+                    else None
+                )
+                owner_tokens = (
+                    owner_state.get("tokens")
+                    if isinstance(owner_state, dict)
+                    else None
+                )
+                if isinstance(owner_tokens, dict) and owner_tokens.get("access_token"):
+                    existing_access_tokens.add(str(owner_tokens["access_token"]))
+                existing_account_identities = {
+                    identity
+                    for entry in owner_entries
+                    if isinstance(entry, dict)
+                    and (
+                        identity := _codex_token_account_identity(
+                            str(entry.get("access_token") or "")
+                        )
+                    )
+                }
+                owner_identity = _codex_token_account_identity(
+                    str(owner_tokens.get("access_token") or "")
+                    if isinstance(owner_tokens, dict)
+                    else ""
+                )
+                if owner_identity:
+                    existing_account_identities.add(owner_identity)
+                migration_entries = list(independent_entries)
+                singleton_candidate: Optional[Dict[str, Any]] = None
+                if isinstance(profile_singleton, dict):
+                    profile_tokens = profile_singleton.get("tokens")
+                    if isinstance(profile_tokens, dict):
+                        singleton_candidate = {
+                            "id": "",
+                            "label": str(profile_singleton.get("label") or "device_code"),
+                            "auth_type": "oauth",
+                            "priority": len(owner_entries),
+                            "source": "device_code",
+                            "access_token": profile_tokens.get("access_token"),
+                            "refresh_token": profile_tokens.get("refresh_token"),
+                            "base_url": "https://chatgpt.com/backend-api/codex",
+                            "last_refresh": profile_singleton.get("last_refresh"),
+                        }
+                        migration_entries.append(singleton_candidate)
+                revoked_tokens = _shared_auth_revoked_token_fingerprints(
+                    owner_store,
+                    provider_id,
+                )
+                retained_profile_object_ids: set[int] = set()
+                migrated_profile_singleton = False
+
+                for raw_entry in migration_entries:
+                    access_token = str(raw_entry.get("access_token") or "")
+                    if (
+                        access_token
+                        and _credential_token_fingerprint(access_token) in revoked_tokens
+                    ):
+                        continue
+                    if access_token and access_token in existing_access_tokens:
+                        continue
+                    entry = dict(raw_entry)
+                    entry_identity = _codex_token_account_identity(access_token)
+                    if entry.get("source") == "device_code":
+                        if entry_identity and entry_identity in existing_account_identities:
+                            continue
+                        if not entry_identity:
+                            if raw_entry is not singleton_candidate:
+                                retained_profile_object_ids.add(id(raw_entry))
+                            continue
+                        entry["source"] = "manual:device_code"
+                    entry_id = str(entry.get("id") or "")
+                    if entry_id and entry_id in existing_ids:
+                        owner_entry = existing_by_id.get(entry_id)
+                        owner_access = str(
+                            owner_entry.get("access_token") or ""
+                            if isinstance(owner_entry, dict)
+                            else ""
+                        )
+                        profile_identity = _codex_token_account_identity(access_token)
+                        owner_identity = _codex_token_account_identity(owner_access)
+                        if (
+                            profile_identity
+                            and owner_identity
+                            and profile_identity != owner_identity
+                        ):
+                            entry_id = uuid.uuid4().hex[:6]
+                            entry["id"] = entry_id
+                        elif access_token == owner_access or (
+                            profile_identity and profile_identity == owner_identity
+                        ):
+                            continue
+                        else:
+                            # Opaque-token collisions cannot be classified
+                            # safely. Preserve the profile row instead of
+                            # silently dropping a potentially distinct account.
+                            retained_profile_object_ids.add(id(raw_entry))
+                            continue
+                    if not entry_id:
+                        entry_id = uuid.uuid4().hex[:6]
+                        entry["id"] = entry_id
+                    existing_ids.add(entry_id)
+                    if access_token:
+                        existing_access_tokens.add(access_token)
+                    if entry_identity:
+                        existing_account_identities.add(entry_identity)
+                    owner_entries.append(entry)
+                    if raw_entry is singleton_candidate:
+                        migrated_profile_singleton = True
+                    owner_changed = True
+                    added_credentials = True
+
+                if isinstance(profile_singleton, dict):
+                    profile_tokens = profile_singleton.get("tokens")
+                    profile_access = (
+                        str(profile_tokens.get("access_token") or "")
+                        if isinstance(profile_tokens, dict)
+                        else ""
+                    )
+                    migrated_profile_singleton = (
+                        migrated_profile_singleton
+                        or bool(profile_access and profile_access in existing_access_tokens)
+                    )
+
+                if independent_entries:
+                    assert isinstance(active_pool, dict)
+                    assert isinstance(profile_entries, list)
+                    migratable_profile_object_ids = {
+                        id(entry) for entry in independent_entries
+                    }
+                    remaining = [
+                        entry
+                        for entry in profile_entries
+                        if id(entry) in retained_profile_object_ids
+                        or id(entry) not in migratable_profile_object_ids
+                    ]
+                    if remaining:
+                        active_pool[provider_id] = remaining
+                    else:
+                        active_pool.pop(provider_id, None)
+                    active_changed = True
+                if migrated_profile_singleton and isinstance(active_providers, dict):
+                    active_providers.pop(provider_id, None)
+                    active_changed = True
+
+            if isinstance(profile_suppressed, list) and profile_suppressed:
+                owner_suppressed = owner_store.setdefault("suppressed_sources", {})
+                if not isinstance(owner_suppressed, dict):
+                    owner_suppressed = {}
+                    owner_store["suppressed_sources"] = owner_suppressed
+                existing_sources = owner_suppressed.get(provider_id)
+                merged_sources = (
+                    list(existing_sources) if isinstance(existing_sources, list) else []
+                )
+                before = list(merged_sources)
+                merged_sources.extend(
+                    source for source in profile_suppressed if source not in merged_sources
+                )
+                owner_suppressed[provider_id] = merged_sources
+                owner_changed = owner_changed or merged_sources != before
+                assert isinstance(active_suppressed, dict)
+                active_suppressed.pop(provider_id, None)
+                active_changed = True
+
+            if owner_changed:
+                deleted = _shared_auth_owner_deleted(owner_store, provider_id)
+                _mark_shared_auth_owner(
+                    owner_store,
+                    provider_id,
+                    deleted=deleted and not added_credentials,
+                    advance_generation=True,
+                )
+                _save_auth_store(owner_store, target_path=owner_path)
+            if active_changed:
+                _save_auth_store(active_store, target_path=active_path)
+            return owner_changed or active_changed
+
+
+def _adopt_legacy_shared_provider_auth(provider_id: str) -> bool:
+    """Move a legacy profile-local shared grant to its canonical root owner.
+
+    Older Hermes versions persisted Codex OAuth separately in each named
+    profile. After global ownership was introduced, a profile whose root store
+    had no Codex state would otherwise appear logged out. Adopt that one legacy
+    chain exactly once, preserving unrelated data in both stores. The active
+    profile lock is always acquired before the root lock, matching
+    ``_provider_state_transaction``; callers must invoke this helper before
+    taking the canonical owner lock.
+    """
+    normalized = str(provider_id or "").strip().lower()
+    if normalized not in _GLOBAL_SHARED_AUTH_PROVIDERS:
+        return False
+
+    active_path = _auth_file_path()
+    owner_path = _auth_store_path_for_provider(normalized)
+    if _same_path(active_path, owner_path):
+        return False
+    # Some refresh paths already hold the canonical owner lock while persisting
+    # a rotated token. Never acquire the profile lock from that state: normal
+    # migration takes profile -> owner, so owner -> profile would deadlock and
+    # could lose a single-use refresh rotation. Deferred profile extras are
+    # reconciled on the next owner read outside the refresh transaction.
+    if getattr(_auth_lock_holder_for(owner_path), "depth", 0) > 0:
+        return False
+
+    # Atomic auth-store replacement makes this unlocked read safe as a fast
+    # path. The locked path below re-checks before mutating either store.
+    owner_snapshot = _load_auth_store(owner_path)
+    if _store_has_shared_auth_owner(
+        owner_snapshot,
+        normalized,
+    ) or _store_has_provider_credentials(owner_snapshot, normalized):
+        return _merge_legacy_shared_profile_extras(
+            normalized,
+            active_path,
+            owner_path,
+        )
+
+    with _auth_store_lock(target_path=active_path):
+        with _auth_store_lock(target_path=owner_path):
+            owner_store = _load_auth_store(owner_path)
+            if _store_has_shared_auth_owner(
+                owner_store,
+                normalized,
+            ) or _store_has_provider_credentials(owner_store, normalized):
+                return _merge_legacy_shared_profile_extras(
+                    normalized,
+                    active_path,
+                    owner_path,
+                )
+            active_store = _load_auth_store(active_path)
+            active_providers = active_store.get("providers")
+            legacy_state = (
+                active_providers.get(normalized)
+                if isinstance(active_providers, dict)
+                else None
+            )
+            active_pool = active_store.get("credential_pool")
+            legacy_entries = (
+                active_pool.get(normalized)
+                if isinstance(active_pool, dict)
+                else None
+            )
+            active_suppressed = active_store.get("suppressed_sources")
+            legacy_suppressed = (
+                active_suppressed.get(normalized)
+                if isinstance(active_suppressed, dict)
+                else None
+            )
+            owner_suppressed = owner_store.get("suppressed_sources")
+            owner_sources = (
+                owner_suppressed.get(normalized)
+                if isinstance(owner_suppressed, dict)
+                else None
+            )
+            suppressed_sources = {
+                str(item)
+                for sources in (owner_sources, legacy_suppressed)
+                if isinstance(sources, list)
+                for item in sources
+            }
+            singleton_suppressed = "device_code" in suppressed_sources
+            if singleton_suppressed:
+                if isinstance(active_providers, dict):
+                    active_providers.pop(normalized, None)
+                legacy_state = None
+                if isinstance(legacy_entries, list):
+                    legacy_entries = [
+                        entry
+                        for entry in legacy_entries
+                        if not (
+                            isinstance(entry, dict)
+                            and entry.get("source") == "device_code"
+                        )
+                    ]
+                    if isinstance(active_pool, dict):
+                        active_pool.pop(normalized, None)
+
+            has_state = _provider_state_has_credentials(legacy_state)
+            has_entries = isinstance(legacy_entries, list) and any(
+                _pool_entry_has_credentials(entry) for entry in legacy_entries
+            )
+            has_suppression = bool(suppressed_sources)
+            if not has_state and not has_entries and not has_suppression:
+                return False
+
+            if has_state:
+                assert isinstance(active_providers, dict)
+                owner_providers = owner_store.setdefault("providers", {})
+                if not isinstance(owner_providers, dict):
+                    owner_providers = {}
+                    owner_store["providers"] = owner_providers
+                owner_providers[normalized] = legacy_state
+                active_providers.pop(normalized, None)
+
+            if has_entries:
+                assert isinstance(active_pool, dict)
+                owner_pool = owner_store.setdefault("credential_pool", {})
+                if not isinstance(owner_pool, dict):
+                    owner_pool = {}
+                    owner_store["credential_pool"] = owner_pool
+                owner_pool[normalized] = legacy_entries
+                active_pool.pop(normalized, None)
+
+            if isinstance(legacy_suppressed, list) and legacy_suppressed:
+                assert isinstance(active_suppressed, dict)
+                owner_suppressed = owner_store.setdefault("suppressed_sources", {})
+                if not isinstance(owner_suppressed, dict):
+                    owner_suppressed = {}
+                    owner_store["suppressed_sources"] = owner_suppressed
+                existing = owner_suppressed.get(normalized)
+                merged = list(existing) if isinstance(existing, list) else []
+                merged.extend(item for item in legacy_suppressed if item not in merged)
+                owner_suppressed[normalized] = merged
+                active_suppressed.pop(normalized, None)
+
+            _mark_shared_auth_owner(
+                owner_store,
+                normalized,
+                deleted=not has_state and not has_entries,
+                advance_generation=True,
+            )
+            _save_auth_store(owner_store, target_path=owner_path)
+            _save_auth_store(active_store, target_path=active_path)
+            return True
 
 
 def _load_global_auth_store() -> Dict[str, Any]:
@@ -1170,6 +1820,8 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
         or isinstance(raw.get("credential_pool"), dict)
+        or isinstance(raw.get("suppressed_sources"), dict)
+        or isinstance(raw.get(_SHARED_AUTH_OWNER_MARKERS_KEY), dict)
     ):
         raw.setdefault("providers", {})
         if isinstance(raw.get("providers"), dict):
@@ -1257,6 +1909,12 @@ def _load_provider_state_with_source(
     """
     owner_path = _auth_store_path_for_provider(provider_id)
     active_path = _auth_file_path()
+    if str(provider_id).strip().lower() in _GLOBAL_SHARED_AUTH_PROVIDERS:
+        owner_store = (
+            auth_store if _same_path(owner_path, active_path) else _load_auth_store(owner_path)
+        )
+        if _shared_auth_owner_deleted(owner_store, provider_id):
+            return None, owner_path
     if not _same_path(owner_path, active_path):
         owner_store = _load_auth_store(owner_path)
         owner_providers = owner_store.get("providers")
@@ -1473,6 +2131,23 @@ def read_credential_pool(
     Writes use the same provider owner via ``write_credential_pool``.
     """
     auth_store = _load_auth_store()
+    if provider_id is None:
+        adopted = False
+        active_suppressed = auth_store.get("suppressed_sources")
+        for shared_provider in _GLOBAL_SHARED_AUTH_PROVIDERS:
+            has_suppression = (
+                isinstance(active_suppressed, dict)
+                and isinstance(active_suppressed.get(shared_provider), list)
+                and bool(active_suppressed.get(shared_provider))
+            )
+            if _store_has_provider_credentials(auth_store, shared_provider) or has_suppression:
+                adopted = _adopt_legacy_shared_provider_auth(shared_provider) or adopted
+        if adopted:
+            auth_store = _load_auth_store()
+    else:
+        _adopt_legacy_shared_provider_auth(provider_id)
+        auth_store = _load_auth_store()
+
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         pool = {}
@@ -1485,8 +2160,14 @@ def read_credential_pool(
 
     if provider_id is None:
         merged = dict(pool)
-        if _global_auth_file_path() is not None:
-            for shared_provider in _GLOBAL_SHARED_AUTH_PROVIDERS:
+        for shared_provider in _GLOBAL_SHARED_AUTH_PROVIDERS:
+            owner_store = (
+                global_store if _global_auth_file_path() is not None else auth_store
+            )
+            if _shared_auth_owner_deleted(owner_store, shared_provider):
+                merged.pop(shared_provider, None)
+                continue
+            if _global_auth_file_path() is not None:
                 # Global ownership means even a non-empty stale profile copy
                 # must not shadow the canonical token chain.
                 merged.pop(shared_provider, None)
@@ -1506,12 +2187,13 @@ def read_credential_pool(
         return merged
 
     normalized_provider = str(provider_id or "").strip().lower()
-    if (
-        normalized_provider in _GLOBAL_SHARED_AUTH_PROVIDERS
-        and _global_auth_file_path() is not None
-    ):
-        global_entries = global_pool.get(normalized_provider)
-        return list(global_entries) if isinstance(global_entries, list) else []
+    if normalized_provider in _GLOBAL_SHARED_AUTH_PROVIDERS:
+        owner_store = global_store if _global_auth_file_path() is not None else auth_store
+        if _shared_auth_owner_deleted(owner_store, normalized_provider):
+            return []
+        if _global_auth_file_path() is not None:
+            global_entries = global_pool.get(normalized_provider)
+            return list(global_entries) if isinstance(global_entries, list) else []
 
     provider_entries = pool.get(provider_id)
     if isinstance(provider_entries, list) and provider_entries:
@@ -1588,12 +2270,44 @@ def _merge_disk_cooldown_state(
         return entry
 
 
+def read_credential_pool_snapshot(
+    provider_id: str,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Read one pool slice with its shared-owner generation atomically."""
+    normalized = str(provider_id or "").strip().lower()
+    if normalized not in _GLOBAL_SHARED_AUTH_PROVIDERS:
+        return read_credential_pool(normalized), None
+
+    owner_path = _auth_store_path_for_provider(normalized)
+    _adopt_legacy_shared_provider_auth(normalized)
+    with _auth_store_lock(target_path=owner_path):
+        auth_store = _load_auth_store(owner_path)
+        _, digest_changed = _reconcile_shared_auth_owner_digest(
+            auth_store,
+            normalized,
+        )
+        if digest_changed:
+            _save_auth_store(auth_store, target_path=owner_path)
+        generation = _shared_auth_owner_generation(auth_store, normalized)
+        if _shared_auth_owner_deleted(auth_store, normalized):
+            return [], generation
+        pool = auth_store.get("credential_pool")
+        entries = pool.get(normalized) if isinstance(pool, dict) else None
+        return (list(entries) if isinstance(entries, list) else []), generation
+
+
 def write_credential_pool(
     provider_id: str,
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
-) -> Path:
+    expected_owner_generation: Optional[int] = None,
+    advance_owner_generation: bool = False,
+    reactivate_owner: bool = False,
+    clear_provider_state: bool = False,
+    suppress_sources: Optional[Iterable[str]] = None,
+    revoke_access_tokens: Optional[Iterable[str]] = None,
+) -> Optional[Path]:
     """Persist one provider's credential pool under auth.json.
 
     This is the final disk-boundary guard for borrowed/reference-only
@@ -1611,11 +2325,59 @@ def write_credential_pool(
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
+
+    For globally shared providers, ``expected_owner_generation`` fences stale
+    pool instances that loaded before a logout tombstone advanced the owner.
+    A stale write is discarded and returns ``None``.
     """
+    _adopt_legacy_shared_provider_auth(provider_id)
     removed = {rid for rid in (removed_ids or ()) if rid}
     target_path = _auth_store_path_for_provider(provider_id)
     with _auth_store_lock(target_path=target_path):
         auth_store = _load_auth_store(target_path)
+        normalized_provider = str(provider_id).strip().lower()
+        owner_was_deleted = False
+        if normalized_provider in _GLOBAL_SHARED_AUTH_PROVIDERS:
+            external_change, digest_changed = _reconcile_shared_auth_owner_digest(
+                auth_store,
+                normalized_provider,
+            )
+            if digest_changed:
+                _save_auth_store(auth_store, target_path=target_path)
+            current_generation = _shared_auth_owner_generation(
+                auth_store,
+                normalized_provider,
+            )
+            if external_change and expected_owner_generation is None:
+                logger.info(
+                    "Discarding unversioned %s credential-pool write after external owner change",
+                    normalized_provider,
+                )
+                return None
+            if (
+                expected_owner_generation is not None
+                and expected_owner_generation != current_generation
+            ):
+                logger.info(
+                    "Discarding stale %s credential-pool write "
+                    "(owner generation %s -> %s)",
+                    normalized_provider,
+                    expected_owner_generation,
+                    current_generation,
+                )
+                return None
+            owner_was_deleted = _shared_auth_owner_deleted(
+                auth_store,
+                normalized_provider,
+            )
+            if owner_was_deleted and not reactivate_owner:
+                logger.info(
+                    "Discarding %s credential-pool write while shared owner is logged out",
+                    normalized_provider,
+                )
+                return None
+            if owner_was_deleted and reactivate_owner:
+                clear_provider_state = True
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1626,7 +2388,11 @@ def write_credential_pool(
             for entry in entries
         ]
         existing = pool.get(provider_id)
-        existing_list = existing if isinstance(existing, list) else []
+        existing_list = (
+            []
+            if owner_was_deleted and reactivate_owner
+            else (existing if isinstance(existing, list) else [])
+        )
         existing_by_id = {
             entry.get("id"): entry
             for entry in existing_list
@@ -1653,28 +2419,88 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
+        if clear_provider_state:
+            providers = auth_store.get("providers")
+            if isinstance(providers, dict):
+                providers.pop(provider_id, None)
+        sources_to_suppress = {
+            str(source).strip()
+            for source in (suppress_sources or ())
+            if str(source).strip()
+        }
+        if sources_to_suppress:
+            suppressed = auth_store.setdefault("suppressed_sources", {})
+            if not isinstance(suppressed, dict):
+                suppressed = {}
+                auth_store["suppressed_sources"] = suppressed
+            existing_sources = suppressed.get(provider_id)
+            merged_sources = (
+                list(existing_sources) if isinstance(existing_sources, list) else []
+            )
+            merged_sources.extend(
+                source for source in sources_to_suppress if source not in merged_sources
+            )
+            suppressed[provider_id] = merged_sources
+        if normalized_provider in _GLOBAL_SHARED_AUTH_PROVIDERS:
+            tokens_to_revoke = [token for token in (revoke_access_tokens or ()) if token]
+            if tokens_to_revoke:
+                _record_shared_auth_token_revocations(
+                    auth_store,
+                    normalized_provider,
+                    tokens_to_revoke,
+                )
+            # Every shared-pool mutation is a new owner epoch. This also fences
+            # direct/current callers that do not yet pass the explicit flag.
+            _mark_shared_auth_owner(
+                auth_store,
+                normalized_provider,
+                advance_generation=True,
+            )
         return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
     """Mark a credential source as suppressed so it won't be re-seeded."""
+    _adopt_legacy_shared_provider_auth(provider_id)
     target_path = _auth_store_path_for_provider(provider_id)
     with _auth_store_lock(target_path=target_path):
         auth_store = _load_auth_store(target_path)
         suppressed = auth_store.setdefault("suppressed_sources", {})
         provider_list = suppressed.setdefault(provider_id, [])
-        if source not in provider_list:
+        changed = source not in provider_list
+        if changed:
             provider_list.append(source)
+        normalized = str(provider_id).strip().lower()
+        if normalized in _GLOBAL_SHARED_AUTH_PROVIDERS:
+            deleted = _shared_auth_owner_deleted(auth_store, normalized) or not (
+                _store_has_provider_credentials(auth_store, normalized)
+            )
+            _mark_shared_auth_owner(
+                auth_store,
+                normalized,
+                deleted=deleted,
+                advance_generation=changed,
+            )
         _save_auth_store(auth_store, target_path=target_path)
+
+
+def list_suppressed_credential_sources(provider_id: str) -> List[str]:
+    """Return suppression keys from the provider's canonical owner store."""
+    _adopt_legacy_shared_provider_auth(provider_id)
+    target_path = _auth_store_path_for_provider(provider_id)
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
+        suppressed = auth_store.get("suppressed_sources")
+        if not isinstance(suppressed, dict):
+            return []
+        sources = suppressed.get(provider_id)
+        return list(sources) if isinstance(sources, list) else []
 
 
 def is_source_suppressed(provider_id: str, source: str) -> bool:
     """Check if a credential source has been suppressed by the user."""
     try:
-        target_path = _auth_store_path_for_provider(provider_id)
-        auth_store = _load_auth_store(target_path)
-        suppressed = auth_store.get("suppressed_sources", {})
-        return source in suppressed.get(provider_id, [])
+        return source in list_suppressed_credential_sources(provider_id)
     except Exception:
         return False
 
@@ -1684,6 +2510,7 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
 
     Returns True if a marker was cleared, False if no marker existed.
     """
+    _adopt_legacy_shared_provider_auth(provider_id)
     target_path = _auth_store_path_for_provider(provider_id)
     with _auth_store_lock(target_path=target_path):
         auth_store = _load_auth_store(target_path)
@@ -1698,6 +2525,13 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
             suppressed.pop(provider_id, None)
         if not suppressed:
             auth_store.pop("suppressed_sources", None)
+        normalized = str(provider_id).strip().lower()
+        if normalized in _GLOBAL_SHARED_AUTH_PROVIDERS:
+            _mark_shared_auth_owner(
+                auth_store,
+                normalized,
+                deleted=_shared_auth_owner_deleted(auth_store, normalized),
+            )
         _save_auth_store(auth_store, target_path=target_path)
         return True
 
@@ -1710,6 +2544,7 @@ def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     from their canonical global owner so stale profile copies cannot shadow a
     rotating token chain.
     """
+    _adopt_legacy_shared_provider_auth(provider_id)
     auth_store = _load_auth_store()
     return _load_provider_state(auth_store, provider_id)
 
@@ -1844,8 +2679,8 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
         return False
 
     target_path = _auth_store_path_for_provider(target)
-    with _auth_store_lock(target_path=target_path):
-        auth_store = _load_auth_store(target_path)
+
+    def _clear_from_store(auth_store: Dict[str, Any], *, clear_active: bool) -> bool:
         providers = auth_store.get("providers", {})
         if not isinstance(providers, dict):
             providers = {}
@@ -1856,29 +2691,51 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
             pool = {}
             auth_store["credential_pool"] = pool
 
-        cleared = False
+        changed = False
         if target in providers:
             del providers[target]
-            cleared = True
+            changed = True
         if target in pool:
             del pool[target]
-            cleared = True
-        if auth_store.get("active_provider") == target:
+            changed = True
+        if clear_active and auth_store.get("active_provider") == target:
             auth_store["active_provider"] = None
-            cleared = True
-        if cleared:
-            _save_auth_store(auth_store, target_path=target_path)
+            changed = True
+        return changed
 
-        # A named profile still owns its active-provider preference even when
-        # the provider's credentials live globally. Clear that pointer too,
-        # taking the documented global-owner -> profile lock order.
-        if not _same_path(target_path, active_path):
-            with _auth_store_lock(target_path=active_path):
-                profile_store = _load_auth_store(active_path)
-                if profile_store.get("active_provider") == target:
-                    profile_store["active_provider"] = None
-                    _save_auth_store(profile_store, target_path=active_path)
-                    cleared = True
+    cleared = False
+    if not _same_path(target_path, active_path):
+        # Remove ignored legacy profile copies first. Locks are deliberately
+        # sequential, never nested: provider refresh transactions take the
+        # profile lock and then the global fallback lock, so nesting these in
+        # the reverse order would deadlock concurrent logout and refresh.
+        with _auth_store_lock(target_path=active_path):
+            profile_store = _load_auth_store(active_path)
+            if _clear_from_store(profile_store, clear_active=True):
+                _save_auth_store(profile_store, target_path=active_path)
+                cleared = True
+
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
+        normalized_target = str(target).strip().lower()
+        changed = _clear_from_store(
+            auth_store,
+            clear_active=_same_path(target_path, active_path),
+        )
+        if normalized_target in _GLOBAL_SHARED_AUTH_PROVIDERS:
+            changed = (
+                _mark_shared_auth_owner(
+                    auth_store,
+                    normalized_target,
+                    deleted=True,
+                    advance_generation=True,
+                    close_legacy_migration=True,
+                )
+                or changed
+            )
+        if changed:
+            _save_auth_store(auth_store, target_path=target_path)
+            cleared = True
 
     return cleared
 
@@ -3517,6 +4374,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
     """
+    _adopt_legacy_shared_provider_auth("openai-codex")
     owner_path = _auth_store_path_for_provider("openai-codex")
     if _lock:
         with _auth_store_lock(target_path=owner_path):
@@ -3616,10 +4474,12 @@ def _sync_codex_pool_entries(
     refresh_token = tokens.get("refresh_token")
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
-        return
+        pool = {}
+        auth_store["credential_pool"] = pool
     entries = pool.get("openai-codex")
     if not isinstance(entries, list):
-        return
+        entries = []
+        pool["openai-codex"] = entries
     # Previous singleton access_token (before this re-auth overwrote it) —
     # used to distinguish legacy singleton-aliases from independent accounts.
     # When None or empty, no manual entry can be treated as an alias (which
@@ -3628,6 +4488,7 @@ def _sync_codex_pool_entries(
     prev_at = None
     if isinstance(previous_singleton_tokens, dict):
         prev_at = previous_singleton_tokens.get("access_token") or None
+    refreshed_mirror = False
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -3649,6 +4510,7 @@ def _sync_codex_pool_entries(
             refresh_this_entry = False
         if not refresh_this_entry:
             continue
+        refreshed_mirror = True
         entry["access_token"] = access_token
         if refresh_token:
             entry["refresh_token"] = refresh_token
@@ -3660,15 +4522,51 @@ def _sync_codex_pool_entries(
         entry["last_error_reason"] = None
         entry["last_error_message"] = None
         entry["last_error_reset_at"] = None
+    if not refreshed_mirror:
+        providers = auth_store.get("providers")
+        state = (
+            providers.get("openai-codex")
+            if isinstance(providers, dict)
+            else None
+        )
+        state_label = (
+            str(state.get("label") or "").strip()
+            if isinstance(state, dict)
+            else ""
+        )
+        entries.append(
+            {
+                "id": uuid.uuid4().hex[:6],
+                "label": state_label or "device_code",
+                "auth_type": "oauth",
+                "priority": len(entries),
+                "source": "device_code",
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "last_refresh": last_refresh,
+            }
+        )
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
     """Save Codex OAuth tokens to the canonical Hermes auth store."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    _adopt_legacy_shared_provider_auth("openai-codex")
     owner_path = _auth_store_path_for_provider("openai-codex")
     with _auth_store_lock(target_path=owner_path):
         auth_store = _load_auth_store(owner_path)
+        reactivating_owner = _shared_auth_owner_deleted(
+            auth_store,
+            "openai-codex",
+        )
+        if reactivating_owner:
+            pool = auth_store.get("credential_pool")
+            if not isinstance(pool, dict):
+                pool = {}
+                auth_store["credential_pool"] = pool
+            pool["openai-codex"] = []
         state = _load_provider_state(auth_store, "openai-codex") or {}
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
@@ -3681,14 +4579,34 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
+        _store_provider_state(
+            auth_store,
+            "openai-codex",
+            state,
+            set_active=False,
+        )
         _sync_codex_pool_entries(
             auth_store,
             tokens,
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
+        suppressed = auth_store.get("suppressed_sources")
+        if isinstance(suppressed, dict):
+            sources = suppressed.get("openai-codex")
+            if isinstance(sources, list) and "device_code" in sources:
+                remaining = [source for source in sources if source != "device_code"]
+                if remaining:
+                    suppressed["openai-codex"] = remaining
+                else:
+                    suppressed.pop("openai-codex", None)
+        _mark_shared_auth_owner(
+            auth_store,
+            "openai-codex",
+            advance_generation=True,
+        )
         _save_auth_store(auth_store, target_path=owner_path)
+    mark_provider_active_if_unset("openai-codex")
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
@@ -4222,8 +5140,10 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
     """
     cleared = 0
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        _adopt_legacy_shared_provider_auth("openai-codex")
+        owner_path = _auth_store_path_for_provider("openai-codex")
+        with _auth_store_lock(target_path=owner_path):
+            auth_store = _load_auth_store(owner_path)
             pool = auth_store.get("credential_pool")
             entries = pool.get("openai-codex") if isinstance(pool, dict) else None
             if not isinstance(entries, list):
@@ -4249,7 +5169,16 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
                 entry["last_error_reset_at"] = None
                 cleared += 1
             if cleared:
-                _save_auth_store(auth_store)
+                _mark_shared_auth_owner(
+                    auth_store,
+                    "openai-codex",
+                    deleted=_shared_auth_owner_deleted(
+                        auth_store,
+                        "openai-codex",
+                    ),
+                    advance_generation=True,
+                )
+                _save_auth_store(auth_store, target_path=owner_path)
     except Exception:
         logger.debug("Failed to clear Codex pool quota cooldowns", exc_info=True)
     return cleared
@@ -4282,9 +5211,12 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
         return None
 
     try:
+        _adopt_legacy_shared_provider_auth("openai-codex")
         owner_path = _auth_store_path_for_provider("openai-codex")
         with _auth_store_lock(target_path=owner_path):
             auth_store = _load_auth_store(owner_path)
+        if _shared_auth_owner_deleted(auth_store, "openai-codex"):
+            return None
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             return None
@@ -4342,9 +5274,12 @@ def _pool_codex_access_token() -> str:
     the original AuthError).
     """
     try:
+        _adopt_legacy_shared_provider_auth("openai-codex")
         owner_path = _auth_store_path_for_provider("openai-codex")
         with _auth_store_lock(target_path=owner_path):
             auth_store = _load_auth_store(owner_path)
+        if _shared_auth_owner_deleted(auth_store, "openai-codex"):
+            return ""
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             return ""

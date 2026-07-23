@@ -3243,6 +3243,13 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
         "auth_type": "api_key",
         "access_token": "manual-codex-key",
     }))
+    pool.add_entry(PooledCredential.from_dict("openai-codex", {
+        "id": "legacy-alias",
+        "source": "manual:device_code",
+        "auth_type": "oauth",
+        "access_token": "old-access-token",
+        "refresh_token": "old-refresh-token",
+    }))
 
     refresh_calls = {"count": 0}
 

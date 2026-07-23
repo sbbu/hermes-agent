@@ -1421,8 +1421,8 @@ def test_auth_remove_codex_device_code_suppresses_reseed(tmp_path, monkeypatch):
     assert "openai-codex" not in updated.get("providers", {})
 
 
-def test_auth_remove_codex_manual_source_suppresses_reseed(tmp_path, monkeypatch):
-    """Removing a manually-added (`manual:device_code`) openai-codex credential must also suppress."""
+def test_auth_remove_codex_manual_source_preserves_singleton(tmp_path, monkeypatch):
+    """A manual Codex account is independent from the seeded singleton."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
@@ -1461,11 +1461,8 @@ def test_auth_remove_codex_manual_source_suppresses_reseed(tmp_path, monkeypatch
     auth_remove_command(SimpleNamespace(provider="openai-codex", target="1"))
 
     updated = json.loads((hermes_home / "auth.json").read_text())
-    suppressed = updated.get("suppressed_sources", {})
-    # Critical: manual:device_code source must also trigger the suppression path
-    assert "openai-codex" in suppressed
-    assert "device_code" in suppressed["openai-codex"]
-    assert "openai-codex" not in updated.get("providers", {})
+    assert "openai-codex" not in updated.get("suppressed_sources", {})
+    assert updated["providers"]["openai-codex"]["tokens"]["access_token"] == "acc-2"
 
 
 def test_auth_add_codex_clears_suppression_marker(tmp_path, monkeypatch):
@@ -1995,11 +1992,11 @@ def test_auth_add_clears_all_suppressions_including_non_env(tmp_path, monkeypatc
     assert not is_source_suppressed("copilot", "env:COPILOT_GITHUB_TOKEN")
 
 
-def test_auth_remove_codex_manual_device_code_suppresses_canonical(tmp_path, monkeypatch):
-    """Removing a manual:device_code entry (from `hermes auth add openai-codex`)
-    must suppress the canonical ``device_code`` key, not ``manual:device_code``.
-    The re-seed gate in _seed_from_singletons checks ``device_code``.
-    """
+def test_auth_remove_codex_manual_device_code_does_not_suppress_canonical(
+    tmp_path,
+    monkeypatch,
+):
+    """Removing an independent manual account must leave singleton seeding enabled."""
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -2023,8 +2020,11 @@ def test_auth_remove_codex_manual_device_code_suppresses_canonical(tmp_path, mon
     )
 
     from types import SimpleNamespace
-    from hermes_cli.auth import is_source_suppressed
+    from hermes_cli.auth import get_provider_auth_state, is_source_suppressed
     from hermes_cli.auth_commands import auth_remove_command
 
     auth_remove_command(SimpleNamespace(provider="openai-codex", target="1"))
-    assert is_source_suppressed("openai-codex", "device_code")
+    assert not is_source_suppressed("openai-codex", "device_code")
+    state = get_provider_auth_state("openai-codex")
+    assert state is not None
+    assert state["tokens"]["access_token"] == "t"
