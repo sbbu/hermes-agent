@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,10 @@ from hermes_cli.config import get_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+
+class AmbiguousChannelName(ValueError):
+    """Raised when a friendly target name maps to multiple destinations."""
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 # Throttle window for repeated Slack channel-directory refresh failures.
@@ -92,6 +97,138 @@ def _channel_target_name(platform_name: str, channel: Dict[str, Any]) -> str:
     if platform_name != "discord" and channel.get("type"):
         return f"{name} ({channel['type']})"
     return name
+
+
+def _unique_channel_id(channels: List[Dict[str, Any]]) -> Optional[str]:
+    """Return the sole distinct target ID in *channels*, else ``None``.
+
+    Directory builders can legitimately contribute duplicate rows for the
+    same target (for example, Discord enumeration plus session history), so
+    uniqueness is about destination IDs rather than row count.
+    """
+    ids = {str(ch["id"]) for ch in channels if ch.get("id") is not None}
+    if len(ids) == 1:
+        return next(iter(ids))
+    return None
+
+
+def _channel_query_id_index(
+    platform_name: str,
+    channels: List[Dict[str, Any]],
+) -> Dict[str, set[str]]:
+    """Index every accepted exact/qualified query by destination ID."""
+    query_ids: Dict[str, set[str]] = {}
+    for channel in channels:
+        channel_id = str(channel["id"])
+        label = _channel_target_name(platform_name, channel)
+        queries = {
+            _normalize_channel_query(channel["name"]),
+            _normalize_channel_query(label),
+        }
+        guild = channel.get("guild")
+        if platform_name == "discord" and guild:
+            queries.add(
+                _normalize_channel_query(f"{guild}/{channel['name']}")
+            )
+        for query in queries:
+            query_ids.setdefault(query, set()).add(channel_id)
+    return query_ids
+
+
+def _target_ref_round_trips(
+    platform_name: str,
+    target_ref: str,
+    channel_id: str,
+) -> bool:
+    """Return whether downstream target parsing preserves this destination.
+
+    Some valid human names also look like explicit IDs (for example a Discord
+    display name of ``123``). Those refs bypass directory resolution entirely,
+    so they are safe to advertise only when the parser identifies the same
+    destination. If the parser cannot be imported, fail closed to the raw ID.
+    """
+    try:
+        from tools.send_message_tool import _parse_target_ref
+
+        parsed_chat_id, parsed_thread_id, is_explicit = _parse_target_ref(
+            platform_name, target_ref
+        )
+    except Exception:
+        return False
+
+    if is_explicit:
+        parsed_id = str(parsed_chat_id)
+        if parsed_thread_id is not None:
+            parsed_id = f"{parsed_id}:{parsed_thread_id}"
+        return parsed_id == channel_id
+
+    try:
+        resolved = resolve_channel_name(platform_name, target_ref)
+    except Exception:
+        return False
+    return str(resolved) == channel_id
+
+
+def _display_target_refs(
+    platform_name: str,
+    channels: List[Dict[str, Any]],
+) -> Dict[int, str]:
+    """Map directory-row identities to friendly, unambiguous target refs.
+
+    Duplicate human names are common across Discord guilds and Slack
+    workspaces. Showing the same friendly ref for several IDs invites a send
+    to the wrong destination. Qualify Discord names by guild when that is
+    sufficient; otherwise expose the unambiguous raw ID. Indexes are built
+    once so formatting a large workspace remains linear rather than quadratic.
+    """
+    query_ids = _channel_query_id_index(platform_name, channels)
+    raw_query_ids: Dict[str, set[str]] = defaultdict(set)
+    for candidate in channels:
+        raw_query_ids[_normalize_channel_query(str(candidate["id"]))].add(
+            str(candidate["id"])
+        )
+
+    def safe_ref(candidate: str, channel_id: str) -> Optional[str]:
+        key = _normalize_channel_query(candidate)
+        if (
+            query_ids[key] | raw_query_ids[key]
+        ) == {channel_id} and _target_ref_round_trips(
+            platform_name, candidate, channel_id
+        ):
+            return candidate
+
+        # Explicit name intent avoids both opaque-ID parsing and raw-ID
+        # precedence in ``resolve_channel_name``.
+        forced = f"name={candidate}"
+        if query_ids[key] == {channel_id} and _target_ref_round_trips(
+            platform_name, forced, channel_id
+        ):
+            return forced
+        return None
+
+    refs: Dict[int, str] = {}
+    for channel in channels:
+        channel_id = str(channel["id"])
+        label = _channel_target_name(platform_name, channel)
+        target_ref = safe_ref(label, channel_id)
+        if target_ref is not None:
+            refs[id(channel)] = target_ref
+            continue
+
+        guild = channel.get("guild")
+        if platform_name == "discord" and guild:
+            qualified = f"{guild}/{channel['name']}"
+            target_ref = safe_ref(qualified, channel_id)
+            if target_ref is not None:
+                refs[id(channel)] = target_ref
+                continue
+
+        raw_ref = channel_id
+        if not _target_ref_round_trips(platform_name, raw_ref, channel_id):
+            raw_ref = f"id={channel_id}"
+        refs[id(channel)] = raw_ref
+
+    return refs
 
 
 def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
@@ -496,57 +633,102 @@ def lookup_channel_type(platform_name: str, chat_id: str) -> Optional[str]:
     return None
 
 
+def split_channel_target_id(
+    platform_name: str,
+    target_id: str,
+) -> tuple[str, Optional[str]]:
+    """Recover chat/thread parts stored on a directory entry.
+
+    Session-derived entries retain ``thread_id`` alongside their legacy
+    ``<chat_id>:<thread_id>`` composite ID. This metadata is authoritative for
+    platforms whose opaque IDs cannot be split by the generic target parser.
+    """
+    raw_target = str(target_id)
+    directory = load_directory()
+    for channel in directory.get("platforms", {}).get(platform_name, []):
+        if str(channel.get("id")) != raw_target:
+            continue
+        thread_id = channel.get("thread_id")
+        if thread_id is None:
+            break
+        thread = str(thread_id)
+        suffix = f":{thread}"
+        if raw_target.endswith(suffix):
+            chat_id = raw_target[: -len(suffix)]
+            if chat_id:
+                return chat_id, thread
+        break
+    return raw_target, None
+
+
 def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     """
     Resolve a human-friendly channel name to a numeric ID.
 
-    Matching strategy (case-insensitive, first match wins):
+    Matching strategy (case-insensitive, unique matches only):
     - Discord: "bot-home", "#bot-home", "GuildName/bot-home"
     - Telegram: display name or group name
     - Slack: "engineering", "#engineering"
+
+    Ambiguous names raise :class:`AmbiguousChannelName` rather than selecting
+    an arbitrary target; callers can disambiguate with a guild-qualified
+    Discord name or raw ID.
     """
     directory = load_directory()
     channels = directory.get("platforms", {}).get(platform_name, [])
     if not channels:
         return None
 
+    raw = name.strip()
+    force_name = raw.lower().startswith("name=")
+    if force_name:
+        raw = raw[len("name=") :].strip()
+        if not raw:
+            return None
+
     # 0. Exact ID match — case-sensitive, no normalization. Lets callers pass
     # raw platform IDs (e.g. Slack "C0B0QV5434G") even when the format guard
-    # in _parse_target_ref hasn't recognized them as explicit.
-    raw = name.strip()
-    for ch in channels:
-        if ch.get("id") == raw:
-            return ch["id"]
-
-    query = _normalize_channel_query(name)
-
-    # 1. Exact name match, including the display labels shown by send_message(action="list")
-    for ch in channels:
-        if _normalize_channel_query(ch["name"]) == query:
-            return ch["id"]
-        if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
-            return ch["id"]
-
-    # 2. Guild-qualified match for Discord ("GuildName/channel")
-    if "/" in query:
-        guild_part, ch_part = query.rsplit("/", 1)
+    # in _parse_target_ref hasn't recognized them as explicit. ``name=`` opts
+    # out of this precedence when a human label is intentionally ID-shaped.
+    if not force_name:
         for ch in channels:
-            guild = ch.get("guild", "").strip().lower()
-            if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part:
+            if ch.get("id") == raw:
                 return ch["id"]
 
-    # 3. Partial prefix match (only if unambiguous)
+    query = _normalize_channel_query(raw)
+
+    # 1. Exact names, display labels, and Discord guild-qualified names share
+    # one index. Unioning those interpretations prevents a DM/thread label
+    # containing "/" from shadowing (or being shadowed by) a guild channel.
+    exact_ids = _channel_query_id_index(platform_name, channels).get(query, set())
+    if len(exact_ids) > 1:
+        raise AmbiguousChannelName(
+            f"Target '{name}' on {platform_name} matches multiple destinations"
+        )
+    if exact_ids:
+        return next(iter(exact_ids))
+
+    # 2. Partial prefix match (only if unambiguous)
     matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
-    if len(matches) == 1:
-        return matches[0]["id"]
+    matched_id = _unique_channel_id(matches)
+    if matches and matched_id is None:
+        raise AmbiguousChannelName(
+            f"Target '{name}' on {platform_name} matches multiple destinations"
+        )
+    return matched_id
 
-    return None
 
-
-def format_directory_for_display() -> str:
-    """Format the channel directory as a human-readable list for the model."""
+def format_directory_for_display(platform_filter: Optional[str] = None) -> str:
+    """Return a human-readable list of available messaging targets."""
     directory = load_directory()
     platforms = directory.get("platforms", {})
+    if platform_filter:
+        key = platform_filter.strip().lower()
+        platforms = {
+            name: channels
+            for name, channels in platforms.items()
+            if name.lower() == key
+        }
 
     if not any(platforms.values()):
         return "No messaging platforms connected or no channels discovered yet."
@@ -556,6 +738,7 @@ def format_directory_for_display() -> str:
     for plat_name, channels in sorted(platforms.items()):
         if not channels:
             continue
+        target_refs = _display_target_refs(plat_name, channels)
 
         # Group Discord channels by guild
         if plat_name == "discord":
@@ -571,16 +754,16 @@ def format_directory_for_display() -> str:
             for guild_name, guild_channels in sorted(guilds.items()):
                 lines.append(f"Discord ({guild_name}):")
                 for ch in sorted(guild_channels, key=lambda c: c["name"]):
-                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    lines.append(f"  discord:{target_refs[id(ch)]}")
             if dms:
                 lines.append("Discord (DMs):")
                 for ch in dms:
-                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    lines.append(f"  discord:{target_refs[id(ch)]}")
             lines.append("")
         else:
             lines.append(f"{plat_name.title()}:")
             for ch in channels:
-                lines.append(f"  {plat_name}:{_channel_target_name(plat_name, ch)}")
+                lines.append(f"  {plat_name}:{target_refs[id(ch)]}")
             lines.append("")
 
     lines.append('Use these as the "target" parameter when sending.')

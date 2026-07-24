@@ -378,6 +378,105 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_ambiguous_friendly_name_fails_closed(self):
+        from gateway.channel_directory import AmbiguousChannelName
+
+        job = {"deliver": "slack:general"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            side_effect=AmbiguousChannelName("ambiguous"),
+        ):
+            result = _resolve_delivery_target(job)
+
+        assert result is None
+
+    def test_forced_friendly_name_missing_from_directory_fails_closed(self):
+        job = {"deliver": "line:name=Alice"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value=None,
+        ):
+            result = _resolve_delivery_target(job)
+
+        assert result is None
+        assert _resolve_delivery_target({"deliver": "line:id="}) is None
+
+    def test_resolved_id_prefix_is_preserved_as_data(self):
+        job = {"deliver": "mattermost:name=Alice"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="id=secret",
+        ):
+            result = _resolve_delivery_target(job)
+
+        assert result == {
+            "platform": "mattermost",
+            "chat_id": "id=secret",
+            "thread_id": None,
+        }
+
+    def test_explicit_target_bypasses_colliding_directory_name(self):
+        job = {"deliver": "discord:123"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="222",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+
+        assert result == {
+            "platform": "discord",
+            "chat_id": "123",
+            "thread_id": None,
+        }
+        resolve_mock.assert_not_called()
+
+    def test_generic_opaque_target_bypasses_colliding_directory_name(self):
+        job = {"deliver": "line:U012ABC"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="Ufed999",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+
+        assert result == {
+            "platform": "line",
+            "chat_id": "U012ABC",
+            "thread_id": None,
+        }
+        resolve_mock.assert_not_called()
+
+    def test_opaque_directory_thread_id_preserves_thread_boundary(self, tmp_path):
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "mattermost": [
+                    {
+                        "id": "channel-a:root-b",
+                        "name": "Engineering / topic root-b",
+                        "type": "channel",
+                        "thread_id": "root-b",
+                    }
+                ]
+            },
+        }))
+        friendly_job = {
+            "deliver": "mattermost:name=Engineering / topic root-b (channel)"
+        }
+        raw_job = {"deliver": "mattermost:channel-a:root-b"}
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            friendly_result = _resolve_delivery_target(friendly_job)
+            raw_result = _resolve_delivery_target(raw_job)
+
+        expected = {
+            "platform": "mattermost",
+            "chat_id": "channel-a",
+            "thread_id": "root-b",
+        }
+        assert friendly_result == expected
+        assert raw_result == expected
+
     def test_explicit_slack_same_channel_preserves_origin_thread_id(self):
         job = {
             "deliver": "slack:C0B3KEP3SD6",

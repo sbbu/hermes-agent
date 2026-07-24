@@ -186,25 +186,9 @@ def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
         print("channel discovery can populate ~/.hermes/channel_directory.json.")
         return _SUCCESS_EXIT
 
-    # Human display — when unfiltered, reuse the shared formatter the agent
-    # already sees. When filtered, build a minimal view ourselves.
-    if platform_filter is None:
-        print(format_directory_for_display())
-        return _SUCCESS_EXIT
-
-    for plat_name in sorted(platforms):
-        channels = platforms[plat_name]
-        print(f"{plat_name}:")
-        if not channels:
-            print("  (no channels discovered yet)")
-            continue
-        for ch in channels:
-            name = ch.get("name", "?")
-            chat_id = ch.get("id") or ch.get("chat_id") or ""
-            suffix = f"  [{chat_id}]" if chat_id and chat_id != name else ""
-            print(f"  {plat_name}:{name}{suffix}")
-        print()
-
+    # Human display always uses the shared formatter so filtered and unfiltered
+    # lists expose the same copyable, ambiguity-safe target refs.
+    print(format_directory_for_display(platform_filter))
     return _SUCCESS_EXIT
 
 

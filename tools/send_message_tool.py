@@ -44,6 +44,24 @@ _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # downstream adapters (signal, etc.) expect.
 _PHONE_PLATFORMS = frozenset({"photon", "signal", "sms", "whatsapp"})
 _E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
+# A ``name=`` prefix makes directory-name intent explicit. Platforms outside
+# this set use unconstrained opaque IDs, so an unprefixed value must remain a
+# raw ID rather than being reinterpreted as somebody else's display name.
+_NAME_TARGET_PREFIX = "name="
+_ID_TARGET_PREFIX = "id="
+_BARE_NAME_TARGET_PLATFORMS = frozenset({
+    "discord",
+    "email",
+    "feishu",
+    "matrix",
+    "signal",
+    "slack",
+    "sms",
+    "telegram",
+    "whatsapp",
+    "weixin",
+    "xmpp",
+})
 # WhatsApp JIDs: group chats (<digits>@g.us), individual users
 # (<phone>@s.whatsapp.net), linked identities (<id>@lid), and broadcast /
 # newsletter chats. These are explicit native targets the bridge accepts
@@ -288,16 +306,58 @@ def _handle_react(args, remove=False):
     target_ref = parts[1].strip() if len(parts) > 1 else None
     chat_id = None
     if target_ref:
-        chat_id, _thread_id, _ = _parse_target_ref(platform_name, target_ref)
-        if not chat_id:
+        chat_id, _thread_id, is_explicit = _parse_target_ref(
+            platform_name, target_ref
+        )
+        if is_explicit and not chat_id:
+            return tool_error("The 'id=' target escape requires a non-empty ID")
+        if is_explicit:
             try:
-                from gateway.channel_directory import resolve_channel_name
-                resolved = resolve_channel_name(platform_name, target_ref)
+                from gateway.channel_directory import split_channel_target_id
+
+                explicit_target_id = str(chat_id)
+                if _thread_id is not None:
+                    explicit_target_id = f"{explicit_target_id}:{_thread_id}"
+                directory_chat_id, directory_thread_id = split_channel_target_id(
+                    platform_name, explicit_target_id
+                )
+                if directory_thread_id is not None:
+                    chat_id = directory_chat_id
+            except Exception:
+                pass
+        if not chat_id:
+            split_channel_target_id = None
+            try:
+                from gateway.channel_directory import (
+                    AmbiguousChannelName,
+                    resolve_channel_name,
+                    split_channel_target_id,
+                )
             except Exception:
                 resolved = None
-            # Opaque platform-native ids (e.g. photon space GUIDs like
-            # 'any;-;+1555...') match no parser pattern and no directory
-            # entry — pass them through verbatim; the adapter validates.
+            else:
+                try:
+                    resolved = resolve_channel_name(platform_name, target_ref)
+                except AmbiguousChannelName:
+                    return tool_error(
+                        f"Could not resolve '{target_ref}' on {platform_name}: "
+                        "the name matches multiple destinations. Use a target "
+                        "from send_message(action='list') instead."
+                    )
+                except Exception:
+                    resolved = None
+            if resolved and split_channel_target_id is not None:
+                directory_chat_id, _directory_thread_id = split_channel_target_id(
+                    platform_name, resolved
+                )
+                resolved = directory_chat_id
+            if target_ref.lower().startswith("name=") and not resolved:
+                return tool_error(
+                    f"Could not resolve '{target_ref}' on {platform_name}. "
+                    "Use a target from send_message(action='list') instead."
+                )
+            # Legacy bare friendly refs retain their old adapter fallback; the
+            # explicit ``name=`` grammar always fails closed above.
             chat_id = resolved or target_ref
 
     try:
@@ -370,16 +430,45 @@ def _handle_send(args):
 
     if target_ref:
         chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
+        if is_explicit and not chat_id:
+            return tool_error("The 'id=' target escape requires a non-empty ID")
+        if is_explicit:
+            try:
+                from gateway.channel_directory import split_channel_target_id
+
+                explicit_target_id = str(chat_id)
+                if thread_id is not None:
+                    explicit_target_id = f"{explicit_target_id}:{thread_id}"
+                directory_chat_id, directory_thread_id = split_channel_target_id(
+                    platform_name, explicit_target_id
+                )
+                if directory_thread_id is not None:
+                    chat_id, thread_id = directory_chat_id, directory_thread_id
+            except Exception:
+                pass
     else:
         is_explicit = False
 
     # Resolve human-friendly channel names to numeric IDs
     if target_ref and not is_explicit:
         try:
-            from gateway.channel_directory import resolve_channel_name
+            from gateway.channel_directory import (
+                resolve_channel_name,
+                split_channel_target_id,
+            )
             resolved = resolve_channel_name(platform_name, target_ref)
             if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                chat_id, thread_id = split_channel_target_id(
+                    platform_name, resolved
+                )
+                if thread_id is None and not str(resolved).lower().startswith(
+                    ("id=", "name=")
+                ):
+                    parsed_chat_id, parsed_thread_id, resolved_is_explicit = (
+                        _parse_target_ref(platform_name, resolved)
+                    )
+                    if resolved_is_explicit:
+                        chat_id, thread_id = parsed_chat_id, parsed_thread_id
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
@@ -529,6 +618,15 @@ def _handle_send(args):
 
 def _parse_target_ref(platform_name: str, target_ref: str):
     """Parse a tool target into chat_id/thread_id and whether it is explicit."""
+    stripped_target = target_ref.strip()
+    if stripped_target.lower().startswith(_ID_TARGET_PREFIX):
+        raw_id = stripped_target[len(_ID_TARGET_PREFIX) :]
+        if raw_id:
+            return raw_id, None, True
+        return None, None, True
+    if stripped_target.lower().startswith(_NAME_TARGET_PREFIX):
+        return None, None, False
+
     if platform_name == "telegram":
         match = _TELEGRAM_TOPIC_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -576,6 +674,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return match.group(1), None, True
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
+        if target_ref.strip():
+            return target_ref.strip(), None, True
         return None, None, False
     if platform_name == "ntfy":
         topic = target_ref.strip()
@@ -591,7 +691,6 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         # through to the _PHONE_PLATFORMS handler below.
         if _WHATSAPP_JID_RE.fullmatch(target_ref):
             return target_ref.strip(), None, True
-    stripped_target = target_ref.strip()
     if platform_name == "signal" and stripped_target.startswith("group:"):
         group_id = stripped_target[len("group:"):].strip()
         if group_id:
@@ -611,6 +710,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     # XMPP JIDs (user@server or room@conference.server) are explicit
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
+    if platform_name not in _BARE_NAME_TARGET_PLATFORMS and stripped_target:
+        return stripped_target, None, True
     return None, None, False
 
 

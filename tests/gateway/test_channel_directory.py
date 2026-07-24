@@ -8,9 +8,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.channel_directory import (
+    AmbiguousChannelName,
     build_channel_directory,
     lookup_channel_type,
     resolve_channel_name,
+    split_channel_target_id,
     format_directory_for_display,
     load_directory,
     _apply_channel_aliases,
@@ -200,6 +202,122 @@ class TestResolveChannelName:
             assert resolve_channel_name("discord", "ServerA/general") == "111"
             assert resolve_channel_name("discord", "ServerB/general") == "222"
 
+    def test_ambiguous_exact_name_returns_none(self, tmp_path):
+        platforms = {
+            "discord": [
+                {"id": "111", "name": "general", "guild": "ServerA", "type": "channel"},
+                {"id": "222", "name": "general", "guild": "ServerB", "type": "channel"},
+            ],
+            "slack": [
+                {"id": "C01", "name": "general", "type": "channel"},
+                {"id": "C02", "name": "general", "type": "channel"},
+            ],
+        }
+        with self._setup(tmp_path, platforms):
+            with pytest.raises(AmbiguousChannelName):
+                resolve_channel_name("discord", "#general")
+            with pytest.raises(AmbiguousChannelName):
+                resolve_channel_name("slack", "general")
+
+    def test_duplicate_rows_for_same_id_are_not_ambiguous(self, tmp_path):
+        platforms = {
+            "discord": [
+                {"id": "111", "name": "general", "guild": "ServerA", "type": "channel"},
+                {"id": "111", "name": "general", "type": "channel"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("discord", "#general") == "111"
+
+    def test_forced_name_bypasses_raw_id_precedence(self, tmp_path):
+        platforms = {
+            "line": [
+                {"id": "U012", "name": "Other", "type": "dm"},
+                {"id": "Ufed", "name": "U012", "type": "dm"},
+            ],
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("line", "U012") == "U012"
+            assert resolve_channel_name("line", "name=U012") == "Ufed"
+
+    def test_opaque_id_name_collision_is_listed_with_forced_name(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "line": [
+                {"id": "U012", "name": "Other", "type": "dm"},
+                {"id": "Ufed", "name": "U012", "type": "dm"},
+            ],
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "line:name=U012 (dm)" in result
+        assert "  line:U012 (dm)" not in result
+
+    def test_natural_name_prefix_is_escaped_by_repetition(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "line": [
+                {"id": "U1", "name": "name=Alice", "type": "dm"},
+                {"id": "U2", "name": "Alice", "type": "dm"},
+            ],
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+            assert resolve_channel_name("line", "name=name=Alice (dm)") == "U1"
+            assert resolve_channel_name("line", "name=Alice (dm)") == "U2"
+
+        assert "line:name=name=Alice (dm)" in result
+        assert "line:name=Alice (dm)" in result
+
+    def test_raw_id_starting_with_name_prefix_uses_id_escape(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "line": [
+                {"id": "name=secret", "name": "Shared", "type": "dm"},
+                {"id": "U2", "name": "Shared", "type": "dm"},
+            ],
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "line:id=name=secret" in result
+
+    def test_guild_qualified_duplicate_within_guild_returns_none(self, tmp_path):
+        platforms = {
+            "discord": [
+                {"id": "111", "name": "general", "guild": "ServerA", "type": "channel"},
+                {"id": "222", "name": "general", "guild": "ServerA", "type": "channel"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            with pytest.raises(AmbiguousChannelName):
+                resolve_channel_name("discord", "ServerA/general")
+
+    def test_slash_in_thread_label_does_not_force_guild_resolution(self, tmp_path):
+        platforms = {
+            "discord": [
+                {
+                    "id": "111:222",
+                    "name": "Coaching Chat / topic 222",
+                    "type": "thread",
+                },
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert (
+                resolve_channel_name("discord", "Coaching Chat / topic 222")
+                == "111:222"
+            )
+
+    def test_dm_name_colliding_with_guild_qualified_name_is_ambiguous(self, tmp_path):
+        platforms = {
+            "discord": [
+                {"id": "111", "name": "general", "guild": "ServerA", "type": "channel"},
+                {"id": "222", "name": "ServerA/general", "type": "dm"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            with pytest.raises(AmbiguousChannelName):
+                resolve_channel_name("discord", "ServerA/general")
+
     def test_prefix_match_unambiguous(self, tmp_path):
         platforms = {
             "slack": [
@@ -219,7 +337,8 @@ class TestResolveChannelName:
             ]
         }
         with self._setup(tmp_path, platforms):
-            assert resolve_channel_name("slack", "eng") is None
+            with pytest.raises(AmbiguousChannelName):
+                resolve_channel_name("slack", "eng")
 
     def test_no_channels_returns_none(self, tmp_path):
         with self._setup(tmp_path, {}):
@@ -399,6 +518,88 @@ class TestFormatDirectoryForDisplay:
         assert "Discord (Server2):" in result
         assert "discord:#general" in result
 
+    def test_ambiguous_discord_names_are_guild_qualified(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "discord": [
+                {"id": "1", "name": "general", "guild": "Server1", "type": "channel"},
+                {"id": "2", "name": "general", "guild": "Server2", "type": "channel"},
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "discord:Server1/general" in result
+        assert "discord:Server2/general" in result
+        assert "discord:#general" not in result
+
+    def test_same_guild_duplicate_discord_names_use_raw_ids(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "discord": [
+                {"id": "1", "name": "general", "guild": "Server1", "type": "channel"},
+                {"id": "2", "name": "general", "guild": "Server1", "type": "channel"},
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "discord:1" in result
+        assert "discord:2" in result
+        assert "discord:Server1/general" not in result
+
+    def test_ambiguous_non_discord_labels_use_raw_ids(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "slack": [
+                {"id": "C01", "name": "general", "type": "channel"},
+                {"id": "C02", "name": "general", "type": "channel"},
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "slack:C01" in result
+        assert "slack:C02" in result
+        assert "slack:general (channel)" not in result
+
+    def test_slash_label_colliding_with_guild_ref_uses_raw_id(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "discord": [
+                {"id": "111", "name": "general", "guild": "ServerA", "type": "channel"},
+                {"id": "222", "name": "ServerA/general", "type": "dm"},
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "discord:#general" in result
+        assert "discord:222" in result
+        assert "discord:ServerA/general" not in result
+
+    def test_platform_filter_uses_same_safe_refs(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "discord": [
+                {"id": "1", "name": "general", "guild": "Server1", "type": "channel"},
+                {"id": "2", "name": "general", "guild": "Server2", "type": "channel"},
+            ],
+            "telegram": [{"id": "3", "name": "Other", "type": "group"}],
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display("discord")
+
+        assert "discord:Server1/general" in result
+        assert "discord:Server2/general" in result
+        assert "telegram:" not in result
+
+    @pytest.mark.parametrize("name", ["111", "111:333"])
+    def test_explicit_looking_discord_name_uses_forced_name_ref(self, tmp_path, name):
+        cache_file = _write_directory(tmp_path, {
+            "discord": [{"id": "222", "name": name, "type": "dm"}],
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert f"discord:name={name}" in result
+        assert f"  discord:{name}" not in result
+
 
 class TestLookupChannelType:
     def _setup(self, tmp_path, platforms):
@@ -444,6 +645,40 @@ class TestLookupChannelType:
         }
         with self._setup(tmp_path, platforms):
             assert lookup_channel_type("discord", "300") is None
+
+
+class TestSplitChannelTargetId:
+    def test_session_thread_metadata_splits_opaque_composite_id(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "mattermost": [
+                {
+                    "id": "channel-a:root-b",
+                    "name": "Engineering / topic root-b",
+                    "type": "channel",
+                    "thread_id": "root-b",
+                }
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            assert split_channel_target_id(
+                "mattermost", "channel-a:root-b"
+            ) == ("channel-a", "root-b")
+
+    def test_non_thread_opaque_id_is_preserved(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "mattermost": [
+                {
+                    "id": "channel:a",
+                    "name": "Engineering",
+                    "type": "channel",
+                    "thread_id": None,
+                }
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            assert split_channel_target_id(
+                "mattermost", "channel:a"
+            ) == ("channel:a", None)
 
 
 def _make_slack_adapter(team_clients):

@@ -55,6 +55,42 @@ def test_whatsapp_friendly_name_still_uses_directory_resolution() -> None:
     assert _parse_target_ref("whatsapp", "general")[2] is False
 
 
+def test_generic_opaque_id_is_explicit() -> None:
+    chat_id, thread_id, is_explicit = _parse_target_ref("line", "U012ABC")
+
+    assert (chat_id, thread_id, is_explicit) == ("U012ABC", None, True)
+
+
+def test_name_prefix_forces_directory_resolution() -> None:
+    assert _parse_target_ref("line", "name=Alice")[2] is False
+    assert _parse_target_ref("discord", "name=123")[2] is False
+
+
+def test_id_prefix_preserves_reserved_raw_id() -> None:
+    assert _parse_target_ref("line", "id=name=secret") == (
+        "name=secret",
+        None,
+        True,
+    )
+    assert _parse_target_ref("line", "id=") == (None, None, True)
+
+
+def test_empty_id_escape_fails_closed_for_send_and_reaction() -> None:
+    send_result = json.loads(
+        send_message_tool(
+            {"action": "send", "target": "line:id=", "message": "hello"}
+        )
+    )
+    reaction_result = json.loads(
+        send_message_tool(
+            {"action": "react", "target": "line:id=", "emoji": "thumbsup"}
+        )
+    )
+
+    assert "non-empty ID" in send_result["error"]
+    assert "non-empty ID" in reaction_result["error"]
+
+
 def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
     whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"api_url": "http://bridge"})
     config = SimpleNamespace(

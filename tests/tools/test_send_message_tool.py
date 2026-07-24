@@ -320,6 +320,45 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_ambiguous_reaction_target_fails_closed(self):
+        from gateway.channel_directory import AmbiguousChannelName
+
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            side_effect=AmbiguousChannelName("ambiguous"),
+        ):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "react",
+                        "target": "discord:#general",
+                        "emoji": "thumbsup",
+                    }
+                )
+            )
+
+        assert "multiple destinations" in result["error"]
+
+    def test_reaction_forced_name_missing_from_directory_fails_closed(self):
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value=None,
+        ):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "react",
+                        "target": "slack:name=missing",
+                        "emoji": "thumbsup",
+                    }
+                )
+            )
+
+        assert result["error"] == (
+            "Could not resolve 'name=missing' on slack. "
+            "Use a target from send_message(action='list') instead."
+        )
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()
@@ -423,6 +462,102 @@ class TestSendMessageTool:
             media_files=[],
             force_document=False,
         )
+
+    def test_opaque_directory_id_does_not_fall_back_to_home_channel(self):
+        mattermost_cfg = SimpleNamespace(enabled=True, token="test", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.MATTERMOST: mattermost_cfg},
+            get_home_channel=lambda _platform: SimpleNamespace(chat_id="HOME"),
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value="id=secret"), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "mattermost:name=engineering",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.MATTERMOST,
+            mattermost_cfg,
+            "id=secret",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_opaque_directory_thread_id_preserves_thread_boundary(self, tmp_path):
+        mattermost_cfg = SimpleNamespace(enabled=True, token="test", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.MATTERMOST: mattermost_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "mattermost": [
+                    {
+                        "id": "opaque-channel-id-a:root-b",
+                        "name": "Engineering / topic root-b",
+                        "type": "channel",
+                        "thread_id": "root-b",
+                    }
+                ]
+            },
+        }))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            friendly_result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "mattermost:name=Engineering / topic root-b (channel)",
+                        "message": "hello",
+                    }
+                )
+            )
+            raw_result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "mattermost:opaque-channel-id-a:root-b",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert friendly_result["success"] is True
+        assert raw_result["success"] is True
+        assert send_mock.await_count == 2
+        for await_args in send_mock.await_args_list:
+            assert await_args.args == (
+                Platform.MATTERMOST,
+                mattermost_cfg,
+                "opaque-channel-id-a",
+                "hello",
+            )
+            assert await_args.kwargs == {
+                "thread_id": "root-b",
+                "media_files": [],
+                "force_document": False,
+            }
 
     def test_resolved_slack_thread_name_preserves_thread_id(self):
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})

@@ -64,6 +64,49 @@ def test_unreact_dispatches_to_remove_reaction():
     assert adapter.calls == [("remove", "+15551234567", "msg-9")]
 
 
+def test_reaction_directory_thread_target_uses_parent_chat_id(tmp_path):
+    adapter = _FakePhotonAdapter()
+    cache_file = tmp_path / "channel_directory.json"
+    cache_file.write_text(json.dumps({
+        "updated_at": "2026-01-01T00:00:00",
+        "platforms": {
+            "photon": [
+                {
+                    "id": "space-a:thread-b",
+                    "name": "Family / topic thread-b",
+                    "type": "group",
+                    "thread_id": "thread-b",
+                }
+            ]
+        },
+    }))
+
+    with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), patch(
+        "gateway.run._gateway_runner_ref", lambda: _runner_with(adapter)
+    ):
+        friendly_result = _call(
+            {
+                "action": "react",
+                "target": "photon:name=Family / topic thread-b (group)",
+                "emoji": "👍",
+            }
+        )
+        raw_result = _call(
+            {
+                "action": "react",
+                "target": "photon:space-a:thread-b",
+                "emoji": "✅",
+            }
+        )
+
+    assert friendly_result["success"] is True
+    assert raw_result["success"] is True
+    assert adapter.calls == [
+        ("add", "space-a", "👍", None),
+        ("add", "space-a", "✅", None),
+    ]
+
+
 def test_react_requires_emoji():
     result = _call({"action": "react", "target": "photon:+15551234567"})
     assert result.get("success") is not True

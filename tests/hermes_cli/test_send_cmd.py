@@ -233,7 +233,7 @@ def test_list_human_output(monkeypatch, capsys):
     import types as _types
 
     fake_dir = _types.ModuleType("gateway.channel_directory")
-    fake_dir.format_directory_for_display = lambda: "Available messaging targets:\n\nTelegram:\n  telegram:-100123\n"
+    fake_dir.format_directory_for_display = lambda _filter=None: "Available messaging targets:\n\nTelegram:\n  telegram:-100123\n"
     fake_dir.load_directory = lambda: {
         "platforms": {"telegram": [{"id": "-100123", "name": "Test Group"}]}
     }
@@ -252,7 +252,7 @@ def test_list_json(monkeypatch, capsys):
     import types as _types
 
     fake_dir = _types.ModuleType("gateway.channel_directory")
-    fake_dir.format_directory_for_display = lambda: "(ignored in json mode)"
+    fake_dir.format_directory_for_display = lambda _filter=None: "(ignored in json mode)"
     fake_dir.load_directory = lambda: {
         "platforms": {"telegram": [{"id": "-100123", "name": "Test Group"}]}
     }
@@ -272,7 +272,13 @@ def test_list_filter_platform(monkeypatch, capsys):
     import types as _types
 
     fake_dir = _types.ModuleType("gateway.channel_directory")
-    fake_dir.format_directory_for_display = lambda: "(should not be called when filter set)"
+    seen_filters = []
+
+    def _format_directory(platform_filter=None):
+        seen_filters.append(platform_filter)
+        return "Available messaging targets:\n\nTelegram:\n  telegram:-100123\n"
+
+    fake_dir.format_directory_for_display = _format_directory
     fake_dir.load_directory = lambda: {
         "platforms": {
             "telegram": [{"id": "-100123", "name": "TG Chat"}],
@@ -290,6 +296,7 @@ def test_list_filter_platform(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "telegram" in out.lower()
     assert "discord" not in out.lower()
+    assert seen_filters == ["telegram"]
 
 
 def test_list_unknown_platform_fails(monkeypatch, capsys):
@@ -297,7 +304,7 @@ def test_list_unknown_platform_fails(monkeypatch, capsys):
     import types as _types
 
     fake_dir = _types.ModuleType("gateway.channel_directory")
-    fake_dir.format_directory_for_display = lambda: ""
+    fake_dir.format_directory_for_display = lambda _filter=None: ""
     fake_dir.load_directory = lambda: {"platforms": {"telegram": []}}
     monkeypatch.setitem(_sys.modules, "gateway.channel_directory", fake_dir)
 

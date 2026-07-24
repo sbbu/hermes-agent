@@ -1178,25 +1178,65 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         from tools.send_message_tool import _parse_target_ref
 
         parsed_chat_id, parsed_thread_id, is_explicit = _parse_target_ref(platform_key, rest)
+        if is_explicit and not parsed_chat_id:
+            return None
         if is_explicit:
             chat_id, thread_id = parsed_chat_id, parsed_thread_id
+            try:
+                from gateway.channel_directory import split_channel_target_id
+
+                explicit_target_id = str(chat_id)
+                if thread_id is not None:
+                    explicit_target_id = f"{explicit_target_id}:{thread_id}"
+                directory_chat_id, directory_thread_id = split_channel_target_id(
+                    platform_key, explicit_target_id
+                )
+                if directory_thread_id is not None:
+                    chat_id, thread_id = directory_chat_id, directory_thread_id
+            except Exception:
+                pass
         else:
             chat_id, thread_id = rest, None
 
-        # Resolve human-friendly labels like "Alice (dm)" to real IDs.
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_key, chat_id)
-            if resolved:
+        # Resolve human-friendly labels like "Alice (dm)" to real IDs. Explicit
+        # IDs bypass the directory so a later name collision cannot redirect a
+        # previously configured cron target.
+        force_name = rest.strip().lower().startswith("name=")
+        resolved = None
+        split_channel_target_id = None
+        if not is_explicit:
+            try:
+                from gateway.channel_directory import (
+                    AmbiguousChannelName,
+                    resolve_channel_name,
+                    split_channel_target_id,
+                )
+            except Exception:
+                pass
+            else:
+                try:
+                    resolved = resolve_channel_name(platform_key, str(chat_id))
+                except AmbiguousChannelName:
+                    # A cron result may contain sensitive content. Never treat
+                    # an ambiguous friendly name as a raw ID and let an adapter
+                    # pick (or reject) an arbitrary destination.
+                    return None
+                except Exception:
+                    pass
+
+        if force_name and not resolved:
+            return None
+
+        if resolved and split_channel_target_id is not None:
+            chat_id, thread_id = split_channel_target_id(platform_key, resolved)
+            if thread_id is None and not str(resolved).lower().startswith(
+                ("id=", "name=")
+            ):
                 parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
                 if resolved_is_explicit:
                     chat_id = parsed_chat_id
                     if parsed_thread_id is not None:
                         thread_id = parsed_thread_id
-                else:
-                    chat_id = resolved
-        except Exception:
-            pass
 
         if (
             thread_id is None
