@@ -220,21 +220,32 @@ def _remove_hermes_pkce(provider: str, removed) -> RemovalResult:
 
 
 def _clear_auth_store_provider(provider: str) -> bool:
-    """Delete auth_store.providers[provider].  Returns True if deleted."""
-    from hermes_cli.auth import (
-        _auth_store_lock,
-        _load_auth_store,
-        _save_auth_store,
-    )
+    """Delete the canonical auth-store singleton. Returns True if deleted."""
+    from hermes_cli import auth as auth_mod
 
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    normalized = str(provider or "").strip().lower()
+    target_path = auth_mod._auth_store_path_for_provider(normalized)
+    with auth_mod._auth_store_lock(target_path=target_path):
+        auth_store = auth_mod._load_auth_store(target_path)
         providers_dict = auth_store.get("providers")
-        if isinstance(providers_dict, dict) and provider in providers_dict:
-            del providers_dict[provider]
-            _save_auth_store(auth_store)
-            return True
-    return False
+        deleted = False
+        if isinstance(providers_dict, dict) and normalized in providers_dict:
+            del providers_dict[normalized]
+            deleted = True
+
+        owner_changed = False
+        if normalized in auth_mod._GLOBAL_SHARED_AUTH_PROVIDERS:
+            # Removing one canonical source must fence every live pool snapshot,
+            # while preserving any independent pool entries that remain.
+            owner_changed = auth_mod._mark_shared_auth_owner(
+                auth_store,
+                normalized,
+                deleted=False,
+                advance_generation=True,
+            )
+        if deleted or owner_changed:
+            auth_mod._save_auth_store(auth_store, target_path=target_path)
+        return bool(deleted)
 
 
 def _remove_nous_device_code(provider: str, removed) -> RemovalResult:
@@ -295,22 +306,11 @@ def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
     deleting Codex CLI's file, so the Codex CLI itself keeps working.
 
     The canonical source name in ``_seed_from_singletons`` is
-    ``"device_code"`` (no prefix).  Entries may show up in the pool as
-    either ``"device_code"`` (seeded) or ``"manual:device_code"`` (added
-    via ``hermes auth add openai-codex``), but in both cases the re-seed
-    gate lives at the ``"device_code"`` suppression key.  We suppress
-    that canonical key here; the central dispatcher also suppresses
-    ``removed.source`` which is fine — belt-and-suspenders, idempotent.
+    ``"device_code"``. Entries added by ``hermes auth add openai-codex`` use
+    ``"manual:device_code"`` and are independent accounts; removing one of
+    those must not delete or suppress the unrelated singleton.
     """
-    from hermes_cli.auth import suppress_credential_source
-
-    result = RemovalResult()
-    if _clear_auth_store_provider(provider):
-        result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
-    # Suppress the canonical re-seed source, not just whatever source the
-    # removed entry had.  Otherwise `manual:device_code` removals wouldn't
-    # block the `device_code` re-seed path.
-    suppress_credential_source(provider, "device_code")
+    result = RemovalResult(suppress=False)
     result.hints.extend([
         "Suppressed openai-codex device_code source — it will not be re-seeded.",
         "Note: Codex CLI credentials still live in ~/.codex/auth.json",
@@ -413,7 +413,6 @@ def _register_all_sources() -> None:
     ))
     register(RemovalStep(
         provider="openai-codex", source_id="device_code",
-        match_fn=lambda src: src == "device_code" or src.endswith(":device_code"),
         remove_fn=_remove_codex_device_code,
         description="auth.json providers.openai-codex + ~/.codex/auth.json",
     ))
