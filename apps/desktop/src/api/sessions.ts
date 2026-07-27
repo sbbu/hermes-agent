@@ -8,7 +8,7 @@ import type {
   SessionSearchResponse
 } from '@/types/hermes'
 
-import { hermesApi } from './client'
+import { hermesApi, profileScoped } from './client'
 
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
 
@@ -289,8 +289,9 @@ export function setSessionUnreadRemote(id: string, unread: boolean, profile?: st
   })
 }
 
-export function searchSessions(query: string): Promise<SessionSearchResponse> {
+export function searchSessions(query: string, profile?: string | null): Promise<SessionSearchResponse> {
   return hermesApi<SessionSearchResponse>({
+    ...profileScoped(profile),
     path: `/api/sessions/search?q=${encodeURIComponent(query)}`
   })
 }
