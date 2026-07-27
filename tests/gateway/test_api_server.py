@@ -41,6 +41,24 @@ from gateway.platforms.api_server import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _close_response_stores(monkeypatch):
+    """Close stores retained by adapter/application cycles after every test."""
+    import weakref
+
+    stores = weakref.WeakSet()
+    original_init = ResponseStore.__init__
+
+    def tracked_init(store, *args, **kwargs):
+        original_init(store, *args, **kwargs)
+        stores.add(store)
+
+    monkeypatch.setattr(ResponseStore, "__init__", tracked_init)
+    yield
+    for store in list(stores):
+        store.close()
+
+
 # ---------------------------------------------------------------------------
 # check_api_server_requirements
 # ---------------------------------------------------------------------------
@@ -92,6 +110,18 @@ class TestResponseStore:
     def test_get_missing_returns_none(self):
         store = ResponseStore(max_size=10)
         assert store.get("resp_missing") is None
+
+    def test_dropped_store_closes_connection_without_gc(self):
+        """Dropping a store must release SQLite FDs without waiting for cyclic GC."""
+        import sqlite3
+
+        store = ResponseStore(max_size=10, db_path=":memory:")
+        connection = store._conn
+
+        del store
+
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
 
     def test_lru_eviction(self):
         store = ResponseStore(max_size=3)
