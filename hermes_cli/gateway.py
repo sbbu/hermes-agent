@@ -4402,6 +4402,40 @@ def _launchd_domain() -> str:
     return _resolved_launchd_domain
 
 
+def _launchd_loaded_target(label: str | None = None) -> str:
+    """Return the launchd target for an already-loaded service when possible.
+
+    LaunchAgents can be loaded in either the GUI or user domain depending on
+    how the service was installed and which macOS session launched it. Restart
+    paths should target the domain that currently owns the job instead of
+    blindly using the default bootstrap domain; otherwise ``launchctl`` reports
+    "Could not find service" and a fallback can create a duplicate gateway.
+    """
+    label = label or get_launchd_label()
+    uid = os.getuid()
+    default_domain = _launchd_domain()
+    candidates = [default_domain, f"gui/{uid}", f"user/{uid}"]
+    seen: set[str] = set()
+    for domain in candidates:
+        if domain in seen:
+            continue
+        seen.add(domain)
+        target = f"{domain}/{label}"
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", target],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        if result.returncode == 0:
+            return target
+    return f"{default_domain}/{label}"
+
+
 # On macOS, exit code 125 ("Domain does not support specified action") and
 # 3/113 ("Could not find service") all mean the job isn't currently loaded in
 # the target domain, so start/restart should re-bootstrap the plist and retry.
@@ -5210,8 +5244,11 @@ def launchd_stop():
             pass
         else:
             raise
-    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
-    print("✓ Service stopped")
+    exited = _wait_for_gateway_exit(timeout=_get_restart_drain_timeout(), force_after=None)
+    if exited:
+        print("✓ Service stopped")
+    else:
+        print("⚠ Service stop requested; gateway is still draining — not force-killing")
 
 
 def _wait_for_gateway_exit(
@@ -5305,7 +5342,8 @@ def _wait_for_launchd_service_pid(
 
 def launchd_restart():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    target = _launchd_loaded_target(label)
+    target_domain = target.rsplit("/", 1)[0]
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
@@ -5340,17 +5378,19 @@ def launchd_restart():
                 f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
                 f"(up to {drain_timeout:.0f}s)..."
             )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(
-                        f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
-                    )
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+            if not _graceful_restart_via_sigusr1(
+                pid,
+                max(drain_timeout + 5.0, 1.0),
+            ):
+                print(
+                    f"⚠ Gateway is still draining after {drain_timeout:.0f}s — not forcing restart"
+                )
+                return
+            print(f"✓ Gateway drained for restart (pid {pid})")
+            kickstart_cmd = ["launchctl", "kickstart", target]
+        else:
+            kickstart_cmd = ["launchctl", "kickstart", "-k", target]
+        subprocess.run(kickstart_cmd, check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
     except subprocess.CalledProcessError as e:
@@ -5377,7 +5417,7 @@ def launchd_restart():
                 timeout=90,
             )
             subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+                ["launchctl", "bootstrap", target_domain, str(plist_path)],
                 check=True,
                 timeout=30,
             )
