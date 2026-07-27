@@ -81,6 +81,63 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
+    db_path = tmp_path / "shared-kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    kb.write_board_metadata("alias-a", name="Alias A")
+    kb.write_board_metadata("alias-b", name="Alias B")
+
+    tid = _create_completed_subscription()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "Kanban" in adapter.sent[0]["text"]
+    assert tid in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
+    db_path = tmp_path / "single-owner.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_completed_subscription()
+
+    adapter1 = RecordingAdapter()
+    adapter2 = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter1)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter2)))
+
+    assert len(adapter1.sent) == 1
+    assert adapter2.sent == []
+
+
+def test_completed_subscription_survives_for_reopened_work(tmp_path, monkeypatch):
+    db_path = tmp_path / "completed-reopen.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+        assert kb.wait_task(conn, tid, reason="serial gates") is True
+        assert kb.complete_task(conn, tid, summary="done after gates") is True
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 2
+
+
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

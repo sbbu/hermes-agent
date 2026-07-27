@@ -14030,6 +14030,7 @@ def main():
             sys.exit(rc)
     else:
         parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
