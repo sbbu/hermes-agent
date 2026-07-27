@@ -58,6 +58,14 @@ class TestSchema:
         from tools.computer_use.schema import COMPUTER_USE_SCHEMA
         assert "max_elements" not in COMPUTER_USE_SCHEMA["parameters"]["properties"]
 
+    def test_schema_preserves_operator_authorized_vercel_2fa_exception(self):
+        from tools.computer_use.schema import COMPUTER_USE_SCHEMA
+
+        description = COMPUTER_USE_SCHEMA["description"]
+        assert "explicit user authorization" in description
+        assert "Vercel" in description
+        assert "machine-identity account" in description
+
 
 class TestRegistration:
     def test_tool_registers_with_registry(self):
