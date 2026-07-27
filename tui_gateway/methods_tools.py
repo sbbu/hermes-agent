@@ -1168,6 +1168,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
 
     cmd = params.get("command", "").strip()
     if not cmd:
@@ -1278,43 +1279,43 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
 
-    worker = session.get("slash_worker")
-    if not worker:
-        # On-demand spawn is now the ONLY spawn path for a fresh session
-        # (eager pre-warm removed), and slash.exec handlers run on the RPC
-        # thread pool — two concurrent slash commands on the same session
-        # could both observe slash_worker=None and each fork a full
-        # MCP-fleet worker (the loser of the _attach_worker race would leak
-        # unclosed). Serialize first-use spawn per session.
-        with _sessions_lock:
-            spawn_lock = session.setdefault("_slash_spawn_lock", threading.Lock())
-        with spawn_lock:
-            worker = session.get("slash_worker")
-            if not worker:
-                try:
-                    worker = _SlashWorker(
-                        session["session_key"],
-                        getattr(session.get("agent"), "model", _resolve_model()),
-                        profile_home=session.get("profile_home"),
-                    )
-                    _attach_worker(params.get("session_id", ""), session, worker)
-                except Exception as e:
-                    return _err(rid, 5030, f"slash worker start failed: {e}")
+    with _sessions_lock:
+        spawn_lock = session.setdefault("_slash_spawn_lock", threading.Lock())
+    with spawn_lock:
+        worker = session.get("slash_worker")
+        if not worker:
+            # On-demand spawn is now the ONLY spawn path for a fresh session
+            # (eager pre-warm removed), and slash.exec handlers run on the RPC
+            # thread pool — two concurrent slash commands on the same session
+            # could both observe slash_worker=None and each fork a full
+            # MCP-fleet worker (the loser of the _attach_worker race would leak
+            # unclosed). Serialize first-use spawn per session.
+            try:
+                worker = _SlashWorker(
+                    session["session_key"],
+                    getattr(session.get("agent"), "model", _resolve_model()),
+                    profile_home=session.get("profile_home"),
+                )
+                _attach_worker(params.get("session_id", ""), session, worker)
+            except Exception as e:
+                return _err(rid, 5030, f"slash worker start failed: {e}")
 
-    try:
-        output = worker.run(cmd)
-        warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
-        payload = {"output": output or "(no output)"}
-        if warning:
-            payload["warning"] = warning
-        return _ok(rid, payload)
-    except Exception as e:
         try:
-            worker.close()
-        except Exception:
-            pass
-        session["slash_worker"] = None
-        return _err(rid, 5030, str(e))
+            output = worker.run(cmd)
+        except Exception as e:
+            try:
+                worker.close()
+            except Exception:
+                pass
+            if session.get("slash_worker") is worker:
+                session["slash_worker"] = None
+            return _err(rid, 5030, str(e))
+
+    warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
+    payload = {"output": output or "(no output)"}
+    if warning:
+        payload["warning"] = warning
+    return _ok(rid, payload)
 
 
 @method("insights.get")

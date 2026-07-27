@@ -491,7 +491,16 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         assert info["tools"] == {"core": ["terminal"]}
         assert info["usage"]["total"] == 140
         assert "credential_warning" not in info
-        assert emitted[-1] == ("session.info", "iso-sid", info)
+        event, event_sid, emitted_info = emitted[-1]
+        assert (event, event_sid) == ("session.info", "iso-sid")
+        # Runtime/update metadata can refresh between the emitted snapshot and
+        # this second _session_info() call. Assert the host-owned mirror
+        # contract rather than volatile process metadata.
+        assert emitted_info["model"] == info["model"]
+        assert emitted_info["provider"] == info["provider"]
+        assert emitted_info["system_prompt"] == info["system_prompt"]
+        assert emitted_info["tools"] == info["tools"]
+        assert emitted_info["usage"] == info["usage"]
     finally:
         server._sessions.pop("iso-sid", None)
 
@@ -11939,6 +11948,548 @@ def test_rollback_restore_rejects_full_history_while_running(monkeypatch):
         )
         assert resp.get("error"), "full-history rollback should reject while running"
         assert resp["error"]["code"] == 4009
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_interrupt_force_releases_stuck_desktop_turn(monkeypatch):
+    """session.interrupt must unlock even if the worker thread is hung."""
+
+    class _Agent:
+        def __init__(self):
+            self._session_db = object()
+            self.tool_progress_callback = object()
+            self.interrupt_reason = None
+
+        def interrupt(self, reason=None):
+            self.interrupt_reason = reason
+
+    class _Worker:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    agent = _Agent()
+    worker = _Worker()
+    server._sessions["sid"] = _session(
+        agent=agent,
+        agent_build_started=True,
+        agent_build_generation=4,
+        running=True,
+        run_generation=1,
+        inflight_turn={"text": "stuck"},
+        queued_prompt={"text": "discard me", "transport": None},
+        slash_worker=worker,
+    )
+    events: list[tuple] = []
+    try:
+        monkeypatch.setattr(server, "_emit", lambda *a: events.append(a))
+        def _request_build(_sid, session):
+            assert session["agent_build_started"] is False
+            session["build_requested"] = True
+
+        monkeypatch.setattr(server, "_start_agent_build", _request_build)
+
+        resp = server.handle_request(
+            {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+
+        assert resp["result"]["status"] == "interrupted"
+        session = server._sessions["sid"]
+        assert session["running"] is False
+        assert session["inflight_turn"] is None
+        assert session["agent"] is None
+        assert session["agent_ready"].is_set() is False
+        assert session["agent_build_started"] is False
+        assert session["agent_build_generation"] == 5
+        assert session["run_generation"] == 2
+        assert session["queued_prompt"] is None
+        assert session["build_requested"] is True
+        assert worker.closed is True
+        assert agent.interrupt_reason == "desktop session.interrupt"
+        assert agent._session_db is None
+        assert agent.tool_progress_callback is None
+        assert any(evt[0] == "session.info" and evt[2]["running"] is False for evt in events)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_quiesce_abandoned_agent_detaches_all_tui_callbacks():
+    """Recovered desktop turns must not let the abandoned worker keep emitting UI events."""
+
+    callback_attrs = set(server._ABANDONED_AGENT_CALLBACK_ATTRS)
+    assert set(server._agent_cbs("sid")) <= callback_attrs
+
+    class _Agent:
+        def __init__(self):
+            self._session_db = object()
+            self.interrupt_reason = None
+            for attr in callback_attrs:
+                setattr(self, attr, lambda *args, **kwargs: None)
+
+        def interrupt(self, reason=None):
+            self.interrupt_reason = reason
+
+    agent = _Agent()
+
+    server._quiesce_abandoned_agent(agent, "abandoned desktop turn")
+
+    assert agent.interrupt_reason == "abandoned desktop turn"
+    assert agent._session_db is None
+    for attr in callback_attrs:
+        assert getattr(agent, attr) is None, f"{attr} still attached"
+
+
+
+def test_compute_host_late_completion_cannot_clear_replacement_run(monkeypatch):
+    session = _session(
+        running=True,
+        run_generation=2,
+        inflight_turn={"user": "replacement"},
+        history_version=4,
+    )
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda *args: events.append(args))
+
+    server._on_compute_host_turn_done(
+        "old-rid",
+        "sid",
+        session,
+        {
+            "type": "turn.end",
+            "session_key": "old-key",
+            "history_version": 9,
+        },
+        run_generation=1,
+    )
+
+    assert session["running"] is True
+    assert session["session_key"] == "session-key"
+    assert session["history_version"] == 4
+    assert session["inflight_turn"] == {"user": "replacement"}
+    assert events == []
+
+
+
+
+
+
+
+def test_slash_worker_restart_waits_for_inflight_command(monkeypatch):
+    order = []
+    run_started = threading.Event()
+    release_run = threading.Event()
+
+    class _TrackingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._attempts = 0
+            self.second_attempt = threading.Event()
+
+        def __enter__(self):
+            self._attempts += 1
+            if self._attempts == 2:
+                self.second_attempt.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    class _OldWorker:
+        def run(self, _cmd):
+            run_started.set()
+            assert release_run.wait(timeout=2)
+            order.append("run-return")
+            return "ok"
+
+        def close(self):
+            order.append("old-close")
+
+    class _NewWorker:
+        def __init__(self, *_args, **_kwargs):
+            order.append("new-create")
+
+        def close(self):
+            order.append("new-close")
+
+    class _Agent:
+        model = "test-model"
+
+    spawn_lock = _TrackingLock()
+    session = _session(
+        agent=_Agent(),
+        slash_worker=_OldWorker(),
+        _slash_spawn_lock=spawn_lock,
+    )
+    server._sessions["slash-race"] = session
+    monkeypatch.setattr(server, "_SlashWorker", _NewWorker)
+    responses = []
+
+    slash_thread = threading.Thread(
+        target=lambda: responses.append(
+            server.handle_request(
+                {
+                    "id": "slash-rid",
+                    "method": "slash.exec",
+                    "params": {
+                        "session_id": "slash-race",
+                        "command": "/worker-only-test",
+                    },
+                }
+            )
+        )
+    )
+    restart_thread = threading.Thread(
+        target=server._restart_slash_worker,
+        args=("slash-race", session),
+    )
+
+    try:
+        slash_thread.start()
+        assert run_started.wait(timeout=2)
+        restart_thread.start()
+        assert spawn_lock.second_attempt.wait(timeout=2)
+        release_run.set()
+        slash_thread.join(timeout=2)
+        restart_thread.join(timeout=2)
+
+        assert not slash_thread.is_alive()
+        assert not restart_thread.is_alive()
+        assert responses[0]["result"]["output"] == "ok"
+        assert order[:3] == ["run-return", "old-close", "new-create"]
+        assert session["slash_worker"].__class__ is _NewWorker
+    finally:
+        release_run.set()
+        slash_thread.join(timeout=2)
+        restart_thread.join(timeout=2)
+        server._sessions.pop("slash-race", None)
+
+
+def test_compute_host_interrupt_force_releases_without_waiting(monkeypatch):
+    calls = []
+
+    class _Supervisor:
+        def force_release(self, sid, **kwargs):
+            calls.append((sid, kwargs))
+            return {"status": "sent"}
+
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        running=True,
+        run_generation=3,
+        inflight_turn={"user": "running"},
+        queued_prompt={"text": "discard", "transport": None},
+        _compute_host_active=True,
+    )
+    server._sessions["host-interrupt"] = session
+    try:
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a: True)
+        monkeypatch.setattr(
+            server,
+            "_get_compute_host_supervisor",
+            lambda *_a: _Supervisor(),
+        )
+        monkeypatch.setattr(server, "_clear_pending", lambda *_a: None)
+
+        resp = server.handle_request(
+            {
+                "id": "stop-host",
+                "method": "session.interrupt",
+                "params": {"session_id": "host-interrupt"},
+            }
+        )
+
+        assert resp is not None
+        assert resp["result"]["status"] == "interrupted"
+        assert calls == [
+            (
+                "host-interrupt",
+                {"wait": False, "clear_queued_prompt": True},
+            )
+        ]
+        assert session["run_generation"] == 4
+        assert session["running"] is False
+        assert session["inflight_turn"] is None
+        assert session["queued_prompt"] is None
+    finally:
+        server._sessions.pop("host-interrupt", None)
+
+
+def test_late_terminal_error_cannot_corrupt_replacement_run(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from tui_gateway.turn_marker import read_turn_marker, record_turn_start
+
+    sid = "late-error"
+    session_key = "gateway:late-error"
+    session = _session(
+        agent=SimpleNamespace(messages=[]),
+        session_key=session_key,
+        profile_home=str(tmp_path),
+    )
+    with session["history_lock"]:
+        old_generation = server._begin_session_run_locked(session, "old prompt")
+
+    old_owner = "old-owner"
+    new_owner = "new-owner"
+    record_turn_start(tmp_path, session_key, "old prompt", owner=old_owner)
+    emitted = []
+
+    def race_in_replacement(_text, _cols):
+        with session["history_lock"]:
+            server._begin_session_run_locked(session, "replacement prompt")
+        record_turn_start(tmp_path, session_key, "replacement prompt", owner=new_owner)
+        return "rendered old error"
+
+    monkeypatch.setattr(server, "render_message", race_in_replacement)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    assert server._emit_terminal_turn_error(
+        sid,
+        session,
+        RuntimeError("late old failure"),
+        generation=old_generation,
+        marker_owner=old_owner,
+    ) is False
+
+    with session["history_lock"]:
+        assert session["inflight_turn"]["user"] == "replacement prompt"
+        assert "error" not in session["inflight_turn"]
+    assert emitted == []
+    marker = read_turn_marker(tmp_path, session_key)
+    assert marker is not None
+    assert marker["owner"] == new_owner
+
+
+def test_delayed_old_run_cannot_write_or_retire_replacement_marker(monkeypatch, tmp_path):
+    """Marker creation is fenced before a stale worker can touch the sidecar."""
+    from types import SimpleNamespace
+
+    from tui_gateway.turn_marker import read_turn_marker, record_turn_start
+
+    sid = "marker-write-race"
+    session_key = "gateway:marker-write-race"
+    session = _session(
+        agent=SimpleNamespace(clear_interrupt=lambda: None),
+        profile_home=str(tmp_path),
+        session_key=session_key,
+    )
+    with session["history_lock"]:
+        old_generation = server._begin_session_run_locked(session, "old prompt")
+
+    old_at_marker = threading.Event()
+    release_old = threading.Event()
+    real_record_for_run = server._record_turn_marker_for_run
+
+    def pause_old_before_marker(target_sid, target_session, generation, text, owner):
+        if generation == old_generation:
+            old_at_marker.set()
+            assert release_old.wait(2), "test timed out waiting to release old marker writer"
+        return real_record_for_run(target_sid, target_session, generation, text, owner)
+
+    real_thread = threading.Thread
+    threads: list[threading.Thread] = []
+
+    def capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    emitted: list[tuple] = []
+    server._sessions[sid] = session
+    try:
+        monkeypatch.setattr(server, "_record_turn_marker_for_run", pause_old_before_marker)
+        monkeypatch.setattr(server.threading, "Thread", capture_thread)
+        monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+        server._run_prompt_submit("old-rid", sid, session, "old prompt")
+        assert old_at_marker.wait(2), "old run did not pause before its marker write"
+
+        with session["history_lock"]:
+            replacement_generation = server._begin_session_run_locked(session, "replacement prompt")
+        assert replacement_generation != old_generation
+        record_turn_start(
+            tmp_path,
+            session_key,
+            "replacement prompt",
+            owner="replacement-owner",
+        )
+        emitted.clear()
+
+        release_old.set()
+        for thread in threads:
+            thread.join(2)
+            assert not thread.is_alive()
+
+        marker = read_turn_marker(tmp_path, session_key)
+        assert marker is not None
+        assert marker["owner"] == "replacement-owner"
+        assert marker["prompt"] == "replacement prompt"
+        with session["history_lock"]:
+            assert session["run_generation"] == replacement_generation
+            assert session["running"] is True
+            assert session["inflight_turn"]["user"] == "replacement prompt"
+        assert emitted == []
+    finally:
+        release_old.set()
+        for thread in threads:
+            thread.join(2)
+        server._sessions.pop(sid, None)
+
+
+def test_replaced_session_object_fences_stale_turn_marker_lifecycle(monkeypatch, tmp_path):
+    """The sid's authoritative object identity fences equal-generation workers."""
+    from types import SimpleNamespace
+
+    from tui_gateway.turn_marker import read_turn_marker, record_turn_start
+
+    sid = "marker-object-race"
+    session_key = "gateway:marker-object-race"
+    stale_session = _session(
+        agent=SimpleNamespace(clear_interrupt=lambda: None),
+        profile_home=str(tmp_path),
+        session_key=session_key,
+    )
+    with stale_session["history_lock"]:
+        stale_generation = server._begin_session_run_locked(stale_session, "stale prompt")
+
+    stale_at_marker = threading.Event()
+    release_stale = threading.Event()
+    real_record_for_run = server._record_turn_marker_for_run
+
+    def pause_stale_before_marker(target_sid, target_session, generation, text, owner):
+        if target_session is stale_session:
+            stale_at_marker.set()
+            assert release_stale.wait(2), "test timed out waiting to replace the session object"
+        return real_record_for_run(target_sid, target_session, generation, text, owner)
+
+    real_thread = threading.Thread
+    threads: list[threading.Thread] = []
+
+    def capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    emitted: list[tuple] = []
+    replacement_session: dict | None = None
+    with server._sessions_lock:
+        server._sessions[sid] = stale_session
+    try:
+        monkeypatch.setattr(server, "_record_turn_marker_for_run", pause_stale_before_marker)
+        monkeypatch.setattr(server.threading, "Thread", capture_thread)
+        monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+        server._run_prompt_submit("stale-rid", sid, stale_session, "stale prompt")
+        assert stale_at_marker.wait(2), "stale run did not pause before its marker write"
+
+        # A cold replacement may restart its generation counter at the same
+        # value. Object identity, not that coincidental equality, owns the sid.
+        replacement_session = _session(
+            agent=SimpleNamespace(clear_interrupt=lambda: None),
+            profile_home=str(tmp_path),
+            session_key=session_key,
+            run_generation=stale_generation,
+            running=True,
+            inflight_turn={"user": "replacement prompt"},
+        )
+        with server._sessions_lock:
+            server._sessions[sid] = replacement_session
+        record_turn_start(
+            tmp_path,
+            session_key,
+            "replacement prompt",
+            owner="replacement-owner",
+        )
+        emitted.clear()
+
+        release_stale.set()
+        for thread in threads:
+            thread.join(2)
+            assert not thread.is_alive()
+
+        marker = read_turn_marker(tmp_path, session_key)
+        assert marker is not None
+        assert marker["owner"] == "replacement-owner"
+        assert marker["prompt"] == "replacement prompt"
+        with server._sessions_lock:
+            assert server._sessions[sid] is replacement_session
+        with replacement_session["history_lock"]:
+            assert replacement_session["run_generation"] == stale_generation
+            assert replacement_session["running"] is True
+            assert replacement_session["inflight_turn"]["user"] == "replacement prompt"
+        # The stale path neither overwrote the replacement marker nor reached
+        # its finally block to retire it under the detached object's identity.
+        assert emitted == []
+    finally:
+        release_stale.set()
+        for thread in threads:
+            thread.join(2)
+        with server._sessions_lock:
+            current_session = server._sessions.get(sid)
+            if current_session is stale_session or (
+                replacement_session is not None and current_session is replacement_session
+            ):
+                server._sessions.pop(sid, None)
+
+
+def test_abandoned_turn_cannot_clear_new_run_or_emit_late_completion(monkeypatch):
+    """Late output from a force-interrupted worker must not poison the new turn."""
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingAgent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            started.set()
+            assert release.wait(2), "test timed out waiting to release old run"
+            return {
+                "final_response": "late reply",
+                "messages": [{"role": "assistant", "content": "late reply"}],
+            }
+
+    real_thread = threading.Thread
+    threads: list[threading.Thread] = []
+
+    def _capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    server._sessions["sid"] = _session(
+        agent=_BlockingAgent(),
+        running=True,
+        run_generation=1,
+        inflight_turn={"text": "old"},
+    )
+    emits: list[tuple] = []
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _capture_thread)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+
+        server._run_prompt_submit("r1", "sid", server._sessions["sid"], "old")
+        assert started.wait(2), "old run did not start"
+
+        session = server._sessions["sid"]
+        with session["history_lock"]:
+            server._detach_running_agent_locked(session, "test interrupt")
+            server._begin_session_run_locked(session, "new")
+
+        release.set()
+        for thread in threads:
+            thread.join(2)
+
+        assert session["running"] is True
+        assert session["history"] == []
+        assert not [evt for evt in emits if evt[0] == "message.complete" and evt[2].get("text") == "late reply"]
     finally:
         server._sessions.pop("sid", None)
 

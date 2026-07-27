@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection
 
 from agent.interrupt_compat import request_hard_interrupt
+from tools.environments.local import _safe_getcwd
 
 
 def now_ns() -> int:
@@ -158,6 +159,8 @@ class ComputeHost:
         # it can leave those sessions unfinalized; a bare set cannot answer that.
         self._turn_futures: dict[concurrent.futures.Future, str] = {}
         self._turn_futures_lock = threading.Lock()
+        self._force_release_bypass: set[str] = set()
+        self._force_release_lock = threading.Lock()
         self._transport = _HostTransport(self.emit)
         self._heartbeat_secs = (
             float(heartbeat_secs)
@@ -272,6 +275,8 @@ class ComputeHost:
             self._handle_turn_start(frame)
         elif kind == "interrupt":
             self._handle_interrupt(frame)
+        elif kind == "force_release":
+            self._handle_force_release(frame)
         elif kind == "reload_mcp":
             self._handle_reload_mcp(frame)
         elif kind == "control":
@@ -324,6 +329,20 @@ class ComputeHost:
         if sid in self._sessions:
             self._handle_spike_turn_start(frame)
             return
+        with self._force_release_lock:
+            bypass_exhausted_pool = sid in self._force_release_bypass
+            self._force_release_bypass.discard(sid)
+        if bypass_exhausted_pool:
+            # A genuinely wedged turn still occupies its executor worker. Run
+            # the first replacement on a dedicated daemon so recovery also
+            # works when every bounded-pool worker is stuck.
+            threading.Thread(
+                target=self._run_real_turn,
+                args=(dict(frame),),
+                name=f"compute-host-recovery-{sid}",
+                daemon=True,
+            ).start()
+            return
         future = self._executor.submit(self._run_real_turn, dict(frame))
         self._track_turn_future(future, sid)
 
@@ -374,6 +393,64 @@ class ComputeHost:
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": True, "applied_ns": now_ns()})
         except Exception as exc:
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False, "message": str(exc)})
+
+    def _handle_force_release(self, frame: dict[str, Any]) -> None:
+        """Invalidate one wedged real session and synchronously rebuild its agent."""
+        sid = str(frame.get("sid") or "")
+        request_id = frame.get("request_id")
+        try:
+            from tui_gateway import server
+
+            session = server._sessions.get(sid)
+            if session is None:
+                self.emit(
+                    {
+                        "type": "force_release.ack",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "applied": False,
+                        "reason": "session_not_found",
+                    }
+                )
+                return
+            with session["history_lock"]:
+                old_agent = server._detach_running_agent_locked(
+                    session,
+                    "stale compute-host turn",
+                    clear_queued_prompt=bool(frame.get("clear_queued_prompt")),
+                )
+            if old_agent is not None:
+                server._quiesce_abandoned_agent(
+                    old_agent,
+                    "stale compute-host turn",
+                )
+            server._start_agent_build(sid, session)
+            ready = session.get("agent_ready")
+            if ready is None or not ready.wait(timeout=20.0):
+                raise TimeoutError("replacement agent build timed out")
+            if session.get("agent_error") or session.get("agent") is None:
+                raise RuntimeError(
+                    str(session.get("agent_error") or "replacement agent build failed")
+                )
+            with self._force_release_lock:
+                self._force_release_bypass.add(sid)
+            self.emit(
+                {
+                    "type": "force_release.ack",
+                    "sid": sid,
+                    "request_id": request_id,
+                    "applied": True,
+                }
+            )
+        except Exception as exc:
+            self.emit(
+                {
+                    "type": "control.error",
+                    "sid": sid,
+                    "request_id": request_id,
+                    "message": str(exc),
+                }
+            )
 
     def _run_spike_turn(self, session: HostSession, frame: dict[str, Any]) -> None:
         request_id = frame.get("request_id") or uuid.uuid4().hex
@@ -623,7 +700,7 @@ class ComputeHost:
                 "running": False,
                 "attached_images": [],
                 "image_counter": 0,
-                "cwd": str(frame.get("cwd") or os.getcwd()),
+                "cwd": str(frame.get("cwd") or _safe_getcwd()),
                 "cols": int(frame.get("cols") or 80),
                 "slash_worker": None,
                 "show_reasoning": server._load_show_reasoning(),
@@ -855,7 +932,7 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
             "host_pid": os.getpid(),
             "boot_id": host._boot_id,
             "build_sha": _build_sha(),
-            "cwd": os.getcwd(),
+            "cwd": _safe_getcwd(),
             "hermes_home": os.environ.get("HERMES_HOME", ""),
         }
     )

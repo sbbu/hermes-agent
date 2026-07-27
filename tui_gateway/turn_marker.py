@@ -26,8 +26,9 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -95,33 +96,55 @@ def _store(path: Path, entries: dict[str, dict]) -> None:
 
 
 def record_turn_start(
-    home: Path | str, session_key: str, prompt: str, *, attempts: int = 0
-) -> None:
+    home: Path | str,
+    session_key: str,
+    prompt: str,
+    *,
+    attempts: int = 0,
+    owner: str | None = None,
+    write_guard: Callable[[], bool] | None = None,
+) -> str | None:
     """Persist the marker for a turn that is about to run.
 
     ``attempts`` counts how many auto-continues led to this run: 0 for a
     user-initiated turn, N for the Nth automatic re-run — the crash-loop
-    breaker reads it back on the next resume.
+    breaker reads it back on the next resume. ``write_guard`` is checked under
+    the marker lock immediately before the durable replacement. Callers that
+    fence another ownership domain must keep that domain stable while the
+    guard and store run (the TUI holds the session history lock).
+
+    Returns the marker owner when the write is accepted, or ``None`` when the
+    ownership guard rejects a stale writer.
     """
+    owner = owner or uuid.uuid4().hex
     if not session_key or not prompt:
-        return
+        return owner
     now = time.time()
     entry = {
         "attempts": max(0, int(attempts)),
         "prompt": prompt[:_MAX_PROMPT_CHARS],
         "started_at": now,
+        "owner": owner,
     }
     try:
         with _lock:
             path = _marker_path(home)
             entries = _prune(_load(path), now)
+            if write_guard is not None and not write_guard():
+                return None
             entries[session_key] = entry
             _store(path, entries)
     except Exception:
         logger.debug("failed to record turn marker for %s", session_key, exc_info=True)
+    return owner
 
 
-def clear_turn_marker(home: Path | str, session_key: str) -> None:
+def clear_turn_marker(
+    home: Path | str,
+    session_key: str,
+    *,
+    owner: str | None = None,
+) -> None:
     """Remove the marker once its turn concluded (any outcome the client saw)."""
     if not session_key:
         return
@@ -130,6 +153,8 @@ def clear_turn_marker(home: Path | str, session_key: str) -> None:
             path = _marker_path(home)
             entries = _load(path)
             if session_key not in entries:
+                return
+            if owner is not None and entries[session_key].get("owner") != owner:
                 return
             del entries[session_key]
             _store(path, entries)
@@ -156,4 +181,9 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
         attempts = max(0, int(entry.get("attempts") or 0))
     except (TypeError, ValueError):
         return None
-    return {"attempts": attempts, "prompt": prompt, "started_at": started_at}
+    return {
+        "attempts": attempts,
+        "prompt": prompt,
+        "started_at": started_at,
+        "owner": str(entry.get("owner") or ""),
+    }

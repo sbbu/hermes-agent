@@ -93,6 +93,7 @@ def _(rid, params: dict) -> dict:
             "cwd": resolved_cwd,
             "inflight_turn": None,
             "last_active": now,
+            "run_generation": 0,
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
@@ -3361,17 +3362,70 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
+        supervisor = _get_compute_host_supervisor()
+        release_error = None
+        submit_lock = session.setdefault("compute_host_submit_lock", threading.Lock())
+        with submit_lock:
+            with session["history_lock"]:
+                was_running = bool(session.get("running"))
+                _bump_run_generation_locked(session)
+                session["running"] = False
+                session["_turn_cancel_requested"] = True
+                session["queued_prompt"] = None
+                session.pop("queued_prompts", None)
+                session["_queued_prompt_generation"] = int(
+                    session.get("_queued_prompt_generation", 0)
+                ) + 1
+                _clear_inflight_turn(session)
+            if was_running:
+                try:
+                    # The generation bump and control-frame write share one
+                    # linearization boundary with prompt.submit's guarded send.
+                    supervisor.force_release(
+                        sid,
+                        wait=False,
+                        clear_queued_prompt=True,
+                    )
+                except Exception as exc:
+                    release_error = exc
+        if release_error is not None:
+            return _err(rid, 5019, f"compute-host interrupt failed: {release_error}")
+        _clear_pending(sid)
         try:
-            _interrupt_session_turn(sid, session, request_id=f"interrupt-{rid}")
-        except Exception as exc:
-            return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
+            from tools.approval import resolve_gateway_approval
+
+            resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+        except Exception:
+            pass
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    _interrupt_session_turn(str(params.get("session_id") or ""), session)
+    sid = params.get("session_id", "")
+    with session["history_lock"]:
+        session.pop("queued_prompts", None)
+        session["_queued_prompt_generation"] = int(
+            session.get("_queued_prompt_generation", 0)
+        ) + 1
+        old_agent = _detach_running_agent_locked(session, "desktop session.interrupt")
+    _quiesce_abandoned_agent(old_agent, "desktop session.interrupt")
+    # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
+    # foreground subprocess). Background processes the agent started (dev servers,
+    # watchers) are intentionally left running — kill those individually with the
+    # "x" on the task row (process.kill). Don't reap them here.
+    # Scope the pending-prompt release to THIS session.  A global
+    # _clear_pending() would collaterally cancel clarify/sudo/secret
+    # prompts on unrelated sessions sharing the same tui_gateway
+    # process, silently resolving them to empty strings.
+    _clear_pending(sid)
+    try:
+        from tools.approval import resolve_gateway_approval
+
+        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+    except Exception:
+        pass
+    _start_agent_build(sid, session)
+    _emit("session.info", sid, _session_info(session.get("agent"), session))
     return _ok(rid, {"status": "interrupted"})
 
 
