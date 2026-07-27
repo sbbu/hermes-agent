@@ -18,6 +18,7 @@ time is positive proof the turn never finished. Contract pinned here:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import threading
 import time
 import types
@@ -70,6 +71,23 @@ def _session(agent=None, **extra):
     }
 
 
+@contextmanager
+def _registered_session(sid: str, session: dict):
+    """Install the exact authoritative object required by turn ownership."""
+    with server._sessions_lock:
+        previous = server._sessions.get(sid)
+        server._sessions[sid] = session
+    try:
+        yield
+    finally:
+        with server._sessions_lock:
+            if server._sessions.get(sid) is session:
+                if previous is None:
+                    server._sessions.pop(sid, None)
+                else:
+                    server._sessions[sid] = previous
+
+
 @pytest.fixture()
 def emits(monkeypatch):
     captured: list = []
@@ -117,6 +135,61 @@ def test_marker_roundtrip(tmp_path):
     assert read_turn_marker(tmp_path, "abc") is None
 
 
+def test_late_owner_cannot_clear_replacement_marker(tmp_path):
+    old_owner = record_turn_start(tmp_path, "abc", "old turn")
+    new_owner = record_turn_start(tmp_path, "abc", "replacement turn")
+
+    clear_turn_marker(tmp_path, "abc", owner=old_owner)
+
+    marker = read_turn_marker(tmp_path, "abc")
+    assert marker is not None
+    assert marker["prompt"] == "replacement turn"
+    assert marker["owner"] == new_owner
+
+    clear_turn_marker(tmp_path, "abc", owner=new_owner)
+    assert read_turn_marker(tmp_path, "abc") is None
+
+
+def test_stale_write_guard_cannot_replace_current_marker(tmp_path):
+    record_turn_start(tmp_path, "abc", "replacement turn", owner="replacement-owner")
+
+    assert (
+        record_turn_start(
+            tmp_path,
+            "abc",
+            "stale turn",
+            owner="stale-owner",
+            write_guard=lambda: False,
+        )
+        is None
+    )
+
+    marker = read_turn_marker(tmp_path, "abc")
+    assert marker is not None
+    assert marker["prompt"] == "replacement turn"
+    assert marker["owner"] == "replacement-owner"
+
+
+def test_marker_clear_is_noop_without_entry(tmp_path):
+    clear_turn_marker(tmp_path, "missing")
+    assert read_turn_marker(tmp_path, "missing") is None
+
+
+def test_marker_write_prunes_expired_entries(tmp_path):
+    import json
+
+    path = tmp_path / "desktop" / "interrupted_turns.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"old": {"attempts": 0, "prompt": "ancient prompt", "started_at": 1.0}})
+    )
+
+    record_turn_start(tmp_path, "new", "current prompt")
+
+    assert read_turn_marker(tmp_path, "old") is None
+    assert read_turn_marker(tmp_path, "new") is not None
+
+
 def test_marker_survives_corrupt_sidecar(tmp_path):
     path = tmp_path / "desktop" / "interrupted_turns.json"
     path.parent.mkdir(parents=True)
@@ -142,7 +215,8 @@ def test_concluded_turn_clears_marker(emits, turn_env, marker_home):
     )
     session = _session(agent=agent, running=True)
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     # Written before the turn ran (this is what survives a process death) …
     assert seen_mid_turn and seen_mid_turn[0] is not None
@@ -150,6 +224,34 @@ def test_concluded_turn_clears_marker(emits, turn_env, marker_home):
     assert seen_mid_turn[0]["attempts"] == 0
     # … and cleared once the turn concluded.
     assert read_turn_marker(marker_home, "session-key") is None
+
+
+@pytest.mark.parametrize(
+    "result", [{"final_response": "done"}, {"error": "provider said no"}]
+)
+def test_marker_is_gone_by_the_terminal_frame(monkeypatch, turn_env, marker_home, result):
+    """The client treats message.complete as "turn over" and may quit right
+    then; post-turn work (titles, memory, goal hooks) keeps the thread alive
+    for a second or more afterwards. If the marker outlived the frame, that
+    quit looked like a crash and re-ran a finished turn on the next launch."""
+    at_frame: list = []
+
+    def _emit(event, sid, payload=None):
+        if event == "message.complete":
+            at_frame.append(read_turn_marker(marker_home, "session-key"))
+
+    monkeypatch.setattr(server, "_emit", _emit)
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda message, **kwargs: result,
+        clear_interrupt=lambda: None,
+    )
+
+    session = _session(agent=agent, running=True)
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert at_frame == [None]
 
 
 def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
@@ -164,7 +266,8 @@ def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
     )
     session = _session(agent=agent, running=True)
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     assert read_turn_marker(marker_home, "session-key") is None
 
@@ -191,7 +294,8 @@ def test_continuation_turn_records_attempt_and_original_prompt(
         _auto_continue_prompt="the original prompt",
     )
 
-    server._run_prompt_submit("rid", "sid", session, server._auto_continue_note("the original prompt"))
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, server._auto_continue_note("the original prompt"))
 
     assert [(m["attempts"], m["prompt"]) for m in seen] == [(2, "the original prompt")]
     # Consumed, so the NEXT user turn starts from a clean slate.
@@ -374,3 +478,34 @@ def test_failed_agent_build_leaves_marker_for_retry(
 # ── End to end: continuation runs a real turn and clears the marker ────
 
 
+def test_continuation_runs_through_turn_pipeline(emits, turn_env, marker_home, monkeypatch):
+    record_turn_start(marker_home, "session-key", "finish the migration")
+    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda session, rid, timeout=30.0: None)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    prompts: list = []
+
+    def _run(message, **kwargs):
+        prompts.append(message)
+        return {"final_response": "continued and finished"}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent)
+
+    with _registered_session("sid", session):
+        result = server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert result == {
+        "attempt": 1,
+        "interrupted_at": pytest.approx(time.time(), abs=5),
+    }
+    assert len(prompts) == 1
+    assert "finish the migration" in prompts[0]
+    # The concluded continuation cleared both the marker and the turn state.
+    assert read_turn_marker(marker_home, "session-key") is None
+    assert session["running"] is False
+    completes = [p for e, _s, p in emits if e == "message.complete"]
+    assert completes and completes[0]["status"] == "complete"
