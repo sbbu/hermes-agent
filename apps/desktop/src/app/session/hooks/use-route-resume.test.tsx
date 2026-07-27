@@ -21,6 +21,8 @@ interface HarnessProps {
   freshDraftReady: boolean
   gatewayState: string
   locationPathname: string
+  replaceRoutedSessionId?: (sessionId: string) => void
+  resolveStoredSessionId?: (sessionId: string) => string
   resumeSession: (sessionId: string, focus: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
   resumeFailedSessionId?: null | string
   resumeExhaustedSessionId?: null | string
@@ -33,12 +35,21 @@ interface HarnessProps {
 }
 
 function RouteResumeHarness({
+  replaceRoutedSessionId = () => undefined,
+  resolveStoredSessionId = sessionId => sessionId,
   resumeFailedSessionId = null,
   resumeExhaustedSessionId = null,
   sessionResumeRequest = null,
   ...props
 }: HarnessProps) {
-  useRouteResume({ ...props, resumeExhaustedSessionId, resumeFailedSessionId, sessionResumeRequest })
+  useRouteResume({
+    ...props,
+    replaceRoutedSessionId,
+    resolveStoredSessionId,
+    resumeExhaustedSessionId,
+    resumeFailedSessionId,
+    sessionResumeRequest
+  })
 
   return null
 }
@@ -97,6 +108,47 @@ describe('useRouteResume', () => {
         startFreshSessionDraft={startFreshSessionDraft}
       />
     )
+
+    expect(resumeSession).not.toHaveBeenCalled()
+  })
+
+  it('canonicalizes a pre-compression history route before it can cold-resume', () => {
+    const replaceRoutedSessionId = vi.fn()
+    const resumeSession = vi.fn(async () => undefined)
+    const activeSessionIdRef: MutableRefObject<null | string> = { current: 'runtime-1' }
+    const creatingSessionRef = { current: false }
+    const runtimeIdByStoredSessionIdRef = { current: new Map([['stored-current', 'runtime-1']]) }
+    const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: 'stored-current' }
+
+    const common = {
+      activeSessionId: 'runtime-1',
+      activeSessionIdRef,
+      creatingSessionRef,
+      currentView: 'chat',
+      freshDraftReady: false,
+      gatewayState: 'open',
+      replaceRoutedSessionId,
+      resolveStoredSessionId: (sessionId: string) =>
+        sessionId === 'stored-before-compression' ? 'stored-current' : sessionId,
+      resumeSession,
+      runtimeIdByStoredSessionIdRef,
+      selectedStoredSessionId: 'stored-current',
+      selectedStoredSessionIdRef,
+      startFreshSessionDraft: vi.fn()
+    }
+
+    const { rerender } = render(
+      <RouteResumeHarness
+        {...common}
+        locationPathname="/stored-before-compression"
+        routedSessionId="stored-before-compression"
+      />
+    )
+
+    expect(replaceRoutedSessionId).toHaveBeenCalledWith('stored-current')
+    expect(resumeSession).not.toHaveBeenCalled()
+
+    rerender(<RouteResumeHarness {...common} locationPathname="/stored-current" routedSessionId="stored-current" />)
 
     expect(resumeSession).not.toHaveBeenCalled()
   })

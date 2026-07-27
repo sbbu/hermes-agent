@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
+import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -126,6 +127,11 @@ export function useSessionStateCache({
   }
 
   const sessionStateCache = sessionStateByRuntimeIdRef.current
+  // Route-only lineage for live compression rotations. This deliberately does
+  // not turn the profile-blind upstream session cache into a multi-profile
+  // cache: aliases are local to this hook and discarded whenever the active
+  // gateway profile changes.
+  const storedSessionIdAliasesRef = useRef(new Map<string, string>())
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
   const transcriptViewGateByRuntimeIdRef = useRef(new Map<string, symbol>())
@@ -137,6 +143,39 @@ export function useSessionStateCache({
   useEffect(() => {
     setMutableRef(busyRef, busy)
   }, [busy, busyRef])
+
+  useOnProfileSwitch(() => storedSessionIdAliasesRef.current.clear())
+
+  const resolveStoredSessionId = useCallback((storedSessionId: string): string => {
+    const aliases = storedSessionIdAliasesRef.current
+    const visited: string[] = []
+    const seen = new Set<string>()
+    let current = storedSessionId
+
+    while (true) {
+      if (seen.has(current)) {
+        // Corrupt/cyclic lineage must fail closed to the original route rather
+        // than redirecting it unpredictably.
+        return storedSessionId
+      }
+
+      seen.add(current)
+      const next = aliases.get(current)
+
+      if (!next || next === current) {
+        break
+      }
+
+      visited.push(current)
+      current = next
+    }
+
+    for (const alias of visited) {
+      aliases.set(alias, current)
+    }
+
+    return current
+  }, [])
 
   const ensureSessionState = useCallback(
     (sessionId: string, storedSessionId?: string | null) => {
@@ -163,12 +202,16 @@ export function useSessionStateCache({
 
             // A rotation event needs a real next id — a null/cleared stored id
             // is a detach, not a rotation the route-follow effect should chase.
-            if (storedSessionId && sessionId === $activeSessionId.get()) {
-              setActiveSessionStoredIdRotation({
-                nextStoredSessionId: storedSessionId,
-                previousStoredSessionId: existing.storedSessionId,
-                runtimeSessionId: sessionId
-              })
+            if (storedSessionId) {
+              storedSessionIdAliasesRef.current.set(existing.storedSessionId, storedSessionId)
+
+              if (sessionId === $activeSessionId.get()) {
+                setActiveSessionStoredIdRotation({
+                  nextStoredSessionId: storedSessionId,
+                  previousStoredSessionId: existing.storedSessionId,
+                  runtimeSessionId: sessionId
+                })
+              }
             }
           }
 
@@ -402,6 +445,7 @@ export function useSessionStateCache({
     getRuntimeIdForStoredSession,
     holdSessionTranscriptView,
     resetViewSync,
+    resolveStoredSessionId,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef: sessionStateByRuntimeIdRef as MutableRefObject<Map<string, ClientSessionState>>,

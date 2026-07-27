@@ -241,6 +241,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const getRoutedStoredSessionId = useCallback(() => routedSessionIdRef.current, [])
 
+  const replaceRoutedSessionId = useCallback(
+    (storedSessionId: string) => navigate(sessionRoute(storedSessionId), { replace: true }),
+    [navigate]
+  )
+
   const clearRoutedSessionIntent = useCallback(() => {
     routedSessionIdRef.current = null
   }, [])
@@ -278,6 +283,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     getRuntimeIdForStoredSession,
     holdSessionTranscriptView,
     resetViewSync,
+    resolveStoredSessionId,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
@@ -722,6 +728,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     freshDraftReady,
     gatewayState,
     locationPathname: location.pathname,
+    replaceRoutedSessionId,
+    resolveStoredSessionId,
     resumeSession,
     resumeFailedSessionId,
     resumeExhaustedSessionId,
