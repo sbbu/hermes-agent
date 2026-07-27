@@ -158,6 +158,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "workflow_parent_id" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
@@ -170,6 +171,109 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 
+def test_create_task_no_parents_is_ready(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="alice")
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.status == "ready"
+    assert t.assignee == "alice"
+    assert t.workspace_kind == "scratch"
+
+
+def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="parent")
+        c = kb.create_task(conn, title="child", parents=[p])
+        assert kb.get_task(conn, c).status == "todo"
+        kb.complete_task(conn, p, result="ok")
+        assert kb.get_task(conn, c).status == "ready"
+
+
+def test_create_task_unknown_parent_errors(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
+        kb.create_task(conn, title="orphan", parents=["t_ghost"])
+
+
+def test_workflow_parent_is_non_blocking_and_exposed(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="workflow root")
+        child = kb.create_task(
+            conn, title="workflow stage", workflow_parent_id=root,
+        )
+        task = kb.get_task(conn, child)
+
+    assert task.status == "ready"
+    assert task.workflow_parent_id == root
+
+
+def test_workflow_parent_inherits_notification_subscriptions(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="workflow root")
+        kb.add_notify_sub(
+            conn, task_id=root, platform="telegram", chat_id="workflow-chat",
+        )
+        child = kb.create_task(
+            conn, title="workflow stage", workflow_parent_id=root,
+        )
+
+        subscriptions = kb.list_notify_subs(conn, child)
+
+    assert len(subscriptions) == 1
+    assert subscriptions[0]["chat_id"] == "workflow-chat"
+
+
+def test_create_task_accepts_structured_step_key(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="workflow stage",
+            current_step_key="gate:1:0:design:preview",
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task.current_step_key == "gate:1:0:design:preview"
+
+
+def test_create_task_unknown_workflow_parent_errors(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="unknown workflow parent"):
+        kb.create_task(
+            conn, title="orphan stage", workflow_parent_id="t_ghost",
+        )
+
+
+def test_workspace_kind_validation(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="workspace_kind"):
+        kb.create_task(conn, title="bad ws", workspace_kind="cloud")
+
+
+def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
+    target = tmp_path / ".worktrees" / "t6-wire"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship worktree",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name=" wt/t6-wire ",
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        context = kb.build_worker_context(conn, tid)
+
+    assert task.branch_name == "wt/t6-wire"
+    assert events[0].payload["branch_name"] == "wt/t6-wire"
+    assert "Branch:   wt/t6-wire" in context
+
+
+def test_branch_name_requires_worktree_workspace(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
+        kb.create_task(
+            conn,
+            title="bad branch",
+            workspace_kind="scratch",
+            branch_name="wt/bad",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +304,134 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+def test_wait_and_resume_are_non_dispatchable_and_parent_gated(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        task_id = kb.create_task(conn, title="stage", parents=[parent])
+
+        assert kb.wait_task(conn, task_id, reason="external gate") is True
+        assert kb.get_task(conn, task_id).status == "waiting"
+        assert kb.claim_task(conn, task_id) is None
+
+        assert kb.resume_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id).status == "todo"
+
+        kb.complete_task(conn, parent)
+        assert kb.wait_task(conn, task_id, reason="second gate") is True
+        assert kb.resume_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_wait_done_persists_phase_metadata_and_can_complete_waiting(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="persistent builder", assignee="builder")
+        kb.claim_task(conn, task_id)
+        kb.complete_task(
+            conn,
+            task_id,
+            summary="implementation complete",
+            metadata={"outcome": "awaiting_gates", "cycle": 1},
+        )
+
+        assert kb.wait_task(
+            conn,
+            task_id,
+            reason="serial gates",
+            step_key="internal_review",
+            summary="parked for gates",
+            metadata={"outcome": "awaiting_gates", "cycle": 1, "next_gate": 0},
+        )
+        parked = kb.get_task(conn, task_id)
+        assert parked is not None
+        assert parked.status == "waiting"
+        assert parked.current_step_key == "internal_review"
+        latest = kb.list_runs(conn, task_id)[-1]
+        assert latest.outcome == "waiting"
+        assert latest.metadata["next_gate"] == 0
+
+        assert kb.wait_task(
+            conn,
+            task_id,
+            step_key="codex_review",
+            metadata={"outcome": "codex_wait", "head_sha": "abc"},
+        )
+        assert kb.get_task(conn, task_id).current_step_key == "codex_review"
+        assert kb.complete_task(
+            conn,
+            task_id,
+            step_key="human_review",
+            summary="handoff",
+            metadata={"outcome": "handoff", "head_sha": "abc"},
+        )
+        done = kb.get_task(conn, task_id)
+        assert done is not None
+        assert done.status == "done"
+        assert done.current_step_key == "human_review"
+
+
+def test_wait_done_regates_ready_dependents(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="workflow stage")
+        child = kb.create_task(conn, title="dependent", parents=[parent])
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, child).status == "ready"
+
+        assert kb.wait_task(conn, parent, reason="serial gates")
+
+        assert kb.get_task(conn, parent).status == "waiting"
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_reopening_done_refuses_after_a_dependent_started(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="workflow stage")
+        child = kb.create_task(conn, title="dependent", parents=[parent])
+        assert kb.complete_task(conn, parent)
+        assert kb.claim_task(conn, child) is not None
+
+        assert kb.wait_task(conn, parent, reason="too late") is False
+        assert kb.resume_task(conn, parent, reopen=True) is False
+        assert kb.get_task(conn, parent).status == "done"
+
+
+def test_resume_done_requires_explicit_reopen_and_preserves_runs(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="retry stage", assignee="builder")
+        kb.claim_task(conn, task_id)
+        kb.complete_task(conn, task_id, result="first result")
+        run_ids_before = [run.id for run in kb.list_runs(conn, task_id)]
+
+        assert kb.resume_task(conn, task_id) is False
+        assert kb.get_task(conn, task_id).status == "done"
+        assert kb.resume_task(
+            conn,
+            task_id,
+            reopen=True,
+            step_key="implementing",
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.current_step_key == "implementing"
+        assert task.completed_at is None
+        assert task.result is None
+        assert [run.id for run in kb.list_runs(conn, task_id)] == run_ids_before
+
+
+def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.schedule_task(conn, child, reason="wait until tomorrow") is True
+
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "todo"
+
+        kb.complete_task(conn, parent)
+        assert kb.schedule_task(conn, child, reason="second timer") is True
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "ready"
 
 
 

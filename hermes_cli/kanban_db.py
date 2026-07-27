@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "waiting", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -1141,6 +1141,8 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Workflow grouping only; unlike task_links this never gates dispatch.
+    workflow_parent_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1236,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            workflow_parent_id=(
+                row["workflow_parent_id"] if "workflow_parent_id" in keys else None
             ),
         )
 
@@ -1422,7 +1427,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Workflow grouping only; deliberately separate from blocking task_links.
+    workflow_parent_id   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2690,6 +2697,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "workflow_parent_id" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "workflow_parent_id", "workflow_parent_id TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3194,6 +3206,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    workflow_parent_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3358,6 +3372,12 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    if workflow_parent_id:
+        workflow_parent_id = str(workflow_parent_id).strip() or None
+    if workflow_parent_id and not get_task(conn, workflow_parent_id):
+        raise ValueError(f"unknown workflow parent task: {workflow_parent_id}")
+    if current_step_key is not None:
+        current_step_key = str(current_step_key).strip() or None
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3508,8 +3528,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, workflow_parent_id,
+                        current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3556,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_parent_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -3563,6 +3586,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "workflow_parent_id": workflow_parent_id,
+                        "current_step_key": current_step_key,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3609,7 +3634,16 @@ def _inherit_notify_subs(
     DM-originated child completion falls back to chat_type='group' and wakes
     a fresh group-scoped session instead of the originating DM (issue #73030).
     """
-    parent_ids = tuple(dict.fromkeys(p for p in parents if p))
+    workflow_row = conn.execute(
+        "SELECT workflow_parent_id FROM tasks WHERE id = ?",
+        (child_id,),
+    ).fetchone()
+    workflow_parent_id = workflow_row["workflow_parent_id"] if workflow_row else None
+    parent_ids = tuple(
+        parent_id
+        for parent_id in dict.fromkeys([*(p for p in parents if p), workflow_parent_id])
+        if parent_id
+    )
     if not parent_ids:
         return
     row = conn.execute(
@@ -5370,8 +5404,9 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    step_key: Optional[str] = None,
 ) -> bool:
-    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+    """Transition ``running|ready|blocked|review|waiting -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -5439,6 +5474,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    normalized_step = str(step_key).strip() if step_key else None
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5461,11 +5497,12 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       current_step_key = COALESCE(?, current_step_key)
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'review', 'waiting')
                 """,
-                (result, now, task_id),
+                (result, now, normalized_step, task_id),
             )
         else:
             cur = conn.execute(
@@ -5478,12 +5515,13 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       current_step_key = COALESCE(?, current_step_key)
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'review', 'waiting')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now, normalized_step, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -7195,6 +7233,122 @@ def invalidate_descendants_for_parent_reopen(
         for pid, claim_lock in terminations:
             _terminate_reclaimed_worker(pid, claim_lock)
     return {"invalidated": invalidated, "terminations": terminations}
+
+
+def _regate_dependents_for_reopen(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Demote dispatchable children, refusing to invalidate progressed work."""
+    progressed = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ? AND c.status IN ('running', 'done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if progressed is not None:
+        return False
+    conn.execute(
+        "UPDATE tasks SET status = 'todo' WHERE status = 'ready' AND id IN "
+        "(SELECT child_id FROM task_links WHERE parent_id = ?)",
+        (task_id,),
+    )
+    return True
+
+
+def wait_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    step_key: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Park non-running workflow work and persist its structured phase evidence."""
+    normalized_step = str(step_key).strip() if step_key else None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        old_status = row["status"]
+        if old_status not in {"todo", "ready", "blocked", "scheduled", "waiting", "done"}:
+            return False
+        if old_status == "done" and not _regate_dependents_for_reopen(conn, task_id):
+            return False
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'waiting', completed_at = NULL, result = NULL, "
+            "current_step_key = COALESCE(?, current_step_key), claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ? AND status = ?",
+            (normalized_step, task_id, old_status),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = None
+        if summary or metadata:
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="waiting",
+                summary=summary,
+                metadata=metadata,
+            )
+        _append_event(
+            conn,
+            task_id,
+            "waiting",
+            {"reason": reason, "step_key": normalized_step, "summary": summary},
+            run_id=run_id,
+        )
+        return True
+
+
+def resume_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reopen: bool = False,
+    reason: Optional[str] = None,
+    step_key: Optional[str] = None,
+) -> bool:
+    """Resume waiting work, or explicitly reopen done work preserving runs."""
+    normalized_step = str(step_key).strip() if step_key else None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        old_status = row["status"]
+        if old_status == "done":
+            if not reopen:
+                return False
+            if not _regate_dependents_for_reopen(conn, task_id):
+                return False
+        elif old_status != "waiting":
+            return False
+        undone_parent = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parent else "ready"
+        conn.execute(
+            "UPDATE tasks SET status = ?, completed_at = NULL, result = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "current_run_id = NULL, "
+            "current_step_key = COALESCE(?, current_step_key) WHERE id = ?",
+            (new_status, normalized_step, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "reopened" if old_status == "done" else "resumed",
+            {"status": new_status, "reason": reason, "step_key": normalized_step},
+        )
+        return True
 
 
 def specify_triage_task(
