@@ -172,8 +172,10 @@ class GatewayKanbanWatchersMixin:
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
-        # Subscriptions are removed only when the task reaches a truly final
-        # status (done / archived). We used to also unsub on any terminal
+        # Subscriptions are removed only when the task reaches the truly final
+        # archived status. ``done`` work can be explicitly reopened or parked
+        # for workflow gates, so deleting its subscription would silence the
+        # reopened task. We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
         # silently dropped the user out of the loop whenever the dispatcher
         # respawned the task: a worker that crashes, gets reclaimed, runs
@@ -633,7 +635,7 @@ class GatewayKanbanWatchersMixin:
                         #   advances after it succeeds — a failure rewinds the
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
-                        task_terminal = task and task.status in {"done", "archived"}
+                        task_terminal = task and task.status == "archived"
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
@@ -720,7 +722,8 @@ class GatewayKanbanWatchersMixin:
                             # if any, already succeeded above).
                             sub_fail_counts.pop(sub_key, None)
                         # Unsubscribe only when the task has reached a truly
-                        # final status (done / archived). For blocked /
+                        # final status (archived). Done work can be reopened or
+                        # parked for workflow gates. For blocked /
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
