@@ -1105,6 +1105,11 @@ class ResponseStore:
         except Exception:
             pass
 
+    def __del__(self) -> None:
+        """Best-effort backstop for callers that discard a store without closing it."""
+        self.close()
+
+
     def __len__(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
         return row[0] if row else 0
