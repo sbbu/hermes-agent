@@ -1448,6 +1448,12 @@ def _cwd_lock_timeout_seconds() -> float:
     )
 
 
+def get_running_job_ids() -> set:
+    """Return a snapshot of cron job IDs currently executing in this process."""
+    with _running_lock:
+        return set(_running_job_ids)
+
+
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool."""
     global _parallel_pool, _parallel_pool_max_workers

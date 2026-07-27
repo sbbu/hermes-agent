@@ -1378,6 +1378,31 @@ def _prepare_resume_pending_message(
     return recovery_message, persist_message
 
 
+def _history_has_unfinished_gateway_work(history: Any) -> bool:
+    """Return True only when a transcript tail contains resumable work.
+
+    ``resume_pending`` alone is not enough to synthesize an auto-resume turn:
+    a shutdown can mark a session while the model was merely between messages,
+    and blindly waking it produces the useless "I'm back / interrupted" filler
+    that users read as nonsense.  Auto-resume should only fire when there is a
+    concrete unfinished assistant→tool sequence to process.
+    """
+    if not isinstance(history, list):
+        return False
+    for msg in reversed(history):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role in {"session_meta", "system"}:
+            continue
+        if role in {"tool", "function"}:
+            return True
+        if role == "assistant" and msg.get("tool_calls"):
+            return True
+        return False
+    return False
+
+
 # Assistant-message fields that must survive transcript replay so multi-turn
 # reasoning context, prefix-cache hits, and provider-specific echo
 # requirements all behave the same on the gateway as they do in the CLI.
@@ -6541,10 +6566,12 @@ class TurnRunner:
                 getattr(_resume_entry, "last_resume_marked_at", None),
                 window_secs=_freshness_window,
             )
+        _has_unfinished_gateway_work = _history_has_unfinished_gateway_work(ctx.history)
         _is_resume_pending = bool(
             _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
             and (_interruption_is_fresh or _resume_mark_is_fresh)
+            and _has_unfinished_gateway_work
         )
         _has_fresh_tool_tail = bool(
             agent_history
@@ -9308,6 +9335,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:  # noqa: BLE001 - suspend is best-effort, never crash
             logger.debug("scale-to-zero: self-suspend failed", exc_info=True)
 
+    async def _wait_for_restart_safe_point(self) -> None:
+        """Defer a planned restart/shutdown until all gateway work finishes."""
+        self._draining = True
+        self._update_runtime_status("draining")
+        last_log_at = 0.0
+        first = True
+        while True:
+            active_work = self._active_work_count()
+            if active_work == 0:
+                if not first:
+                    logger.info(
+                        "Gateway shutdown/restart safe point reached; no active work remains"
+                    )
+                return
+
+            now = time.monotonic()
+            if first or now - last_log_at >= 30.0:
+                logger.info(
+                    "Gateway shutdown/restart waiting for safe point: "
+                    "active_sessions=%d, running_cron_jobs=%d, api_server_runs=%d",
+                    self._running_agent_count(),
+                    self._active_cron_job_count(),
+                    self._active_api_run_count(),
+                )
+                last_log_at = now
+                first = False
+            self._update_runtime_status("draining")
+            await asyncio.sleep(1.0)
+
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
 
@@ -9318,10 +9374,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, busy_input_mode: Optional[str] = None
     ) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
-        # to be lost during restart — queue them for the newly-spawned gateway
-        # process to pick up.  "interrupt" mode drops them (current behaviour).
+        # to be lost during restart — finish them before the old gateway reaches
+        # its safe point. "interrupt" mode keeps the historical discard policy.
         mode = busy_input_mode or self._busy_input_mode
         return self._restart_requested and mode in {"queue", "steer"}
+
+    def _should_discard_pending_during_drain(self) -> bool:
+        """Whether a pending follow-up must be dropped during shutdown drain."""
+        return self._draining and not self._queue_during_drain_enabled()
 
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
@@ -10536,7 +10596,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = (
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the "
+                    "next turn before restart completes."
+                )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -11153,10 +11216,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+            "I'll wait for the current task to finish before restarting. "
+            "New messages will be queued until the gateway comes back."
             if self._restart_requested
-            else "Your current task will be interrupted."
+            else "I'll wait for current work to finish before shutting down."
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
@@ -12099,6 +12162,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart helper: %s", e)
             await asyncio.sleep(0.05)
+            await self._wait_for_restart_safe_point()
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
         # _run_restart is a short-lived self-terminating task (calls stop()
@@ -12688,6 +12752,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
             if self._is_session_running(entry.session_key):
+                continue
+
+            try:
+                history = self.session_store.load_transcript(entry.session_id)
+            except Exception:
+                history = []
+            if not _history_has_unfinished_gateway_work(history):
+                logger.info(
+                    "Skipping auto-resume for %s: no unfinished tool work in transcript tail",
+                    entry.session_key,
+                )
                 continue
 
             source = entry.origin
@@ -18161,7 +18236,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if queue_during_drain:
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the "
+                    "next turn before restart completes."
                     if queue_during_drain
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
@@ -30631,7 +30707,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-            if self._draining and (pending_event or pending):
+            if self._should_discard_pending_during_drain() and (
+                pending_event or pending
+            ):
                 logger.info(
                     "Discarding pending follow-up for session %s during gateway %s",
                     session_key or "?",
@@ -31977,6 +32055,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _signal_initiated_shutdown = False
 
     # Set up signal handlers
+    async def _run_planned_shutdown_after_safe_point() -> None:
+        try:
+            await runner._wait_for_restart_safe_point()
+        finally:
+            await runner.stop()
+
     def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
         # Planned --replace takeover check: when a sibling gateway is
@@ -32070,7 +32154,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
             except Exception as _e:
                 logger.debug("spawn_async_diagnostic failed: %s", _e)
-        asyncio.create_task(runner.stop())
+        if planned_stop or planned_takeover:
+            asyncio.create_task(_run_planned_shutdown_after_safe_point())
+        else:
+            asyncio.create_task(runner.stop())
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)

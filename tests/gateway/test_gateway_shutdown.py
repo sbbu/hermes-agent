@@ -169,6 +169,139 @@ async def test_planned_service_exit_issues_no_restart_of_its_own(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_drains_running_agents_before_disconnect():
+    runner, adapter = make_restart_runner()
+    # Opt into a grace window (the default is 0 = interrupt immediately).
+    # This exercises the path where an agent finishes within the drain
+    # window and must NOT be interrupted.
+    runner._restart_drain_timeout = 5.0
+    disconnect_mock = AsyncMock()
+    adapter.disconnect = disconnect_mock
+
+    running_agent = MagicMock()
+    runner._running_agents = {"session": running_agent}
+
+    async def finish_agent():
+        await asyncio.sleep(0.05)
+        runner._running_agents.clear()
+
+    asyncio.create_task(finish_agent())
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    running_agent.interrupt.assert_not_called()
+    disconnect_mock.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_cancels_secondary_reconnects_before_session_drain():
+    runner, _adapter = make_restart_runner()
+    order: list[str] = []
+
+    async def _cancel_secondary_reconnects() -> None:
+        order.append("secondary_reconnect_cancel")
+
+    async def _notify_sessions() -> None:
+        order.append("notify_sessions")
+
+    runner._cancel_secondary_profile_reconnect_tasks = _cancel_secondary_reconnects
+    runner._notify_active_sessions_of_shutdown = _notify_sessions
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    assert order[:2] == ["secondary_reconnect_cancel", "notify_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_interrupts_after_drain_timeout():
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 0.05
+
+    disconnect_mock = AsyncMock()
+    adapter.disconnect = disconnect_mock
+
+    running_agent = MagicMock()
+    runner._running_agents = {"session": running_agent}
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    running_agent.interrupt.assert_called_once_with("Gateway shutting down")
+    disconnect_mock.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_systemd_service_restart_uses_tempfail(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    monkeypatch.setenv("INVOCATION_ID", "systemd-test")
+    runner._launch_systemd_restart_shortcut = MagicMock()
+
+    with patch("gateway.run.sys.platform", "linux"), patch(
+        "gateway.status.remove_pid_file"
+    ), patch("gateway.status.write_runtime_status"):
+        await runner.stop(restart=True, service_restart=True)
+
+    runner._launch_systemd_restart_shortcut.assert_called_once_with()
+    # Exit 75 (EX_TEMPFAIL) so RestartForceExitStatus=75 in the unit
+    # file revives the gateway via Restart=on-failure, even when the
+    # planned-restart helper fails (Polkit denial, missing user bus,
+    # headless box, or operator-managed unit using on-failure instead
+    # of always).  StartLimitBurst still bounds accidental loops.
+    assert runner._exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+    assert (tmp_path / ".restart_pending.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_launchd_service_restart_keeps_nonzero_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+
+    with patch("gateway.run.sys.platform", "darwin"), patch(
+        "gateway.status.remove_pid_file"
+    ), patch("gateway.status.write_runtime_status"):
+        await runner.stop(restart=True, service_restart=True)
+
+    assert runner._exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+
+
+@pytest.mark.asyncio
+async def test_restart_shutdown_warning_uses_restart_command_reply_anchor_for_active_session():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: MagicMock()}
+    runner._cache_session_source(session_key, source)
+    restart_source = make_restart_source(thread_id="42")
+    restart_source.message_id = "restart-command"
+    runner._restart_requested = True
+    runner._restart_command_source = restart_source
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id=source.chat_id,
+        name="Telegram",
+        thread_id=source.thread_id,
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    chat_id, message, metadata = adapter.sent_calls[0]
+    assert chat_id == source.chat_id
+    assert "Gateway restarting" in message
+    assert metadata["thread_id"] == source.thread_id
+    assert metadata["telegram_dm_topic_reply_fallback"] is True
+    assert metadata["direct_messages_topic_id"] == source.thread_id
+    assert metadata["telegram_reply_to_message_id"] == "restart-command"
+
+
+@pytest.mark.asyncio
 async def test_in_chat_restart_skips_home_shutdown_even_with_active_session():
     runner, adapter = make_restart_runner()
     source = make_restart_source(thread_id="42")
