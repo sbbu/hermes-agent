@@ -21430,6 +21430,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     def _run_turn(prompt: str) -> str:
+        status = _task_status()
+        if status not in ("running", "ready"):
+            raise RuntimeError(
+                f"kanban run ownership lost before continuation: status={status}"
+            )
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,

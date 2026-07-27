@@ -747,6 +747,424 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+def test_respawn_guard_blocker_auth_on_authentication_error(kanban_home):
+    """Full word 'Authentication' triggers blocker_auth (regex covers auth\\w*)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="authn-task", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("Authentication failed: invalid credentials", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
+    """Full word 'authorization' triggers blocker_auth (regex covers auth\\w*)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="authz-task", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("authorization denied for scope repo", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_recent_success(kanban_home):
+    """A completed run within the guard window triggers recent_success."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already-done", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "recent_success"
+
+
+def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
+    """An explicit re-queue after a recent success (operator done->ready,
+    promote, unblock, reclaim) is a deliberate re-run and must bypass the
+    recent_success guard — otherwise a manual done->ready just sits there
+    until the window elapses."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rerun-me", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        # Baseline: a recent completion defers the respawn.
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
+        # Operator drags done -> ready: a 'status' event after completion.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'status', ?)",
+            (t, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_recent_success_bypassed_by_workflow_reopen(kanban_home):
+    """The workflow controller's done -> ready reopen is a deliberate new run."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="repair-pr-feedback", assignee="alice")
+        assert kb.complete_task(conn, t, result="first handoff")
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
+
+        resume_task = getattr(kb, "resume_task")
+        assert resume_task(
+            conn,
+            t,
+            reopen=True,
+            reason="new post-handoff feedback",
+            step_key="implementing",
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_stale_success_not_guarded(kanban_home):
+    """A completed run outside the guard window does not block re-spawn."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="old-done", assignee="alice")
+        old_end = int(time.time()) - kb._RESPAWN_GUARD_SUCCESS_WINDOW - 60
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, old_end - 300, old_end),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_in_comment(kanban_home):
+    """A GitHub PR URL in a recent comment triggers active_pr."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
+    """A GitHub PR URL in a comment older than the PR window does not block."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="old-pr", assignee="alice")
+        old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
+            (t, old_ts),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_bypassed_by_later_promotion(kanban_home):
+    """A dependency promotion after the PR comment is an intentional rerun.
+
+    Exact-head gate cards commonly comment with the PR URL, wait on a repair
+    child, then return to ready when that child completes.  The PR guard must
+    not strand that promoted card for 24 hours.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="recheck-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Waiting on repair for https://github.com/acme/repo/pull/42",
+        )
+        comment_at = conn.execute(
+            "SELECT MAX(created_at) FROM task_comments WHERE task_id = ?",
+            (t,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (t, comment_at),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_dispatch_spawns_active_pr_task_after_later_promotion(
+    kanban_home, all_assignees_spawnable
+):
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="recheck-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR: https://github.com/acme/repo/pull/42",
+        )
+        comment_at = conn.execute(
+            "SELECT MAX(created_at) FROM task_comments WHERE task_id = ?",
+            (t,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (t, comment_at),
+        )
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert (t, "active_pr") not in result.respawn_guarded
+
+
+def test_respawn_guard_active_pr_still_applies_when_promotion_is_older(kanban_home):
+    """Only a requeue after the PR evidence may override the guard."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already-promoted", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (t, now - 2),
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR: https://github.com/acme/repo/pull/42",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+            (now - 1, t),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_uses_event_order_within_same_second(kanban_home, monkeypatch):
+    """A same-second requeue before the PR comment must not defeat the guard."""
+    fixed_now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: fixed_now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ordered-events", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted_manual', ?)",
+            (t, fixed_now),
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR: https://github.com/acme/repo/pull/42",
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_honors_same_second_manual_promotion(kanban_home, monkeypatch):
+    """promote_task's promoted_manual event deliberately resumes the card."""
+    fixed_now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: fixed_now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="manual-resume", assignee="alice")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="temporary")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR: https://github.com/acme/repo/pull/42",
+        )
+        promoted, error = kb.promote_task(conn, t, actor="operator")
+
+        assert promoted is True
+        assert error is None
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_recent_success_uses_event_order_within_same_second(kanban_home, monkeypatch):
+    """A pre-completion requeue cannot masquerade as a later rerun request."""
+    fixed_now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: fixed_now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="completed-order", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'status', ?)",
+            (t, fixed_now),
+        )
+        assert kb.complete_task(conn, t, result="done")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t,))
+
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
+
+
+def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once defers (does NOT auto-block) a ready task whose last
+    error is a blocker_auth.
+
+    The old behaviour auto-blocked on first occurrence, which was too
+    aggressive: a transient 429 rate-limit (which typically clears in
+    seconds to minutes) would end up requiring manual unblock. The new
+    behaviour defers the spawn this tick; the task stays in ``ready``
+    and gets another chance next tick. If the auth error genuinely
+    persists, the existing ``consecutive_failures`` circuit breaker
+    will auto-block via the normal failure-limit path.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="quota-storm", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("rate limit exceeded: 429 Too Many Requests", t),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    # Critical: task is NOT auto-blocked on first occurrence.
+    assert t not in res.auto_blocked, (
+        f"blocker_auth should defer, not auto-block on first occurrence; "
+        f"got auto_blocked={res.auto_blocked!r}"
+    )
+    # It IS recorded as respawn_guarded with the reason.
+    assert (t, "blocker_auth") in res.respawn_guarded, (
+        f"expected (task_id, 'blocker_auth') in respawn_guarded; "
+        f"got {res.respawn_guarded!r}"
+    )
+    # And it's NOT spawned this tick.
+    assert t not in spawned_ids
+    # Status stays ``ready`` so a future tick (or operator action) can
+    # retry without manual unblock.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_skips_recent_success(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once skips (but does not block) a task with a recent completed run."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="recent-winner", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "recent_success") in res.respawn_guarded
+    assert t not in spawned_ids
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
+
+
+def test_dispatch_respawn_guard_skips_active_pr(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_dry_run_no_auto_block(
+    kanban_home, all_assignees_spawnable
+):
+    """In dry_run mode, blocker_auth tasks are recorded in respawn_guarded (not auto-blocked)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="dry-quota", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("quota exceeded", t),
+        )
+        res = kb.dispatch_once(conn, dry_run=True)
+
+    assert (t, "blocker_auth") in res.respawn_guarded
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"  # dry_run: no writes
+
+
+def test_dispatch_respawn_guard_allows_clean_task(
+    kanban_home, all_assignees_spawnable
+):
+    """A task with no guard triggers is spawned normally."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="clean-task", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
+    assert t not in res.auto_blocked
+
+
+def test_dispatch_respawn_guard_emits_event_for_skipped_task(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once emits a respawn_guarded task_event so operators can diagnose stuck-ready tasks."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="event-check", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = kb.list_events(conn, t)
+
+    kinds = [e.kind for e in events]
+    assert "respawn_guarded" in kinds
+    guarded_evt = next(e for e in events if e.kind == "respawn_guarded")
+    # Event.payload is already parsed as a dict by list_events.
+    assert isinstance(guarded_evt.payload, dict)
+    assert guarded_evt.payload.get("reason") == "recent_success"
+
 
 # ---------------------------------------------------------------------------
 # Workspace resolution

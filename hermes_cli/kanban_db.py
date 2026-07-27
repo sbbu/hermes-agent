@@ -4044,7 +4044,12 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": author, "len": len(body), "comment_id": int(cur.lastrowid or 0)},
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -8177,6 +8182,24 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Events that intentionally return a task to ``ready``.  A guard derived from
+# evidence older than one of these events must not veto the new run: the
+# operator, dependency engine, or failure recovery path has explicitly asked
+# the dispatcher to continue the same card.
+_RESPAWN_REQUEUE_EVENT_KINDS = (
+    "status",
+    "promoted",
+    "promoted_manual",
+    "unblocked",
+    "resumed",
+    "reopened",
+    "reclaimed",
+    "crashed",
+    "timed_out",
+    "stale",
+    "rate_limited",
+)
+
 
 @dataclass
 class DispatchResult:
@@ -9551,6 +9574,58 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _was_requeued_after_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    event_id: int,
+) -> bool:
+    placeholders = ", ".join("?" for _ in _RESPAWN_REQUEUE_EVENT_KINDS)
+    row = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND id > ? "
+        f"AND kind IN ({placeholders}) LIMIT 1",
+        (task_id, event_id, *_RESPAWN_REQUEUE_EVENT_KINDS),
+    ).fetchone()
+    return row is not None
+
+
+def _was_requeued_after_time(
+    conn: sqlite3.Connection,
+    task_id: str,
+    boundary: int,
+) -> bool:
+    """Legacy fallback when old evidence has no linked event."""
+    placeholders = ", ".join("?" for _ in _RESPAWN_REQUEUE_EVENT_KINDS)
+    row = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND created_at > ? "
+        f"AND kind IN ({placeholders}) LIMIT 1",
+        (task_id, boundary, *_RESPAWN_REQUEUE_EVENT_KINDS),
+    ).fetchone()
+    return row is not None
+
+
+def _comment_event_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    comment_id: int,
+) -> Optional[int]:
+    """Return the monotonic event id linked to a newly-created comment."""
+    rows = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'commented' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("comment_id") == comment_id:
+            return int(row["id"])
+    return None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9603,6 +9678,8 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed when a later re-queue event deliberately asks the same card
+        to continue (for example, after its repair dependency completes).
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9673,30 +9750,47 @@ def check_respawn_guard(
     #    silently held by the guard, until the window elapses.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
-        "SELECT ended_at FROM task_runs "
+        "SELECT id, ended_at FROM task_runs "
         "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id, cutoff),
     ).fetchone()
     if recent_completed:
         completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, completed_at),
+        completed_event = conn.execute(
+            "SELECT id FROM task_events "
+            "WHERE task_id = ? AND kind = 'completed' AND run_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(recent_completed["id"])),
         ).fetchone()
+        requeued_after = (
+            _was_requeued_after_event(conn, task_id, int(completed_event["id"]))
+            if completed_event
+            else _was_requeued_after_time(conn, task_id, completed_at)
+        )
         if not requeued_after:
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    A later promotion/requeue is authoritative: the same task is being
+    #    resumed to re-check or repair that PR, not being duplicated.  Without
+    #    this comparison a dependency-gated card can sit ready for the full
+    #    24-hour PR window while the dispatcher emits active_pr forever.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            comment_event_id = _comment_event_id(conn, task_id, int(c["id"]))
+            requeued_after = (
+                _was_requeued_after_event(conn, task_id, comment_event_id)
+                if comment_event_id is not None
+                else _was_requeued_after_time(conn, task_id, int(c["created_at"]))
+            )
+            if requeued_after:
+                return None
             return "active_pr"
 
     return None
