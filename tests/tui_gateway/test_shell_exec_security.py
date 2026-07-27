@@ -70,3 +70,42 @@ def test_shell_exec_redacts_secrets_printed_by_command(server, monkeypatch):
     assert secret not in response["result"]["stdout"]
     assert secret not in response["result"]["stderr"]
     assert response["result"]["stdout"] != completed.stdout
+
+
+def test_shell_exec_recovers_when_process_cwd_was_deleted(server, monkeypatch, tmp_path):
+    completed = SimpleNamespace(stdout="ok\n", stderr="", returncode=0)
+    deleted_cwd_path = tmp_path / "deleted" / "workspace"
+
+    def deleted_cwd():
+        raise FileNotFoundError("process cwd was deleted")
+
+    monkeypatch.setattr(server.os, "getcwd", deleted_cwd)
+    monkeypatch.setenv("TERMINAL_CWD", str(deleted_cwd_path))
+    with (
+        _safe_command_checks(),
+        patch.object(server.subprocess, "run", return_value=completed) as run,
+    ):
+        response = server._methods["shell.exec"]("request-3", {"command": "printf ok"})
+
+    assert response["result"]["stdout"] == "ok\n"
+    assert run.call_args.kwargs["cwd"] == str(tmp_path)
+
+
+def test_default_session_cwd_recovers_deleted_local_terminal_cwd(server, monkeypatch, tmp_path):
+    deleted_cwd_path = tmp_path / "deleted" / "workspace"
+
+    def deleted_cwd():
+        raise FileNotFoundError("process cwd was deleted")
+
+    monkeypatch.setattr(server.os, "getcwd", deleted_cwd)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(deleted_cwd_path))
+    with patch.object(server, "_launch_configured_cwd", return_value=None):
+        assert server._default_session_cwd() == str(tmp_path)
+
+
+def test_default_session_cwd_preserves_remote_terminal_cwd(server, monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_CWD", "/remote-only/workspace")
+    with patch.object(server, "_launch_configured_cwd", return_value=None):
+        assert server._default_session_cwd() == "/remote-only/workspace"

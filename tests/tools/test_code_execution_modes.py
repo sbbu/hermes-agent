@@ -158,6 +158,90 @@ class TestResolveChildCwd(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), os.getcwd())
 
+    def test_project_uses_terminal_cwd_when_set(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"TERMINAL_CWD": td}):
+                self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), td)
+
+    def test_project_bogus_terminal_cwd_falls_back_to_getcwd(self):
+        with patch.dict(os.environ, {"TERMINAL_CWD": "/does/not/exist/anywhere"}):
+            self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), os.getcwd())
+
+    def test_project_relative_terminal_cwd_falls_back_to_getcwd(self):
+        with patch.dict(os.environ, {"TERMINAL_CWD": "auto"}):
+            self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), os.getcwd())
+
+    def test_project_recovers_when_process_and_terminal_cwd_were_deleted(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as parent:
+            deleted = os.path.join(parent, "deleted", "workspace")
+            with (
+                patch.dict(os.environ, {"TERMINAL_CWD": deleted}),
+                patch("tools.code_execution_tool.os.getcwd", side_effect=FileNotFoundError),
+            ):
+                self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), parent)
+
+    def test_project_recovers_deleted_terminal_cwd_before_process_cwd(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as parent:
+            deleted = os.path.join(parent, "deleted", "workspace")
+            with patch.dict(os.environ, {"TERMINAL_CWD": deleted}):
+                self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), parent)
+
+    def test_project_expands_tilde(self):
+        import pathlib
+        home = str(pathlib.Path.home())
+        with patch.dict(os.environ, {"TERMINAL_CWD": "~"}):
+            self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), home)
+
+    def test_project_prefers_registered_task_cwd_override(self):
+        import tempfile
+        import tools.terminal_tool as terminal_tool
+
+        with tempfile.TemporaryDirectory() as td:
+            task_id = "session-cwd-test"
+            with patch.dict(os.environ, {"TERMINAL_CWD": "/does/not/exist"}):
+                with patch.object(terminal_tool, "_task_env_overrides", {}, create=False):
+                    terminal_tool.register_task_env_overrides(task_id, {"cwd": td})
+                    self.assertEqual(_resolve_child_cwd("project", "/tmp/staging", task_id=task_id), td)
+
+    def test_project_prefers_session_cwd_record_over_override(self):
+        """The session's cwd RECORD (its live `cd` state) outranks the
+        registration-time workspace override — same ladder as file tools
+        and the terminal, so a `cd` before execute_code is honored."""
+        import tempfile
+        import tools.terminal_tool as terminal_tool
+
+        with tempfile.TemporaryDirectory() as reg, tempfile.TemporaryDirectory() as cded:
+            task_id = "session-record-test"
+            with patch.dict(os.environ, {"TERMINAL_CWD": "/does/not/exist"}):
+                with patch.object(terminal_tool, "_task_env_overrides", {}, create=False), \
+                     patch.object(terminal_tool, "_session_cwd", {}, create=False):
+                    terminal_tool.register_task_env_overrides(task_id, {"cwd": reg})
+                    # Simulate a later `cd`: post-command tracking rewrites the record.
+                    terminal_tool.record_session_cwd(task_id, cded)
+                    self.assertEqual(
+                        _resolve_child_cwd("project", "/tmp/staging", task_id=task_id), cded
+                    )
+
+    def test_project_uses_session_cwd_record_without_any_override(self):
+        """A session that only `cd`'d (no session.cwd.set registration) still
+        resolves to its recorded directory."""
+        import tempfile
+        import tools.terminal_tool as terminal_tool
+
+        with tempfile.TemporaryDirectory() as cded:
+            task_id = "record-only-test"
+            with patch.dict(os.environ, {"TERMINAL_CWD": "/does/not/exist"}):
+                with patch.object(terminal_tool, "_task_env_overrides", {}, create=False), \
+                     patch.object(terminal_tool, "_session_cwd", {}, create=False):
+                    terminal_tool.record_session_cwd(task_id, cded)
+                    self.assertEqual(
+                        _resolve_child_cwd("project", "/tmp/staging", task_id=task_id), cded
+                    )
 
     def test_project_stale_record_falls_through_to_override(self):
         """A recorded directory that no longer exists is skipped; the

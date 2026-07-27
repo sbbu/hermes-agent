@@ -33,7 +33,7 @@ from hermes_constants import (
 )
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
-from tools.environments.local import hermes_subprocess_env
+from tools.environments.local import _safe_getcwd, hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display
 from agent.skill_commands import describe_skill_invocation
@@ -509,7 +509,7 @@ class _SlashWorker:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            cwd=os.getcwd(),
+            cwd=_safe_getcwd(),
             env=env,
             creationflags=windows_hide_flags(),
             start_new_session=True,
@@ -2472,7 +2472,13 @@ def _default_session_cwd() -> str:
     than ``os.getcwd()`` when the in-memory gateway's process env has no bridged
     ``TERMINAL_CWD``.
     """
-    return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
+    configured = _launch_configured_cwd()
+    if configured:
+        return configured
+    env_cwd = os.getenv("TERMINAL_CWD")
+    if not _is_local_terminal_backend() and env_cwd:
+        return env_cwd
+    return _safe_getcwd(env_cwd)
 
 
 def write_json(obj: dict) -> bool:
@@ -3468,7 +3474,7 @@ def _completion_cwd(params: dict | None = None) -> str:
         # configured terminal.cwd wins over a stale process env / launch dir.
         or _launch_configured_cwd()
         or os.environ.get("TERMINAL_CWD")
-        or os.getcwd()
+        or _safe_getcwd()
     )
     try:
         resolved = os.path.abspath(os.path.expanduser(str(raw)))
@@ -3476,7 +3482,7 @@ def _completion_cwd(params: dict | None = None) -> str:
             return resolved
     except Exception:
         pass
-    return os.getcwd()
+    return _safe_getcwd()
 
 
 def _terminal_task_cwd(session: dict | None) -> str:

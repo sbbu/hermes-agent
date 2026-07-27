@@ -428,7 +428,7 @@ def _(rid, params: dict) -> dict:
             encoding="utf-8",
             errors="replace",
             timeout=min(int(params.get("timeout", 240)), 600),
-            cwd=os.getcwd(),
+            cwd=_safe_getcwd(),
             # cli.exec runs `python -m hermes_cli.main` (can drive the agent) →
             # needs provider credentials. Tier-1 secrets still stripped (#29157).
             env=hermes_subprocess_env(inherit_credentials=True),
@@ -1523,7 +1523,7 @@ def _(rid, params: dict) -> dict:
             {
                 "title": "Environment",
                 "rows": [
-                    ["Working Dir", os.getcwd()],
+                    ["Working Dir", _safe_getcwd()],
                     ["Config File", str(_hermes_home / "config.yaml")],
                 ],
             },
@@ -2655,7 +2655,7 @@ def _(rid, params: dict) -> dict:
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=os.getcwd(),
+            cwd=_safe_getcwd(),
             # Force UTF-8 + lossy decode so non-UTF-8 child output can't crash
             # the gateway thread on locale-mismatched Windows (#53137).
             encoding="utf-8",
