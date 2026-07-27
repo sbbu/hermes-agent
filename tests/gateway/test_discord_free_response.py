@@ -205,6 +205,154 @@ async def test_discord_free_response_in_server_channels(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discord_free_response_in_server_channels_includes_recent_channel_context(adapter, monkeypatch):
+    """Free-response server channels still need human-style recent context.
+
+    Regression: history backfill only ran for mention-gated channels and
+    threads, so a normal #general message with DISCORD_REQUIRE_MENTION=false
+    reached the model blind to the immediately preceding channel discussion.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    # Keep this focused on channel-context backfill; upstream now skips agent
+    # invocation when auto-thread creation fails, and the fake channel has no
+    # real thread/send implementation.
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    channel = FakeHistoryChannel(
+        [make_history_message(author=human, content="we were talking about invoices", msg_id=122)],
+        channel_id=123,
+    )
+
+    message = make_message(channel=channel, content="can you handle that?")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "can you handle that?"
+    assert event.channel_context == (
+        "[Recent channel messages]\n[Alice] we were talking about invoices"
+    )
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_in_threads(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="Ghost reader skill")
+    message = make_message(channel=thread, content="hello from thread")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello from thread"
+    assert event.source.chat_id == "456"
+    assert event.source.thread_id == "456"
+    assert event.source.chat_type == "thread"
+
+
+@pytest.mark.asyncio
+async def test_discord_forum_threads_are_handled_as_threads(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    forum = FakeForumChannel(channel_id=222, name="support-forum")
+    thread = FakeThread(channel_id=456, name="Can Hermes reply here?", parent=forum)
+    message = make_message(channel=thread, content="hello from forum post")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello from forum post"
+    assert event.source.chat_id == "456"
+    assert event.source.thread_id == "456"
+    assert event.source.chat_type == "thread"
+    assert event.source.chat_name == "Hermes Server / support-forum / Can Hermes reply here?"
+
+
+@pytest.mark.asyncio
+async def test_discord_can_still_require_mentions_when_enabled(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(channel=FakeTextChannel(channel_id=789), content="ignored without mention")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_channel_overrides_mention_requirement(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789,999")
+
+    message = make_message(channel=FakeTextChannel(channel_id=789), content="allowed without mention")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "allowed without mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_channel_can_come_from_config_extra(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["free_response_channels"] = ["789", "999"]
+
+    message = make_message(channel=FakeTextChannel(channel_id=789), content="allowed from config")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "allowed from config"
+
+
+def test_discord_free_response_channels_bare_int(adapter, monkeypatch):
+    # YAML `discord.free_response_channels: 1491973769726791812` (single bare
+    # integer) is loaded as an int and previously fell through the
+    # isinstance(str) branch in _discord_free_response_channels, silently
+    # returning an empty set.  Scalar → str coercion makes single-channel
+    # config work without having to quote the ID in YAML.
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["free_response_channels"] = 1491973769726791812
+
+    assert adapter._discord_free_response_channels() == {"1491973769726791812"}
+
+
+def test_discord_free_response_channels_int_list(adapter, monkeypatch):
+    # YAML list form with bare numeric entries — each element should be coerced.
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["free_response_channels"] = [1491973769726791812, 99999]
+
+    assert adapter._discord_free_response_channels() == {"1491973769726791812", "99999"}
+
+
+@pytest.mark.asyncio
+async def test_discord_forum_parent_in_free_response_list_allows_forum_thread(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "222")
+
+    forum = FakeForumChannel(channel_id=222, name="support-forum")
+    thread = FakeThread(channel_id=333, name="Forum topic", parent=forum)
+    message = make_message(channel=thread, content="allowed from forum thread")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "allowed from forum thread"
+    assert event.source.chat_id == "333"
+
+
+@pytest.mark.asyncio
 async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
@@ -826,4 +974,30 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
         "[Context around the replied-to message]\n[Hermes [bot]] earlier answer"
     )
 
+
+@pytest.mark.asyncio
+async def test_discord_non_reply_free_channel_fetches_plain_backfill(adapter, monkeypatch):
+    """A plain (non-reply) message in a free-response channel gets recent context.
+
+    Free-response Discord channels are no-mention by definition, so ordinary
+    messages still need channel_context. The reply-specific path must not
+    accidentally pass a reply anchor for plain messages.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["history_backfill"] = True
+    adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] noise")
+
+    message = make_message(channel=FakeTextChannel(channel_id=321), content="just chatting")
+    assert message.reference is None  # not a reply
+
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_awaited_once()
+    call = adapter._fetch_channel_context.await_args
+    assert call is not None
+    assert call.kwargs.get("reply_target") is None
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context == "[Recent channel messages]\n[Alice] noise"
 
