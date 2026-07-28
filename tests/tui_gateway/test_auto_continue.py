@@ -290,6 +290,7 @@ def test_continuation_turn_records_attempt_and_original_prompt(
     session = _session(
         agent=agent,
         running=True,
+        _auto_continue_generation=0,
         _auto_continue_attempt=2,
         _auto_continue_prompt="the original prompt",
     )
@@ -299,6 +300,7 @@ def test_continuation_turn_records_attempt_and_original_prompt(
 
     assert [(m["attempts"], m["prompt"]) for m in seen] == [(2, "the original prompt")]
     # Consumed, so the NEXT user turn starts from a clean slate.
+    assert "_auto_continue_generation" not in session
     assert "_auto_continue_attempt" not in session
     assert "_auto_continue_prompt" not in session
 
@@ -440,6 +442,45 @@ def test_running_session_wins_over_continuation(emits, schedule_env, marker_home
     assert session["_auto_continue_scheduled"] is False
     assert read_turn_marker(marker_home, "session-key") is not None
     # Nothing left behind for the racing user turn to inherit.
+    assert "_auto_continue_attempt" not in session
+    assert "_auto_continue_prompt" not in session
+
+
+def test_stale_auto_continue_dispatch_cannot_taint_next_user_turn(
+    emits, schedule_env, marker_home, monkeypatch
+):
+    """A cancelled continuation must not lend its crash-loop metadata to the
+    real user turn that invalidated it before dispatch."""
+    record_turn_start(marker_home, "session-key", "interrupted prompt")
+    session = _session()
+    recorded: list = []
+
+    def stale_submit(rid, sid, current, text, **kwargs):
+        with current["history_lock"]:
+            current_generation = server._bump_run_generation_locked(current)
+        recorded.append(
+            server._record_turn_marker_for_run(
+                sid,
+                current,
+                current_generation,
+                "new user prompt",
+                "new-user-owner",
+            )
+        )
+        return False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", stale_submit)
+
+    with _registered_session("sid", session):
+        result = server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert result is not None
+    assert recorded == [(marker_home, "session-key")]
+    marker = read_turn_marker(marker_home, "session-key")
+    assert marker is not None
+    assert marker["prompt"] == "new user prompt"
+    assert marker["attempts"] == 0
+    assert "_auto_continue_generation" not in session
     assert "_auto_continue_attempt" not in session
     assert "_auto_continue_prompt" not in session
 
