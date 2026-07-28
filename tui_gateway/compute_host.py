@@ -160,6 +160,7 @@ class ComputeHost:
         self._turn_futures: dict[concurrent.futures.Future, str] = {}
         self._turn_futures_lock = threading.Lock()
         self._force_release_bypass: set[str] = set()
+        self._real_turn_epochs: dict[str, int] = {}
         self._force_release_lock = threading.Lock()
         self._transport = _HostTransport(self.emit)
         self._heartbeat_secs = (
@@ -329,7 +330,11 @@ class ComputeHost:
         if sid in self._sessions:
             self._handle_spike_turn_start(frame)
             return
+        turn_frame = dict(frame)
         with self._force_release_lock:
+            epoch = self._real_turn_epochs.get(sid, 0) + 1
+            self._real_turn_epochs[sid] = epoch
+            turn_frame["_host_turn_epoch"] = epoch
             bypass_exhausted_pool = sid in self._force_release_bypass
             self._force_release_bypass.discard(sid)
         if bypass_exhausted_pool:
@@ -338,12 +343,12 @@ class ComputeHost:
             # works when every bounded-pool worker is stuck.
             threading.Thread(
                 target=self._run_real_turn,
-                args=(dict(frame),),
+                args=(turn_frame,),
                 name=f"compute-host-recovery-{sid}",
                 daemon=True,
             ).start()
             return
-        future = self._executor.submit(self._run_real_turn, dict(frame))
+        future = self._executor.submit(self._run_real_turn, turn_frame)
         self._track_turn_future(future, sid)
 
     def _handle_spike_turn_start(self, frame: dict[str, Any]) -> None:
@@ -401,39 +406,45 @@ class ComputeHost:
         try:
             from tui_gateway import server
 
-            session = server._sessions.get(sid)
-            if session is None:
-                self.emit(
-                    {
-                        "type": "force_release.ack",
-                        "sid": sid,
-                        "request_id": request_id,
-                        "applied": False,
-                        "reason": "session_not_found",
-                    }
-                )
-                return
-            with session["history_lock"]:
-                old_agent = server._detach_running_agent_locked(
-                    session,
-                    "stale compute-host turn",
-                    clear_queued_prompt=bool(frame.get("clear_queued_prompt")),
-                )
-            if old_agent is not None:
-                server._quiesce_abandoned_agent(
-                    old_agent,
-                    "stale compute-host turn",
-                )
-            server._start_agent_build(sid, session)
-            ready = session.get("agent_ready")
-            if ready is None or not ready.wait(timeout=20.0):
-                raise TimeoutError("replacement agent build timed out")
-            if session.get("agent_error") or session.get("agent") is None:
-                raise RuntimeError(
-                    str(session.get("agent_error") or "replacement agent build failed")
-                )
             with self._force_release_lock:
+                # Invalidate every accepted turn frame for this sid before
+                # looking for its child session. A turn.start may still be
+                # queued behind an exhausted executor and therefore have no
+                # server._sessions entry yet; its worker checks this epoch
+                # before constructing an agent.
+                self._real_turn_epochs[sid] = self._real_turn_epochs.get(sid, 0) + 1
+                session = server._sessions.get(sid)
                 self._force_release_bypass.add(sid)
+                if session is None:
+                    self.emit(
+                        {
+                            "type": "force_release.ack",
+                            "sid": sid,
+                            "request_id": request_id,
+                            "applied": True,
+                            "reason": "pending_turn_cancelled",
+                        }
+                    )
+                    return
+                with session["history_lock"]:
+                    old_agent = server._detach_running_agent_locked(
+                        session,
+                        "stale compute-host turn",
+                        clear_queued_prompt=bool(frame.get("clear_queued_prompt")),
+                    )
+                if old_agent is not None:
+                    server._quiesce_abandoned_agent(
+                        old_agent,
+                        "stale compute-host turn",
+                    )
+                server._start_agent_build(sid, session)
+                ready = session.get("agent_ready")
+                if ready is None or not ready.wait(timeout=20.0):
+                    raise TimeoutError("replacement agent build timed out")
+                if session.get("agent_error") or session.get("agent") is None:
+                    raise RuntimeError(
+                        str(session.get("agent_error") or "replacement agent build failed")
+                    )
             self.emit(
                 {
                     "type": "force_release.ack",
@@ -514,61 +525,77 @@ class ComputeHost:
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        turn_epoch = int(frame.get("_host_turn_epoch") or 0)
         if not sid:
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "sid required"})
             return
+        session = None
         try:
             from tui_gateway import server
 
-            session = self._ensure_server_session(server, frame)
-            with session["history_lock"]:
-                queued_prompt_generation = frame.get("queued_prompt_generation")
-                if (
-                    queued_prompt_generation is not None
-                    and int(session.get("_queued_prompt_generation", 0))
-                    != int(queued_prompt_generation)
-                ):
+            # Keep acceptance, child-session registration, and turn dispatch in
+            # one force-release boundary. Once dispatch returns, force_release
+            # can safely find and interrupt the exact registered session.
+            with self._force_release_lock:
+                if self._real_turn_epochs.get(sid) != turn_epoch:
                     self.emit(
                         {
-                            "type": "turn.end",
+                            "type": "turn.error",
                             "sid": sid,
                             "request_id": request_id,
-                            "interrupted": True,
-                            "ended_ns": now_ns(),
+                            "reason": "force_released_before_start",
+                            "message": "turn cancelled before compute-host dispatch",
                         }
                     )
                     return
-                if session.get("running"):
-                    self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "session busy"})
-                    return
-                session["running"] = True
-                session["_turn_cancel_requested"] = False
-                session["last_active"] = time.time()
-                server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
-            self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
-            try:
-                server._ensure_session_db_row(session)
-            except Exception:
-                pass
-            try:
-                import hermes_undo
+                session = self._ensure_server_session(server, frame)
+                text = frame.get("text") if "text" in frame else frame.get("prompt", "")
+                with session["history_lock"]:
+                    queued_prompt_generation = frame.get("queued_prompt_generation")
+                    if (
+                        queued_prompt_generation is not None
+                        and int(session.get("_queued_prompt_generation", 0))
+                        != int(queued_prompt_generation)
+                    ):
+                        self.emit(
+                            {
+                                "type": "turn.end",
+                                "sid": sid,
+                                "request_id": request_id,
+                                "interrupted": True,
+                                "ended_ns": now_ns(),
+                            }
+                        )
+                        return
+                    if session.get("running"):
+                        self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "session busy"})
+                        return
+                    run_generation = server._begin_session_run_locked(session, text)
+                self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
+                try:
+                    server._ensure_session_db_row(session)
+                except Exception:
+                    pass
+                try:
+                    import hermes_undo
 
-                hermes_undo.on_user_message_appended(session["session_key"])
-            except Exception:
-                pass
-            try:
-                server._persist_branch_seed(session)
-            except Exception:
-                pass
-            text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            server._run_prompt_submit(
-                request_id,
-                sid,
-                session,
-                text,
-                display_kind=frame.get("display_kind") or None,
-            )
-            run_thread = session.get("_run_thread")
+                    hermes_undo.on_user_message_appended(session["session_key"])
+                except Exception:
+                    pass
+                try:
+                    server._persist_branch_seed(session)
+                except Exception:
+                    pass
+                text = frame.get("text") if "text" in frame else frame.get("prompt", "")
+                server._run_prompt_submit(
+                    request_id,
+                    sid,
+                    session,
+                    text,
+                    expected_generation=run_generation,
+                    display_kind=frame.get("display_kind") or None,
+                )
+                run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()
             with session["history_lock"]:
@@ -596,8 +623,11 @@ class ComputeHost:
             try:
                 from tui_gateway import server
 
-                session = server._sessions.get(sid)
-                if session is not None:
+                if (
+                    session is not None
+                    and server._sessions.get(sid) is session
+                    and self._real_turn_epochs.get(sid) == turn_epoch
+                ):
                     with session.get("history_lock", threading.Lock()):
                         session["running"] = False
                         server._clear_inflight_turn(session)

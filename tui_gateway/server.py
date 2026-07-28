@@ -2696,35 +2696,40 @@ def _on_compute_host_turn_done(
     run_generation: int | None = None,
 ) -> None:
     is_error = frame.get("type") == "turn.error"
-    with session["history_lock"]:
-        if run_generation is not None and not _run_current_locked(
-            session, run_generation
-        ):
-            return
-        if frame.get("session_key"):
-            session["session_key"] = str(frame.get("session_key"))
-        if frame.get("history_version") is not None:
-            try:
-                session["history_version"] = max(
-                    int(session.get("history_version", 0)),
-                    int(frame.get("history_version") or 0),
-                )
-            except Exception:
-                pass
-        session["running"] = False
-        session["last_active"] = time.time()
-        _clear_inflight_turn(session)
-    if is_error:
-        message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
-    _apply_compute_host_metadata_mirror(session, frame)
-    try:
-        info = _session_info(session.get("agent"), session)
-    except TypeError:
-        info = _session_info(session.get("agent"))
-    if not frame.get("session_info_emitted"):
-        _emit("session.info", sid, info)
-    _drain_queued_prompt(rid, sid, session)
+    # Keep lifecycle identity stable through every completion side effect. A
+    # force-released worker may finish after a replacement session owns the
+    # same sid; it must not emit into or drain work for that replacement.
+    with _sessions_lock:
+        with session["history_lock"]:
+            if _sessions.get(sid) is not session or (
+                run_generation is not None
+                and not _run_current_locked(session, run_generation)
+            ):
+                return
+            if frame.get("session_key"):
+                session["session_key"] = str(frame.get("session_key"))
+            if frame.get("history_version") is not None:
+                try:
+                    session["history_version"] = max(
+                        int(session.get("history_version", 0)),
+                        int(frame.get("history_version") or 0),
+                    )
+                except Exception:
+                    pass
+            session["running"] = False
+            session["last_active"] = time.time()
+            _clear_inflight_turn(session)
+        if is_error:
+            message = str(frame.get("message") or "compute host turn failed")
+            _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        _apply_compute_host_metadata_mirror(session, frame)
+        try:
+            info = _session_info(session.get("agent"), session)
+        except TypeError:
+            info = _session_info(session.get("agent"))
+        if not frame.get("session_info_emitted"):
+            _emit("session.info", sid, info)
+        _drain_queued_prompt(rid, sid, session)
 
 
 def _submit_prompt_to_compute_host(

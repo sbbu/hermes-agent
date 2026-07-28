@@ -172,6 +172,112 @@ def test_compute_host_force_release_rebuilds_only_the_stuck_session(monkeypatch)
     assert "real-sid" in host._force_release_bypass
 
 
+def test_force_release_invalidates_turn_queued_before_child_registration(monkeypatch):
+    from tui_gateway import server
+
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    ensure_calls = []
+
+    def _block_worker():
+        blocker_started.set()
+        release_blocker.wait(timeout=2)
+
+    host._executor.submit(_block_worker)
+    assert blocker_started.wait(timeout=1)
+    monkeypatch.setattr(
+        host,
+        "_ensure_server_session",
+        lambda *_args: ensure_calls.append(True),
+    )
+    server._sessions.pop("queued-real-sid", None)
+    try:
+        host.handle_frame(
+            {
+                "type": "turn.start",
+                "sid": "queued-real-sid",
+                "request_id": "queued-turn",
+            }
+        )
+        host.handle_frame(
+            {
+                "type": "force_release",
+                "sid": "queued-real-sid",
+                "request_id": "release-queued",
+            }
+        )
+        ack = _wait_for_frame(
+            out,
+            lambda frame: frame.get("request_id") == "release-queued",
+        )
+        release_blocker.set()
+        error = _wait_for_frame(
+            out,
+            lambda frame: frame.get("request_id") == "queued-turn",
+        )
+    finally:
+        release_blocker.set()
+        server._sessions.pop("queued-real-sid", None)
+        host.close()
+
+    assert ack["applied"] is True
+    assert ack["reason"] == "pending_turn_cancelled"
+    assert error["reason"] == "force_released_before_start"
+    assert ensure_calls == []
+    assert "queued-real-sid" in host._force_release_bypass
+
+
+def test_real_turn_exception_does_not_clear_replacement_session(monkeypatch):
+    from tui_gateway import server
+
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    old_session = {
+        "agent": object(),
+        "session_key": "old-key",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "inflight_turn": None,
+    }
+    replacement = {
+        "running": True,
+        "inflight_turn": {"user": "replacement"},
+    }
+    sid = "reused-real-sid"
+    host._real_turn_epochs[sid] = 1
+    server._sessions[sid] = old_session
+    monkeypatch.setattr(host, "_ensure_server_session", lambda *_args: old_session)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+
+    def _raise_after_replacement(*_args, **_kwargs):
+        server._sessions[sid] = replacement
+        raise RuntimeError("old worker failed late")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _raise_after_replacement)
+    try:
+        host._run_real_turn(
+            {
+                "type": "turn.start",
+                "sid": sid,
+                "request_id": "old-turn",
+                "session_key": "old-key",
+                "_host_turn_epoch": 1,
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+    assert replacement["running"] is True
+    assert replacement["inflight_turn"] == {"user": "replacement"}
+
+
 def test_force_released_turn_bypasses_exhausted_executor(monkeypatch):
     host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
     blocker_started = threading.Event()

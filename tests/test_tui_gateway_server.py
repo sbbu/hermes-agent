@@ -12071,9 +12071,46 @@ def test_compute_host_late_completion_cannot_clear_replacement_run(monkeypatch):
     assert events == []
 
 
+def test_compute_host_late_completion_is_fenced_by_session_identity(monkeypatch):
+    detached = _session(
+        running=True,
+        run_generation=1,
+        inflight_turn={"user": "detached"},
+        history_version=4,
+    )
+    replacement = _session(
+        running=True,
+        run_generation=1,
+        inflight_turn={"user": "replacement"},
+        history_version=5,
+    )
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda *args: events.append(args))
+    server._sessions["sid"] = replacement
 
+    try:
+        server._on_compute_host_turn_done(
+            "old-rid",
+            "sid",
+            detached,
+            {
+                "type": "turn.error",
+                "session_key": "old-key",
+                "history_version": 9,
+                "message": "old worker failed",
+            },
+            run_generation=1,
+        )
+    finally:
+        server._sessions.pop("sid", None)
 
-
+    assert detached["running"] is True
+    assert detached["session_key"] == "session-key"
+    assert detached["history_version"] == 4
+    assert detached["inflight_turn"] == {"user": "detached"}
+    assert replacement["running"] is True
+    assert replacement["inflight_turn"] == {"user": "replacement"}
+    assert events == []
 
 
 def test_slash_worker_restart_waits_for_inflight_command(monkeypatch):
