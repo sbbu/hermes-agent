@@ -305,6 +305,35 @@ def test_continuation_turn_records_attempt_and_original_prompt(
     assert "_auto_continue_prompt" not in session
 
 
+def test_continuation_is_typed_at_turn_start(emits, turn_env, marker_home):
+    """The recovery note's row must be typed BEFORE the turn runs.
+
+    Typing it after run_conversation returns leaves the row a raw user bubble
+    for the whole turn — and permanently if the continuation is itself killed,
+    which is exactly the scenario it exists for. The model still receives the
+    note as an ordinary user message.
+    """
+    seen: list = []
+
+    def _run(message, *, persist_user_display_kind=None, **kwargs):
+        seen.append((message, persist_user_display_kind))
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    note = server._auto_continue_note("the original prompt")
+    session = _session(agent=agent, running=True)
+
+    with _registered_session("sid", session):
+        server._run_prompt_submit(
+            "rid", "sid", session, note,
+            display_kind="auto_continue",
+        )
+
+    assert seen == [(note, "auto_continue")]
+
+
 def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home):
     """An agent whose run_conversation predates turn-start typing keeps the
     original behavior — the row is typed once the turn concludes."""
@@ -325,11 +354,13 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
         _session_db=_LegacyDB(),
     )
     note = server._auto_continue_note("the original prompt")
+    session = _session(agent=agent, running=True)
 
-    server._run_prompt_submit(
-        "rid", "sid", _session(agent=agent, running=True), note,
-        display_kind="auto_continue",
-    )
+    with _registered_session("sid", session):
+        server._run_prompt_submit(
+            "rid", "sid", session, note,
+            display_kind="auto_continue",
+        )
 
     assert stamped == [("session-key", "auto_continue")]
 
