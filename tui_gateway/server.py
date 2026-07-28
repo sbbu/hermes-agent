@@ -13374,6 +13374,15 @@ def _run_prompt_submit(
                 # message.complete.
                 _usage_stop.set()
                 _usage_thread.join()
+            # A force-release may replace the live agent while the old provider
+            # call is unwinding. Fence every post-run mutation before synthetic
+            # row stamping, model restoration, history writes, or UI emission.
+            with session["history_lock"]:
+                if (
+                    not _run_current_locked(session, generation)
+                    or session.get("agent") is not agent
+                ):
+                    return
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -13852,10 +13861,22 @@ def _run_prompt_submit(
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
             if one_turn_restore:
                 try:
-                    _restore_agent_model_runtime(agent, one_turn_restore)
-                    _restart_slash_worker(sid, session)
-                    _persist_live_session_runtime(session)
-                    _persist_live_session_system_prompt(session)
+                    with session["history_lock"]:
+                        owns_restore = (
+                            _run_current_locked(session, generation)
+                            and session.get("agent") is agent
+                        )
+                    if owns_restore:
+                        _restore_agent_model_runtime(agent, one_turn_restore)
+                        with session["history_lock"]:
+                            owns_restore = (
+                                _run_current_locked(session, generation)
+                                and session.get("agent") is agent
+                            )
+                        if owns_restore:
+                            _restart_slash_worker(sid, session)
+                            _persist_live_session_runtime(session)
+                            _persist_live_session_system_prompt(session)
                 except Exception:
                     logger.debug("TUI one-turn model restore failed", exc_info=True)
             try:
@@ -13928,6 +13949,12 @@ def _run_prompt_submit(
         # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
         # A real queued prompt still wins: the merge in _enqueue_prompt keeps
         # both texts.
+        with session["history_lock"]:
+            if (
+                not _run_current_locked(session, generation)
+                or session.get("agent") is not agent
+            ):
+                return
         _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
         if isinstance(_leftover_steer, str) and _leftover_steer.strip():
             with session["history_lock"]:
@@ -13941,9 +13968,6 @@ def _run_prompt_submit(
         # guard. A real user prompt that races us wins because
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
-        with session["history_lock"]:
-            if not _run_current_locked(session, generation):
-                return
         if goal_followup:
             with session["history_lock"]:
                 if session.get("running"):
