@@ -9965,6 +9965,24 @@ def _retire_turn_marker(
             clear_turn_marker(marker_home, key, owner=owner)
 
 
+def _discard_auto_continue_marker_claim_locked(
+    session: dict, generation: int
+) -> None:
+    """Drop continuation-only marker inputs owned by ``generation``."""
+    claim_generation = session.get("_auto_continue_generation")
+    try:
+        matches = claim_generation is not None and int(claim_generation) == int(
+            generation
+        )
+    except (TypeError, ValueError):
+        matches = False
+    if not matches:
+        return
+    session.pop("_auto_continue_generation", None)
+    session.pop("_auto_continue_attempt", None)
+    session.pop("_auto_continue_prompt", None)
+
+
 def _record_turn_marker_for_run(
     sid: str,
     session: dict,
@@ -9983,6 +10001,7 @@ def _record_turn_marker_for_run(
         current_session = _sessions.get(sid)
         with session["history_lock"]:
             if current_session is not session or not _run_current_locked(session, generation):
+                _discard_auto_continue_marker_claim_locked(session, generation)
                 logger.info(
                     "fenced stale turn-marker write",
                     extra={
@@ -10003,8 +10022,21 @@ def _record_turn_marker_for_run(
 
             marker_home = _session_home(session)
             marker_key = str(session.get("session_key") or "")
-            marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
-            marker_text = session.pop("_auto_continue_prompt", None) or text
+            claim_generation = session.pop("_auto_continue_generation", None)
+            claim_attempt = session.pop("_auto_continue_attempt", 0)
+            claim_text = session.pop("_auto_continue_prompt", None)
+            try:
+                owns_auto_continue_claim = (
+                    claim_generation is not None
+                    and int(claim_generation) == int(generation)
+                )
+            except (TypeError, ValueError):
+                owns_auto_continue_claim = False
+            marker_attempt = 0
+            marker_text = text
+            if owns_auto_continue_claim:
+                marker_attempt = int(claim_attempt or 0)
+                marker_text = claim_text or text
 
             if isinstance(marker_text, str) and marker_text.strip():
                 recorded_owner = record_turn_start(
@@ -10109,6 +10141,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             # behind for a racing user turn to inherit.
             session["_auto_continue_attempt"] = attempt
             session["_auto_continue_prompt"] = marker["prompt"]
+            session["_auto_continue_generation"] = submit_generation
         try:
             _emit(
                 "status.update",
@@ -10125,6 +10158,9 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             )
             if not started:
                 with session["history_lock"]:
+                    _discard_auto_continue_marker_claim_locked(
+                        session, submit_generation
+                    )
                     session["_auto_continue_scheduled"] = False
         except Exception as exc:
             _abandon_claimed_run(session, submit_generation)
@@ -10134,6 +10170,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 file=sys.stderr,
             )
             with session["history_lock"]:
+                if submit_generation is not None:
+                    _discard_auto_continue_marker_claim_locked(
+                        session, submit_generation
+                    )
                 session["_auto_continue_scheduled"] = False
 
     threading.Thread(target=kickoff, daemon=True).start()

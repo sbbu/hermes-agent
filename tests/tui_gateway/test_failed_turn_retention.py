@@ -21,6 +21,7 @@ Contract pinned here:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import threading
 import types
 
@@ -65,6 +66,23 @@ def _session(agent=None, **extra):
         "inflight_turn": None,
         **extra,
     }
+
+
+@contextmanager
+def _registered_session(sid: str, session: dict):
+    """Install the authoritative session identity required by turn fencing."""
+    with server._sessions_lock:
+        previous = server._sessions.get(sid)
+        server._sessions[sid] = session
+    try:
+        yield
+    finally:
+        with server._sessions_lock:
+            if server._sessions.get(sid) is session:
+                if previous is None:
+                    server._sessions.pop(sid, None)
+                else:
+                    server._sessions[sid] = previous
 
 
 @pytest.fixture()
@@ -153,7 +171,8 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     completes = _events(emits, "message.complete")
     assert len(completes) == 1
@@ -240,7 +259,8 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     completes = _events(emits, "message.complete")
     assert len(completes) == 1
@@ -266,7 +286,8 @@ def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_en
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     # Terminal frame, not a bare error event.
     assert not _events(emits, "error")
@@ -305,7 +326,8 @@ def test_live_session_payload_exposes_retained_failure(emits, turn_env, monkeypa
     )
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "long job")
-    server._run_prompt_submit("rid", "sid", session, "long job")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "long job")
 
     # What session.resume's live fast path hands a reconnecting client.
     monkeypatch.setattr(server, "_get_db", lambda: None)
@@ -343,7 +365,8 @@ def test_next_turn_replaces_retained_error_snapshot(emits, turn_env):
     server._start_inflight_turn(session, "old failed prompt")
     server._fail_inflight_turn(session, "previous turn failed")
 
-    server._run_prompt_submit("rid", "sid", session, "new prompt")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "new prompt")
 
     # The new turn must have started a fresh inflight turn, not inherited the
     # failed one (the retained dict used to satisfy the isinstance guard).
