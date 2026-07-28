@@ -350,6 +350,42 @@ def test_supervisor_force_release_waits_for_matching_ack(tmp_path, monkeypatch):
     assert sent[0]["clear_queued_prompt"] is True
 
 
+def test_supervisor_turn_correlation_is_unique_across_client_request_ids(
+    tmp_path, monkeypatch
+):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    sent = []
+    callbacks = []
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(supervisor, "_send_frame", lambda frame: sent.append(dict(frame)))
+
+    first_id = supervisor.submit_turn(
+        {"sid": "session-a", "request_id": "1"},
+        on_complete=lambda frame: callbacks.append(("a", frame["sid"])),
+    )
+    second_id = supervisor.submit_turn(
+        {"sid": "session-b", "request_id": "1"},
+        on_complete=lambda frame: callbacks.append(("b", frame["sid"])),
+    )
+
+    assert first_id != second_id
+    assert sent[0]["client_request_id"] == "1"
+    assert sent[1]["client_request_id"] == "1"
+    supervisor._complete_turn(
+        {"type": "turn.end", "sid": "session-a", "request_id": first_id},
+    )
+    supervisor._complete_turn(
+        {"type": "turn.end", "sid": "session-b", "request_id": second_id},
+    )
+
+    assert callbacks == [("a", "session-a"), ("b", "session-b")]
+    assert supervisor._pending_turns == {}
+
+
 def test_compute_host_flushes_sessions_on_orphan_shutdown(monkeypatch):
     from tui_gateway import server
 
