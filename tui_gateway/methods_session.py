@@ -3365,7 +3365,10 @@ def _(rid, params: dict) -> dict:
     assert session is not None
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
-        supervisor = _get_compute_host_supervisor()
+        try:
+            supervisor = _get_compute_host_supervisor()
+        except Exception as exc:
+            return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
         release_error = None
         submit_lock = session.setdefault("compute_host_submit_lock", threading.Lock())
         with submit_lock:
