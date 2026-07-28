@@ -13405,46 +13405,56 @@ def _run_prompt_submit(
                                 message["display_metadata"] = display_metadata
                             break
             if "moa_one_shot_restore" in session:
-                _restore = session.pop("moa_one_shot_restore", None)
+                lifecycle_lock = session.setdefault(
+                    "agent_lifecycle_lock", threading.Lock()
+                )
+                with lifecycle_lock:
+                    with session["history_lock"]:
+                        if (
+                            not _run_current_locked(session, generation)
+                            or session.get("agent") is not agent
+                        ):
+                            return
+                        _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
                 # The one-shot did a real in-place agent.switch_model() to MoA
                 # (#53444), so undoing it must go back through the switch path —
                 # resetting session["model_override"] alone would leave the live
                 # agent's client pinned to MoA for the next turn.
-                if isinstance(_restore, dict):
-                    _prev_override = _restore.get("override")
-                    _prev_model = _restore.get("model")
-                    _prev_provider = _restore.get("provider")
-                    if _prev_override is None:
+                    if isinstance(_restore, dict):
+                        _prev_override = _restore.get("override")
+                        _prev_model = _restore.get("model")
+                        _prev_provider = _restore.get("provider")
+                        if _prev_override is None:
+                            session.pop("model_override", None)
+                        else:
+                            session["model_override"] = _prev_override
+                        if _prev_model:
+                            _raw = (
+                                f"{_prev_model} --provider {_prev_provider}"
+                                if _prev_provider
+                                else _prev_model
+                            )
+                            try:
+                                _apply_model_switch(
+                                    sid,
+                                    session,
+                                    _raw,
+                                    confirm_expensive_model=False,
+                                    pin_session_override=bool(_prev_override),
+                                    # Session-internal restore after the /moa
+                                    # one-shot — never persist to config.yaml.
+                                    persist_override=False,
+                                )
+                            except Exception as _moa_restore_exc:
+                                logger.warning(
+                                    "MoA one-shot model restore failed: %s",
+                                    _moa_restore_exc,
+                                )
+                    elif _restore is None:
                         session.pop("model_override", None)
                     else:
-                        session["model_override"] = _prev_override
-                    if _prev_model:
-                        _raw = (
-                            f"{_prev_model} --provider {_prev_provider}"
-                            if _prev_provider
-                            else _prev_model
-                        )
-                        try:
-                            _apply_model_switch(
-                                sid,
-                                session,
-                                _raw,
-                                confirm_expensive_model=False,
-                                pin_session_override=bool(_prev_override),
-                                # Session-internal restore after the /moa
-                                # one-shot — never persist to config.yaml.
-                                persist_override=False,
-                            )
-                        except Exception as _moa_restore_exc:
-                            logger.warning(
-                                "MoA one-shot model restore failed: %s",
-                                _moa_restore_exc,
-                            )
-                elif _restore is None:
-                    session.pop("model_override", None)
-                else:
-                    session["model_override"] = _restore
+                        session["model_override"] = _restore
 
             with session["history_lock"]:
                 if not _run_current_locked(session, generation):
@@ -13861,19 +13871,17 @@ def _run_prompt_submit(
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
             if one_turn_restore:
                 try:
-                    with session["history_lock"]:
-                        owns_restore = (
-                            _run_current_locked(session, generation)
-                            and session.get("agent") is agent
-                        )
-                    if owns_restore:
-                        _restore_agent_model_runtime(agent, one_turn_restore)
+                    lifecycle_lock = session.setdefault(
+                        "agent_lifecycle_lock", threading.Lock()
+                    )
+                    with lifecycle_lock:
                         with session["history_lock"]:
                             owns_restore = (
                                 _run_current_locked(session, generation)
                                 and session.get("agent") is agent
                             )
                         if owns_restore:
+                            _restore_agent_model_runtime(agent, one_turn_restore)
                             _restart_slash_worker(sid, session)
                             _persist_live_session_runtime(session)
                             _persist_live_session_system_prompt(session)
@@ -13949,15 +13957,14 @@ def _run_prompt_submit(
         # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
         # A real queued prompt still wins: the merge in _enqueue_prompt keeps
         # both texts.
+        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
         with session["history_lock"]:
             if (
                 not _run_current_locked(session, generation)
                 or session.get("agent") is not agent
             ):
                 return
-        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
-        if isinstance(_leftover_steer, str) and _leftover_steer.strip():
-            with session["history_lock"]:
+            if isinstance(_leftover_steer, str) and _leftover_steer.strip():
                 _enqueue_prompt(session, _leftover_steer, session.get("transport"))
         if _drain_queued_prompt(rid, sid, session):
             return

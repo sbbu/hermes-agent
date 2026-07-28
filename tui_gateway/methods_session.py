@@ -3405,12 +3405,14 @@ def _(rid, params: dict) -> dict:
             pass
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
     sid = params.get("session_id", "")
-    with session["history_lock"]:
-        session.pop("queued_prompts", None)
-        session["_queued_prompt_generation"] = int(
-            session.get("_queued_prompt_generation", 0)
-        ) + 1
-        old_agent = _detach_running_agent_locked(session, "desktop session.interrupt")
+    lifecycle_lock = session.setdefault("agent_lifecycle_lock", threading.Lock())
+    with lifecycle_lock:
+        with session["history_lock"]:
+            session.pop("queued_prompts", None)
+            session["_queued_prompt_generation"] = int(
+                session.get("_queued_prompt_generation", 0)
+            ) + 1
+            old_agent = _detach_running_agent_locked(session, "desktop session.interrupt")
     _quiesce_abandoned_agent(old_agent, "desktop session.interrupt")
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,

@@ -426,12 +426,16 @@ class ComputeHost:
                         }
                     )
                     return
-                with session["history_lock"]:
-                    old_agent = server._detach_running_agent_locked(
-                        session,
-                        "stale compute-host turn",
-                        clear_queued_prompt=bool(frame.get("clear_queued_prompt")),
-                    )
+                lifecycle_lock = session.setdefault(
+                    "agent_lifecycle_lock", threading.Lock()
+                )
+                with lifecycle_lock:
+                    with session["history_lock"]:
+                        old_agent = server._detach_running_agent_locked(
+                            session,
+                            "stale compute-host turn",
+                            clear_queued_prompt=bool(frame.get("clear_queued_prompt")),
+                        )
                 if old_agent is not None:
                     server._quiesce_abandoned_agent(
                         old_agent,
@@ -623,14 +627,15 @@ class ComputeHost:
             try:
                 from tui_gateway import server
 
-                if (
-                    session is not None
-                    and server._sessions.get(sid) is session
-                    and self._real_turn_epochs.get(sid) == turn_epoch
-                ):
-                    with session.get("history_lock", threading.Lock()):
-                        session["running"] = False
-                        server._clear_inflight_turn(session)
+                with self._force_release_lock:
+                    if (
+                        session is not None
+                        and server._sessions.get(sid) is session
+                        and self._real_turn_epochs.get(sid) == turn_epoch
+                    ):
+                        with session.get("history_lock", threading.Lock()):
+                            session["running"] = False
+                            server._clear_inflight_turn(session)
             except Exception:
                 pass
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
