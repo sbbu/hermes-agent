@@ -1571,7 +1571,10 @@ def _submit_prompt_to_compute_host(
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(rid, sid, session, text)
-    supervisor = _get_compute_host_supervisor(cfg)
+    try:
+        supervisor = _get_compute_host_supervisor(cfg)
+    except Exception as exc:
+        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
@@ -2151,6 +2154,17 @@ def _begin_session_run_locked(session: dict, text: Any | None = None) -> int:
 
 def _run_current_locked(session: dict, generation: int) -> bool:
     return _run_generation(session) == int(generation)
+
+
+def _abandon_claimed_run(session: dict, generation: int | None) -> None:
+    """Release a run reservation that never reached its worker thread."""
+    if generation is None:
+        return
+    with session["history_lock"]:
+        if not _run_current_locked(session, generation):
+            return
+        session["running"] = False
+        _clear_inflight_turn(session)
 
 
 def _mark_run_activity_locked(session: dict) -> None:
@@ -7169,6 +7183,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
 
     def kickoff() -> None:
         rid = f"__auto_continue__{int(time.time() * 1000)}"
+        submit_generation: int | None = None
         try:
             _start_agent_build(sid, session)
             err = _wait_agent(session, rid, timeout=120.0)
@@ -7185,8 +7200,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 # own conclusion clears the marker.
                 session["_auto_continue_scheduled"] = False
                 return
-            session["running"] = True
-            session["last_active"] = time.time()
+            try:
+                submit_generation = _begin_session_run_locked(session, text)
+            except Exception:
+                session["_auto_continue_scheduled"] = False
+                raise
             # Hand this turn its own marker inputs (read back by
             # _run_prompt_submit): count the attempt so a crash during the
             # continuation trips the breaker, and re-record the ORIGINAL
@@ -7201,16 +7219,26 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 sid,
                 {"kind": "process", "text": "Resuming interrupted turn…"},
             )
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue")
+            started = _dispatch_claimed_prompt(
+                rid,
+                sid,
+                session,
+                text,
+                display_kind="auto_continue",
+                expected_generation=submit_generation,
+            )
+            if not started:
+                with session["history_lock"]:
+                    session["_auto_continue_scheduled"] = False
         except Exception as exc:
+            _abandon_claimed_run(session, submit_generation)
             print(
                 f"[tui_gateway] auto-continue dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
             with session["history_lock"]:
-                session["running"] = False
+                session["_auto_continue_scheduled"] = False
 
     threading.Thread(target=kickoff, daemon=True).start()
     logger.info(
@@ -7387,7 +7415,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 if emit_error:
                     _emit("error", sid, {"message": message})
         else:
-            _run_prompt_submit(rid, sid, session, queued["text"])
+            _dispatch_claimed_prompt(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                expected_generation=submit_generation,
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -8876,16 +8910,27 @@ def _notification_poller_loop(
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
+                submit_generation: int | None = None
                 with session["history_lock"]:
                     if not session.get("running"):
-                        session["running"] = True
+                        submit_generation = _begin_session_run_locked(
+                            session, "\n".join(_pending)
+                        )
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
-                        _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        started = _dispatch_claimed_prompt(
+                            rid,
+                            sid,
+                            session,
+                            "\n".join(_batch),
+                            expected_generation=submit_generation,
+                        )
+                        if not started:
+                            with session["history_lock"]:
+                                session.setdefault("_kanban_pending", [])[0:0] = _batch
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -8893,7 +8938,7 @@ def _notification_poller_loop(
                             file=sys.stderr,
                         )
                         with session["history_lock"]:
-                            session["running"] = False
+                            session.setdefault("_kanban_pending", [])[0:0] = _batch
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -8949,12 +8994,13 @@ def _notification_poller_loop(
             _emitted.add(_dedup_key)
 
         _requeued = False
+        submit_generation: int | None = None
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
             else:
-                _begin_session_run_locked(session, text)
+                submit_generation = _begin_session_run_locked(session, text)
         if _requeued:
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
@@ -8968,30 +9014,42 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            _abandon_claimed_run(session, submit_generation)
             continue
         try:
-            _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                started = _dispatch_claimed_prompt(
                     rid,
                     sid,
                     session,
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    expected_generation=submit_generation,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                started = _dispatch_claimed_prompt(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    expected_generation=submit_generation,
+                )
+            if not started:
+                release_event_delivery(evt, _claim)
+                process_registry.completion_queue.put(evt)
+                time.sleep(0.25)
+                continue
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
+            process_registry.completion_queue.put(evt)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            time.sleep(0.25)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -9034,11 +9092,12 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
+        submit_generation: int | None = None
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
-            _begin_session_run_locked(session, text)
+            submit_generation = _begin_session_run_locked(session, text)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -9046,30 +9105,41 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            _abandon_claimed_run(session, submit_generation)
             continue
         try:
-            _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                started = _dispatch_claimed_prompt(
                     rid,
                     sid,
                     session,
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    expected_generation=submit_generation,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                started = _dispatch_claimed_prompt(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    expected_generation=submit_generation,
+                )
+            if not started:
+                release_event_delivery(evt, _claim)
+                process_registry.completion_queue.put(evt)
+                break
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
+            process_registry.completion_queue.put(evt)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            break
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -9184,11 +9254,61 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _dispatch_claimed_prompt(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    expected_generation: int | None,
+    **kwargs: Any,
+) -> bool:
+    """Dispatch a claimed run while tolerating legacy test/mocking call shapes."""
+    if expected_generation is None:
+        return False
+    submit = _run_prompt_submit
+    try:
+        supports_generation = "expected_generation" in inspect.signature(
+            submit
+        ).parameters
+    except (TypeError, ValueError):
+        supports_generation = True
+    try:
+        if supports_generation:
+            result = submit(
+                rid,
+                sid,
+                session,
+                text,
+                expected_generation=expected_generation,
+                **kwargs,
+            )
+        else:
+            with session["history_lock"]:
+                if not _run_current_locked(session, expected_generation):
+                    return False
+                _emit("message.start", sid)
+            result = submit(rid, sid, session, text, **kwargs)
+    except Exception as exc:
+        _abandon_claimed_run(session, expected_generation)
+        _emit("error", sid, {"message": f"Turn dispatch failed: {exc}"})
+        raise
+    if result is False:
+        _abandon_claimed_run(session, expected_generation)
+        return False
+    return True
+
+
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
-) -> None:
+    expected_generation: int | None = None,
+) -> bool:
     with session["history_lock"]:
+        if expected_generation is not None and not _run_current_locked(
+            session, expected_generation
+        ):
+            return False
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
@@ -9198,16 +9318,24 @@ def _run_prompt_submit(
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
-        generation = _run_generation(session)
+        generation = (
+            expected_generation
+            if expected_generation is not None
+            else _run_generation(session)
+        )
     agent = session["agent"]
-    if hasattr(agent, "clear_interrupt"):
-        try:
-            agent.clear_interrupt()
-        except Exception:
-            pass
-    _emit("message.start", sid)
+    launch_gate = threading.Event()
+    launch_cancelled = threading.Event()
 
     def run():
+        launch_gate.wait()
+        if launch_cancelled.is_set():
+            return
+        with session["history_lock"]:
+            if expected_generation is not None and not _run_current_locked(
+                session, expected_generation
+            ):
+                return
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
@@ -9423,12 +9551,12 @@ def _run_prompt_submit(
                         return
                     _mark_run_activity_locked(session)
                     _append_inflight_delta(session, delta)
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
-                    payload["rendered"] = r
-                if tts_queue is not None and isinstance(delta, str):
-                    tts_queue.put(delta)
-                _emit("message.delta", sid, payload)
+                    payload = {"text": delta}
+                    if streamer and (r := streamer.feed(delta)) is not None:
+                        payload["rendered"] = r
+                    if tts_queue is not None and isinstance(delta, str):
+                        tts_queue.put(delta)
+                    _emit("message.delta", sid, payload)
 
             # Surface interim assistant text (commentary emitted alongside
             # tool calls, or the attempted final answer before a verify-on-stop
@@ -9920,10 +10048,17 @@ def _run_prompt_submit(
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
-                _begin_session_run_locked(session, goal_followup)
+                followup_generation = _begin_session_run_locked(
+                    session, goal_followup
+                )
             try:
-                _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _dispatch_claimed_prompt(
+                    rid,
+                    sid,
+                    session,
+                    goal_followup,
+                    expected_generation=followup_generation,
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -9960,26 +10095,37 @@ def _run_prompt_submit(
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
-                    _begin_session_run_locked(session, synth)
+                    notification_generation = _begin_session_run_locked(
+                        session, synth
+                    )
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    _abandon_claimed_run(session, notification_generation)
                     continue
                 try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    started = _dispatch_claimed_prompt(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        expected_generation=notification_generation,
+                    )
+                    if not started:
+                        release_event_delivery(_evt, _claim)
+                        process_registry.completion_queue.put(_evt)
+                        continue
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
+                    process_registry.completion_queue.put(_evt)
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
                         f"{type(_n_exc).__name__}: {_n_exc}",
                         file=sys.stderr,
                     )
-                    with session["history_lock"]:
-                        session["running"] = False
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -9988,8 +10134,49 @@ def _run_prompt_submit(
             )
 
     run_thread = threading.Thread(target=run, daemon=True)
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    real_thread = type(run_thread).__module__ == "threading"
+    with session["history_lock"]:
+        if expected_generation is not None and not _run_current_locked(
+            session, expected_generation
+        ):
+            launch_cancelled.set()
+            launch_gate.set()
+            return False
+        if hasattr(agent, "clear_interrupt"):
+            try:
+                agent.clear_interrupt()
+            except Exception:
+                pass
+        session["_run_thread"] = run_thread
+        if not real_thread:
+            _emit("message.start", sid)
+            launch_gate.set()
+    try:
+        run_thread.start()
+    except Exception:
+        launch_gate.set()
+        with session["history_lock"]:
+            if session.get("_run_thread") is run_thread:
+                session["_run_thread"] = None
+        raise
+    if not real_thread:
+        return True
+    with session["history_lock"]:
+        if expected_generation is not None and not _run_current_locked(
+            session, expected_generation
+        ):
+            launch_cancelled.set()
+            launch_gate.set()
+            return False
+        try:
+            _emit("message.start", sid)
+        except Exception:
+            launch_cancelled.set()
+            launch_gate.set()
+            raise
+        else:
+            launch_gate.set()
+    return True
 
 
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25
