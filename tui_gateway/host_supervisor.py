@@ -398,11 +398,17 @@ class HostSupervisor:
         on_complete: Callable[[dict], None] | None = None,
     ) -> str:
         self.start()
-        request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        client_request_id = str(frame.get("request_id") or "")
+        # JSON-RPC ids are scoped to one websocket client and routinely collide
+        # across tabs/reloads. The compute-host transport is process-global, so
+        # give every submitted turn its own correlation id.
+        request_id = uuid.uuid4().hex
         sid = str(frame.get("sid") or "")
         payload = dict(frame)
         payload["type"] = "turn.start"
         payload["request_id"] = request_id
+        if client_request_id:
+            payload["client_request_id"] = client_request_id
         try:
             with self._lock:
                 self._pending_turns[request_id] = (self._proc, sid, on_complete)
@@ -778,7 +784,15 @@ class HostSupervisor:
                 pending = None
         if pending is None:
             return
-        _owner_proc, _sid, cb = pending
+        _owner_proc, owner_sid, cb = pending
+        if str(frame.get("sid") or "") != owner_sid:
+            logger.error(
+                "compute host completion sid mismatch: expected=%s actual=%s request_id=%s",
+                owner_sid,
+                frame.get("sid"),
+                request_id,
+            )
+            return
         if cb is not None:
             try:
                 cb(frame)
