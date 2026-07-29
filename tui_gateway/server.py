@@ -13977,6 +13977,11 @@ def _run_prompt_submit(
         # we check that guard before re-firing.
         if goal_followup:
             with session["history_lock"]:
+                if (
+                    not _run_current_locked(session, generation)
+                    or session.get("agent") is not agent
+                ):
+                    return
                 if session.get("running"):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
@@ -14012,6 +14017,13 @@ def _run_prompt_submit(
         try:
             from tools.process_registry import process_registry
 
+            with session["history_lock"]:
+                if (
+                    not _run_current_locked(session, generation)
+                    or session.get("agent") is not agent
+                ):
+                    return
+
             # Positive-proof ownership (compression-chain aware) — the same
             # fail-closed gate the poller uses, so the post-turn drain can't
             # adopt another session's addressed notification while a
@@ -14024,6 +14036,13 @@ def _run_prompt_submit(
             )
             for index, (_evt, synth) in enumerate(drained):
                 with session["history_lock"]:
+                    if (
+                        not _run_current_locked(session, generation)
+                        or session.get("agent") is not agent
+                    ):
+                        for pending_evt, _pending_synth in drained[index:]:
+                            process_registry.completion_queue.put(pending_evt)
+                        return
                     if session.get("running"):
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
