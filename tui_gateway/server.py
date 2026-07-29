@@ -14003,8 +14003,7 @@ def _run_prompt_submit(
                     f"{type(_cont_exc).__name__}: {_cont_exc}",
                     file=sys.stderr,
                 )
-                with session["history_lock"]:
-                    session["running"] = False
+                _abandon_claimed_run(session, followup_generation)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
