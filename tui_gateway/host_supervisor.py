@@ -496,12 +496,15 @@ class HostSupervisor:
         if route_name not in MUTATOR_ROUTE_TABLE:
             raise ValueError(f"unclassified host mutator route: {route_name}")
         self.start()
-        request_id = str((payload or {}).get("request_id") or uuid.uuid4().hex)
+        client_request_id = str((payload or {}).get("request_id") or "")
+        request_id = uuid.uuid4().hex
         frame = dict(payload or {})
         frame.setdefault("type", "control")
         frame["sid"] = sid
         frame["route_name"] = route_name
         frame["request_id"] = request_id
+        if client_request_id:
+            frame["client_request_id"] = client_request_id
         q: queue.Queue[dict] | None = None
         if wait:
             q = queue.Queue(maxsize=1)
