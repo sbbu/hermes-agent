@@ -79,6 +79,94 @@ def test_compute_host_frame_protocol_round_trip():
         host.close()
 
 
+def test_compute_host_future_completion_serializes_with_heartbeat_snapshot(
+    monkeypatch,
+):
+    """A completed turn must not mutate the tracked set during a snapshot."""
+    callback_attempted = threading.Event()
+
+    class _Future:
+        def __init__(self):
+            self.callback = None
+            self.completed = False
+
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+        def done(self):
+            return self.completed
+
+        def finish(self):
+            self.completed = True
+            callback_attempted.set()
+            assert self.callback is not None
+            self.callback(self)
+
+    class _GuardedFutureSet(set):
+        def __init__(self):
+            super().__init__()
+            self.iterating = threading.Event()
+            self.iteration_done = threading.Event()
+
+        def __iter__(self):
+            iterator = super().__iter__()
+            self.iterating.set()
+            assert callback_attempted.wait(timeout=1)
+            yield from iterator
+
+        def discard(self, item):
+            if self.iterating.is_set() and not self.iteration_done.is_set():
+                raise AssertionError("turn future mutated during heartbeat snapshot")
+            super().discard(item)
+
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+    future = _Future()
+    tracked = _GuardedFutureSet()
+    host._turn_futures = tracked
+    monkeypatch.setattr(host._executor, "submit", lambda *_args, **_kwargs: future)
+    snapshot_errors: list[BaseException] = []
+    callback_errors: list[BaseException] = []
+
+    def _snapshot():
+        try:
+            with host._turn_futures_lock:
+                try:
+                    sum(1 for item in host._turn_futures if not item.done())
+                finally:
+                    tracked.iteration_done.set()
+        except BaseException as exc:
+            snapshot_errors.append(exc)
+
+    def _finish():
+        try:
+            future.finish()
+        except BaseException as exc:
+            callback_errors.append(exc)
+
+    try:
+        host.handle_frame(
+            {"type": "turn.start", "sid": "real-sid", "request_id": "turn-1"}
+        )
+        snapshot_thread = threading.Thread(target=_snapshot)
+        snapshot_thread.start()
+        assert tracked.iterating.wait(timeout=1)
+
+        callback_thread = threading.Thread(target=_finish)
+        callback_thread.start()
+        snapshot_thread.join(timeout=1)
+        callback_thread.join(timeout=1)
+
+        assert not snapshot_thread.is_alive()
+        assert not callback_thread.is_alive()
+        assert snapshot_errors == []
+        assert callback_errors == []
+        assert future not in tracked
+    finally:
+        callback_attempted.set()
+        tracked.iteration_done.set()
+        host.close()
+
+
 def test_compute_host_interrupt_control_is_not_queued_behind_turn():
     out = io.StringIO()
     host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
