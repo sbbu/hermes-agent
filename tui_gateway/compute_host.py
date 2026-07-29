@@ -234,6 +234,16 @@ class ComputeHost:
         self._sessions[sid] = HostSession(sid=sid, agent=SpikeAgent(sid, list(history)))
         self.emit({"type": "session.seeded", "sid": sid, "request_id": frame.get("request_id")})
 
+    def _track_turn_future(self, future: concurrent.futures.Future) -> None:
+        with self._turn_futures_lock:
+            self._turn_futures.add(future)
+
+        def _discard(completed: concurrent.futures.Future) -> None:
+            with self._turn_futures_lock:
+                self._turn_futures.discard(completed)
+
+        future.add_done_callback(_discard)
+
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         if sid in self._sessions:
@@ -258,9 +268,7 @@ class ComputeHost:
             ).start()
             return
         future = self._executor.submit(self._run_real_turn, turn_frame)
-        with self._turn_futures_lock:
-            self._turn_futures.add(future)
-        future.add_done_callback(self._turn_futures.discard)
+        self._track_turn_future(future)
 
     def _handle_spike_turn_start(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
@@ -274,9 +282,7 @@ class ComputeHost:
                 return
             session.running = True
         future = self._executor.submit(self._run_spike_turn, session, dict(frame))
-        with self._turn_futures_lock:
-            self._turn_futures.add(future)
-        future.add_done_callback(self._turn_futures.discard)
+        self._track_turn_future(future)
 
     def _handle_interrupt(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
