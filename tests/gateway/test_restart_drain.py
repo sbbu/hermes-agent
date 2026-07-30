@@ -341,6 +341,35 @@ async def test_wait_for_restart_safe_point_waits_for_all_gateway_work(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_wait_for_restart_safe_point_waits_for_queued_drain_message(monkeypatch):
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner._busy_input_mode = "queue"
+    adapter._pending_messages["agent:main:telegram:dm:999"] = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="queued-1",
+    )
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", fast_sleep)
+
+    async def finish_queued_work():
+        await real_sleep(0)
+        adapter._pending_messages.clear()
+
+    asyncio.create_task(finish_queued_work())
+    await asyncio.wait_for(runner._wait_for_restart_safe_point(), timeout=1)
+
+    assert runner._draining is True
+
+
+@pytest.mark.asyncio
 async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
     runner, _adapter = make_restart_runner()
     popen_calls = []
