@@ -8915,7 +8915,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + (
+                self._pending_message_count()
+                if self._queue_during_drain_enabled()
+                else 0
+            )
         )
+
+    def _pending_message_count(self) -> int:
+        """Count queued inbound turns across primary and multiplex adapters."""
+        adapters = list(getattr(self, "adapters", {}).values())
+        for profile_map in getattr(self, "_profile_adapters", {}).values():
+            adapters.extend(profile_map.values())
+        seen: set[int] = set()
+        total = 0
+        for adapter in adapters:
+            identity = id(adapter)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            pending = getattr(adapter, "_pending_messages", None)
+            if isinstance(pending, dict):
+                total += len(pending)
+        return total
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
