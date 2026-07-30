@@ -16,15 +16,9 @@ from typing import Any, Dict
 COMPUTER_USE_SCHEMA: Dict[str, Any] = {
     "name": "computer_use",
     "description": (
-        "Drive the desktop in the background via cua-driver — screenshots, "
-        "mouse, keyboard, scroll, drag — without stealing the user's cursor "
-        "or keyboard focus. Supported on macOS, Windows, and Linux. "
-        "Preferred workflow: call with "
-        "action='capture' (mode='som' gives numbered element overlays), "
-        "then click by `element` index for reliability. Pixel coordinates "
-        "are supported for models trained on them. Works on any window — "
-        "hidden, minimized, or behind another app. Requires cua-driver to "
-        "be installed."
+        "Drive desktop apps through cua-driver without taking the user's real cursor/focus. "
+        "Prefer capture(mode='som') then act by element index; use coordinates only when needed. "
+        "Supports native apps and typed browser-page actions."
     ),
     "parameters": {
         "type": "object",
@@ -57,11 +51,8 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "cua_browser_download",
                 ],
                 "description": (
-                    "Which action to perform. `capture` is free (no side "
-                    "effects). All other actions require approval unless "
-                    "auto-approved. Use `set_value` for select/popup elements "
-                    "and sliders — it selects the matching option directly "
-                    "without opening the native menu (no focus steal)."
+                    "Action to perform. Capture is read-only; mutations require approval unless "
+                    "auto-approved. Prefer set_value for popups/sliders."
                 ),
             },
             # ── capture ────────────────────────────────────────────
@@ -69,26 +60,15 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "enum": ["som", "vision", "ax"],
                 "description": (
-                    "Capture mode. `som` (default) is a screenshot with "
-                    "numbered overlays on every interactable element plus "
-                    "the AX tree — best for vision models, lets you click "
-                    "by element index. `vision` is a plain screenshot. "
-                    "`ax` is the accessibility tree only (no image; useful "
-                    "for text-only models)."
+                    "Capture mode: som (default) = screenshot + numbered elements + AX; "
+                    "vision = plain screenshot; ax = accessibility tree only."
                 ),
             },
             "app": {
                 "type": "string",
                 "description": (
-                    "Optional. Limit capture/action to a specific app "
-                    "(by name, e.g. 'Safari', or bundle ID, "
-                    "'com.apple.Safari'). If omitted, operates on the "
-                    "frontmost app's window. Pass app='screen' (or "
-                    "'desktop') to capture the OS desktop/shell surface — "
-                    "e.g. to see the wallpaper or click the taskbar. Note: "
-                    "capture is per-window; a single image cannot span "
-                    "multiple monitors, so on a multi-screen setup capture "
-                    "one window or display at a time."
+                    "App name/bundle ID; omit for frontmost window. Use screen/desktop for the "
+                    "OS shell. Captures cover one window/display at a time."
                 ),
             },
             "pid": {
@@ -109,20 +89,8 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "max_elements": {
                 "type": "integer",
                 "description": (
-                    "Optional cap on the AX `elements` array returned by "
-                    "`action='capture'`. Default 100, hard maximum 1000. "
-                    "Dense UIs (Electron apps such as Obsidian or VS Code, "
-                    "JetBrains IDEs) can publish 500+ AX nodes — capping "
-                    "prevents a single capture from blowing session "
-                    "context. When the cap trims the response, "
-                    "`total_elements` and `truncated_elements` are "
-                    "surfaced in the result so you can re-call with "
-                    "`app=` to narrow scope or raise `max_elements` when "
-                    "the full tree is required. Has no effect on "
-                    "`mode='som'` / `mode='vision'` when a screenshot is "
-                    "included in the response; only the rare image-"
-                    "missing fallback returns an `elements` array and is "
-                    "subject to the cap."
+                    "AX element cap (default 100, max 1000). If truncated, narrow app scope or "
+                    "raise it; screenshot-backed som/vision captures are unaffected."
                 ),
                 "default": 100,
                 "minimum": 1,
@@ -132,9 +100,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "element": {
                 "type": "integer",
                 "description": (
-                    "The 1-based SOM index returned by the last "
-                    "`capture(mode='som')` call. Strongly preferred over "
-                    "raw coordinates."
+                    "1-based element index from the latest som capture; preferred over coordinates."
                 ),
             },
             "coordinate": {
@@ -143,9 +109,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "minItems": 2,
                 "maxItems": 2,
                 "description": (
-                    "Pixel coordinates [x, y] relative to the captured window "
-                    "screenshot (top-left origin). Only use this if no element "
-                    "index is available."
+                    "Window-relative [x,y] from the capture; use only without an element index."
                 ),
             },
             "button": {
@@ -221,10 +185,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "raise_window": {
                 "type": "boolean",
                 "description": (
-                    "Only for action='focus_app'. If true, brings the "
-                    "window to front (DISRUPTS the user). Default false "
-                    "— input is routed to the app without raising, "
-                    "matching the background co-work model."
+                    "focus_app only. True visibly raises the window; default false routes in background."
                 ),
             },
             # ── delivery (verify → escalate ladder) ────────────────
@@ -232,28 +193,15 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "enum": ["background", "foreground"],
                 "description": (
-                    "How input is delivered, for the input actions (click, "
-                    "double_click, right_click, drag, scroll, type, key). "
-                    "`background` (DEFAULT) routes input to the target without "
-                    "raising it or stealing focus — the co-work model. "
-                    "`foreground` briefly fronts the window, acts, then "
-                    "restores the prior frontmost app. A `confirmed` effect is "
-                    "done. For `unverifiable`, inspect fresh state before any "
-                    "retry even if escalation is recommended. Escalate only "
-                    "after `suspected_noop` or a structured refusal. Do not "
-                    "predict the rung from the app being Electron/Chromium. "
-                    "Foreground is a visible focus change and needs its own "
-                    "approval."
+                    "Input route; background is default. A confirmed effect is done; for unverifiable, "
+                    "inspect fresh state before retrying. Escalate only after suspected_noop/refusal. "
+                    "Foreground visibly fronts/restores the app and needs separate approval."
                 ),
             },
             "bring_to_front": {
                 "type": "boolean",
                 "description": (
-                    "Optional and only valid with delivery_mode='foreground'. "
-                    "Explicitly invokes cua-driver's standalone bring_to_front "
-                    "tool before the input; it is never passed as an input "
-                    "property. This persistent focus change has a separate "
-                    "approval scope. Default false."
+                    "foreground only: persistently raise before input; separate approval, default false."
                 ),
             },
             # ── cua-driver typed browser route ─────────────────────
@@ -290,10 +238,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "enum": ["isolated_new", "isolated_named", "existing_profile"],
                 "description": (
-                    "Browser preparation mode. existing_profile is decided by "
-                    "cua-driver's immutable permission mode: standard requires a "
-                    "certified protected host; explicit Hermes YOLO uses a private "
-                    "unrestricted daemon."
+                    "Browser preparation mode; existing_profile availability is permission-enforced."
                 ),
             },
             "profile_name": {"type": "string", "description": "Name for isolated_named setup."},
