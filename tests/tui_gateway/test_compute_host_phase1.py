@@ -1176,12 +1176,15 @@ def test_supervisor_drains_terminal_control_ack_before_crash_error(tmp_path, mon
                 proc=proc,
             )
 
+        def is_alive(self) -> bool:
+            return False
+
     stdout_thread: Any = _StdoutDrain()
     supervisor._wait_for_exit(proc, stdout_thread)
     waiter.join(timeout=1)
 
     assert not waiter.is_alive()
-    assert result["join_call"] == ((), {})
+    assert result["join_call"] == ((), {"timeout": 5.0})
     assert result["response"]["type"] == "control.ack"
     assert supervisor._pending_controls == {}
 
