@@ -146,10 +146,11 @@ docs/superpowers/*
 # Persistent dev sandbox dir (scripts/dev-sandbox.sh --persistent)
 .hermes-sandbox/
 
-# Interrupted-update breadcrumb + recovery lock written next to the shared venv
+# Interrupted-update breadcrumbs + recovery lock written next to the shared venv
 # by `hermes update` / launch-time self-heal. Runtime state, never a code change
 # — ignore so `git status` stays clean and update's autostash skips them.
 .update-incomplete
+.lazy-refresh-incomplete
 .update-incomplete.lock
 
 # Checkout fingerprint the __pycache__ tree was last validated against
