@@ -199,6 +199,7 @@ class HostSupervisor:
         rpc_sink: Callable[[dict], None] | None = None,
         respawn_max: int = 3,
         heartbeat_secs: int = 15,
+        stdout_drain_timeout: float = 5.0,
         expected_build_sha: str | None = None,
         expected_hermes_home: str | None = None,
         autostart: bool = True,
@@ -210,6 +211,7 @@ class HostSupervisor:
         self.rpc_sink = rpc_sink or (lambda _obj: None)
         self.respawn_max = max(0, int(respawn_max))
         self.heartbeat_secs = max(1, int(heartbeat_secs))
+        self.stdout_drain_timeout = max(0.0, float(stdout_drain_timeout))
         self.expected_build_sha = expected_build_sha if expected_build_sha is not None else _build_sha()
         self.expected_hermes_home = expected_hermes_home if expected_hermes_home is not None else str(get_hermes_home())
 
@@ -810,12 +812,17 @@ class HostSupervisor:
         code = proc.wait()
         # A child can flush its terminal response immediately before exit. Let
         # that process' stdout reader claim completed requests before synthesizing
-        # crash errors for whatever remains unresolved. This is deliberately an
-        # unbounded join: frame handling is ordered, and the production websocket
-        # sink has its own bounded write timeout; timing out here can overtake a
-        # terminal ack queued behind a slow event and falsely fail the request.
+        # crash errors for whatever remains unresolved. Bound the drain because
+        # a descendant can inherit the host's stdout descriptor and keep the pipe
+        # open after the host exits; that must not suppress request failure and
+        # respawn forever.
         if stdout_thread is not None and stdout_thread is not threading.current_thread():
-            stdout_thread.join()
+            stdout_thread.join(timeout=self.stdout_drain_timeout)
+            if stdout_thread.is_alive():
+                logger.warning(
+                    "compute host stdout did not drain within %.1fs after exit",
+                    self.stdout_drain_timeout,
+                )
 
         pending_turns: dict[str, tuple[str, Callable[[dict], None] | None]] = {}
         pending_controls: dict[str, queue.Queue[dict]] = {}

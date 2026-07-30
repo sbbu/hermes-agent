@@ -2699,37 +2699,48 @@ def _on_compute_host_turn_done(
     # Keep lifecycle identity stable through every completion side effect. A
     # force-released worker may finish after a replacement session owns the
     # same sid; it must not emit into or drain work for that replacement.
-    with _sessions_lock:
-        with session["history_lock"]:
-            if _sessions.get(sid) is not session or (
-                run_generation is not None
-                and not _run_current_locked(session, run_generation)
-            ):
-                return
-            if frame.get("session_key"):
-                session["session_key"] = str(frame.get("session_key"))
-            if frame.get("history_version") is not None:
-                try:
-                    session["history_version"] = max(
-                        int(session.get("history_version", 0)),
-                        int(frame.get("history_version") or 0),
-                    )
-                except Exception:
-                    pass
-            session["running"] = False
-            session["last_active"] = time.time()
-            _clear_inflight_turn(session)
-        if is_error:
-            message = str(frame.get("message") or "compute host turn failed")
-            _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
-        _apply_compute_host_metadata_mirror(session, frame)
-        try:
-            info = _session_info(session.get("agent"), session)
-        except TypeError:
-            info = _session_info(session.get("agent"))
-        if not frame.get("session_info_emitted"):
-            _emit("session.info", sid, info)
-        _drain_queued_prompt(rid, sid, session)
+    submit_lock = session.setdefault("compute_host_submit_lock", threading.RLock())
+    with submit_lock:
+        with _sessions_lock:
+            with session["history_lock"]:
+                if _sessions.get(sid) is not session or (
+                    run_generation is not None
+                    and not _run_current_locked(session, run_generation)
+                ):
+                    return
+                if frame.get("session_key"):
+                    session["session_key"] = str(frame.get("session_key"))
+                if frame.get("history_version") is not None:
+                    try:
+                        session["history_version"] = max(
+                            int(session.get("history_version", 0)),
+                            int(frame.get("history_version") or 0),
+                        )
+                    except Exception:
+                        pass
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+            if is_error:
+                message = str(frame.get("message") or "compute host turn failed")
+                _emit(
+                    "message.complete",
+                    sid,
+                    {"text": f"Error: {message}", "status": "error"},
+                )
+            _apply_compute_host_metadata_mirror(session, frame)
+            try:
+                info = _session_info(session.get("agent"), session)
+            except TypeError:
+                info = _session_info(session.get("agent"))
+            if not frame.get("session_info_emitted"):
+                _emit("session.info", sid, info)
+        _drain_queued_prompt(
+            rid,
+            sid,
+            session,
+            expected_generation=run_generation,
+            release_running=True,
+        )
 
 
 def _submit_prompt_to_compute_host(
@@ -2773,7 +2784,7 @@ def _submit_prompt_to_compute_host(
             run_generation=run_generation,
         )
 
-    submit_lock = session.setdefault("compute_host_submit_lock", threading.Lock())
+    submit_lock = session.setdefault("compute_host_submit_lock", threading.RLock())
     with submit_lock:
         with session["history_lock"]:
             if expected_generation is not None and (
@@ -10451,7 +10462,14 @@ def _handle_busy_submit(
     return _ok(rid, {"status": "queued"})
 
 
-def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+def _drain_queued_prompt(
+    rid,
+    sid: str,
+    session: dict,
+    *,
+    expected_generation: int | None = None,
+    release_running: bool = False,
+) -> bool:
     """Fire a queued next-turn prompt if one is waiting and the session is idle.
 
     Returns True if a queued prompt was dispatched (the caller should then skip
@@ -10461,6 +10479,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
             return False
+        if expected_generation is not None and (
+            _sessions.get(sid) is not session
+            or not _run_current_locked(session, expected_generation)
+        ):
+            return False
+        if release_running:
+            # Completion must transition to idle and claim an older queued
+            # prompt in one critical section. Otherwise a fresh submit can
+            # overtake the queue between those two operations.
+            session["running"] = False
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False

@@ -3370,7 +3370,7 @@ def _(rid, params: dict) -> dict:
         except Exception as exc:
             return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
         release_error = None
-        submit_lock = session.setdefault("compute_host_submit_lock", threading.Lock())
+        submit_lock = session.setdefault("compute_host_submit_lock", threading.RLock())
         with submit_lock:
             with session["history_lock"]:
                 was_running = bool(session.get("running"))
