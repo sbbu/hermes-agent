@@ -6957,11 +6957,6 @@ _RESPAWN_REQUEUE_EVENT_KINDS = (
     "unblocked",
     "resumed",
     "reopened",
-    "reclaimed",
-    "crashed",
-    "timed_out",
-    "stale",
-    "rate_limited",
 )
 
 

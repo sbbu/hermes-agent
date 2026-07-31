@@ -7,6 +7,7 @@ import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $activeSessionId,
   $busy,
@@ -89,6 +90,7 @@ export function useSessionStateCache({
   // cache: aliases are local to this hook and discarded whenever the active
   // gateway profile changes.
   const storedSessionIdAliasesRef = useRef(new Map<string, string>())
+  const storedSessionAliasProfileRef = useRef(normalizeProfileKey($activeGatewayProfile.get()))
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
   // Runtime id whose transcript currently occupies `$messages` — lets the
@@ -100,38 +102,54 @@ export function useSessionStateCache({
     setMutableRef(busyRef, busy)
   }, [busy, busyRef])
 
-  useOnProfileSwitch(() => storedSessionIdAliasesRef.current.clear())
+  const syncStoredSessionAliasProfile = useCallback(() => {
+    const currentProfile = normalizeProfileKey($activeGatewayProfile.get())
 
-  const resolveStoredSessionId = useCallback((storedSessionId: string): string => {
-    const aliases = storedSessionIdAliasesRef.current
-    const visited: string[] = []
-    const seen = new Set<string>()
-    let current = storedSessionId
-
-    while (true) {
-      if (seen.has(current)) {
-        // Corrupt/cyclic lineage must fail closed to the original route rather
-        // than redirecting it unpredictably.
-        return storedSessionId
-      }
-
-      seen.add(current)
-      const next = aliases.get(current)
-
-      if (!next || next === current) {
-        break
-      }
-
-      visited.push(current)
-      current = next
+    if (storedSessionAliasProfileRef.current !== currentProfile) {
+      storedSessionIdAliasesRef.current.clear()
+      storedSessionAliasProfileRef.current = currentProfile
     }
-
-    for (const alias of visited) {
-      aliases.set(alias, current)
-    }
-
-    return current
   }, [])
+
+  useOnProfileSwitch(syncStoredSessionAliasProfile)
+
+  const resolveStoredSessionId = useCallback(
+    (storedSessionId: string): string => {
+      // Profile-switch callbacks are passive effects. Route canonicalization can
+      // run earlier in the same commit, so fence aliases synchronously at read
+      // time as well; old compression lineage must not redirect the new profile.
+      syncStoredSessionAliasProfile()
+      const aliases = storedSessionIdAliasesRef.current
+      const visited: string[] = []
+      const seen = new Set<string>()
+      let current = storedSessionId
+
+      while (true) {
+        if (seen.has(current)) {
+          // Corrupt/cyclic lineage must fail closed to the original route rather
+          // than redirecting it unpredictably.
+          return storedSessionId
+        }
+
+        seen.add(current)
+        const next = aliases.get(current)
+
+        if (!next || next === current) {
+          break
+        }
+
+        visited.push(current)
+        current = next
+      }
+
+      for (const alias of visited) {
+        aliases.set(alias, current)
+      }
+
+      return current
+    },
+    [syncStoredSessionAliasProfile]
+  )
 
   const ensureSessionState = useCallback((sessionId: string, storedSessionId?: string | null) => {
     const existing = sessionStateByRuntimeIdRef.current.get(sessionId)
@@ -160,6 +178,7 @@ export function useSessionStateCache({
           // A rotation event needs a real next id — a null/cleared stored id
           // is a detach, not a rotation the route-follow effect should chase.
           if (storedSessionId) {
+            syncStoredSessionAliasProfile()
             storedSessionIdAliasesRef.current.set(existing.storedSessionId, storedSessionId)
 
             if (sessionId === $activeSessionId.get()) {
@@ -188,7 +207,7 @@ export function useSessionStateCache({
     }
 
     return created
-  }, [])
+  }, [syncStoredSessionAliasProfile])
 
   const resetViewSync = useCallback(() => {
     // Drop any RAF-pending transcript stage so a backgrounded turn cannot
