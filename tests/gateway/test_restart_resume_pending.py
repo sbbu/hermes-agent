@@ -907,6 +907,43 @@ async def test_startup_auto_resume_skips_when_no_unfinished_tool_work():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_rechecks_unfinished_work_at_dispatch():
+    """A turn completed after scheduling must not receive synthetic filler."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="finished-during-startup")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:finished-during-startup",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner.session_store.load_transcript = MagicMock(
+        side_effect=[
+            _unfinished_history(),
+            [
+                {"role": "user", "content": "work", "timestamp": time.time() - 2},
+                {"role": "assistant", "content": "done", "timestamp": time.time() - 1},
+            ],
+        ]
+    )
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    assert runner.session_store.load_transcript.call_count == 2
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_skips_stale_entries():
     """Entries older than the freshness window must not be auto-resumed."""
     runner, adapter = make_restart_runner()

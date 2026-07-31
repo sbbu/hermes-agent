@@ -854,6 +854,24 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+@pytest.mark.parametrize(
+    "automatic_kind", ["reclaimed", "crashed", "timed_out", "stale", "rate_limited"]
+)
+def test_respawn_guard_active_pr_is_not_bypassed_by_automatic_failure_event(
+    kanban_home, automatic_kind
+):
+    """Only intentional requeues may override proof that a worker opened a PR."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr-and-failed", assignee="alice")
+        kb.add_comment(conn, t, "worker", "PR: https://github.com/acme/repo/pull/42")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, ?, ?)",
+            (t, automatic_kind, int(time.time()) + 1),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
