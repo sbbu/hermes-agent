@@ -222,7 +222,8 @@ interface GatewayEventDeps {
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
+    storedSessionId?: string | null,
+    sourceProfile?: string | null
   ) => ClientSessionState
   upsertToolCall: (
     sessionId: string,
@@ -494,7 +495,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               branch: statePatch.branch ?? state.branch,
               cwd: statePatch.cwd ?? state.cwd
             }),
-            payload?.stored_session_id || undefined
+            payload?.stored_session_id || undefined,
+            event.profile
           )
         }
 

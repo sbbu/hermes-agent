@@ -47,7 +47,8 @@ interface MessageStreamOptions {
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
+    storedSessionId?: string | null,
+    sourceProfile?: string | null
   ) => ClientSessionState
 }
 

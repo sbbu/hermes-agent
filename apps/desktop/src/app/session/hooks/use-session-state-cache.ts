@@ -151,7 +151,11 @@ export function useSessionStateCache({
     [syncStoredSessionAliasProfile]
   )
 
-  const ensureSessionState = useCallback((sessionId: string, storedSessionId?: string | null) => {
+  const ensureSessionState = useCallback((
+    sessionId: string,
+    storedSessionId?: string | null,
+    sourceProfile?: string | null
+  ) => {
     const existing = sessionStateByRuntimeIdRef.current.get(sessionId)
 
     if (existing) {
@@ -179,9 +183,18 @@ export function useSessionStateCache({
           // is a detach, not a rotation the route-follow effect should chase.
           if (storedSessionId) {
             syncStoredSessionAliasProfile()
-            storedSessionIdAliasesRef.current.set(existing.storedSessionId, storedSessionId)
+            const activeProfile = storedSessionAliasProfileRef.current
+            const rotationBelongsToActiveProfile =
+              !sourceProfile || normalizeProfileKey(sourceProfile) === activeProfile
 
-            if (sessionId === $activeSessionId.get()) {
+            // Gateway events can already be queued when the renderer switches
+            // profiles. Never attribute a late old-profile compression rotation
+            // to the newly active profile's route lineage.
+            if (rotationBelongsToActiveProfile) {
+              storedSessionIdAliasesRef.current.set(existing.storedSessionId, storedSessionId)
+            }
+
+            if (rotationBelongsToActiveProfile && sessionId === $activeSessionId.get()) {
               setActiveSessionStoredIdRotation({
                 nextStoredSessionId: storedSessionId,
                 previousStoredSessionId: existing.storedSessionId,
@@ -342,9 +355,10 @@ export function useSessionStateCache({
     (
       sessionId: string,
       updater: (state: ClientSessionState) => ClientSessionState,
-      storedSessionId?: string | null
+      storedSessionId?: string | null,
+      sourceProfile?: string | null
     ) => {
-      const previous = ensureSessionState(sessionId, storedSessionId)
+      const previous = ensureSessionState(sessionId, storedSessionId, sourceProfile)
       // Give the updater the raw previous state so it can return the same
       // reference when nothing changed (the caller sees a no-op). Previously
       // the param was always a fresh spread, so every call looked like a
