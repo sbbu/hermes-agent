@@ -377,9 +377,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         while True:
             event = await self._message_queue.get()
             try:
-                task = asyncio.create_task(self.handle_message(event))
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                self._schedule_message(event)
             except Exception:
                 logger.exception("[WecomCallback] Failed to enqueue event")
 
