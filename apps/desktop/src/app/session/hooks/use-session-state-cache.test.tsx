@@ -145,6 +145,23 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
 
     expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-A')
   })
+
+  it('does not repopulate aliases from a late event for the previous profile', () => {
+    let cache!: Cache
+
+    $activeGatewayProfile.set('profile-a')
+    render(
+      <Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="stored-A" />
+    )
+    act(() => {
+      cache.updateSessionState('runtime-A', state => state, 'stored-A', 'profile-a')
+      $activeGatewayProfile.set('profile-b')
+      cache.updateSessionState('runtime-A', state => state, 'stored-A-next', 'profile-a')
+    })
+
+    expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-A')
+    expect($activeSessionStoredIdRotation.get()).toBeNull()
+  })
 })
 
 function Harness({ activeSessionId, onReady, selectedStoredSessionId }: HarnessProps) {

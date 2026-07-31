@@ -3153,6 +3153,7 @@ class BasePlatformAdapter(ABC):
         # corrected thread_id or None to leave the source untouched.
         self._topic_recovery_fn: Optional[Callable[[Any], Optional[str]]] = None
         self._running = False
+        self._active_message_dispatches = 0
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
         self._fatal_error_retryable = True
@@ -3199,6 +3200,9 @@ class BasePlatformAdapter(ABC):
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
+        # Tasks scheduled by fire-and-forget platform callbacks before their
+        # handle_message coroutine gets its first event-loop turn.
+        self._scheduled_message_tasks: set[asyncio.Task] = set()
         # One-shot callbacks to fire after the main response is delivered.
         # Keyed by session_key. Values are either a bare callback (legacy) or
         # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
@@ -6211,7 +6215,39 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def active_message_work_count(self) -> int:
+        """Inbound dispatch/setup plus owned session tasks not yet finished."""
+        tasks = {
+            task
+            for task in (*self._scheduled_message_tasks, *self._session_tasks.values())
+            if not task.done()
+        }
+        return max(0, int(self._active_message_dispatches)) + len(tasks)
+
+    def _schedule_message(self, event: MessageEvent) -> asyncio.Task:
+        """Schedule and synchronously register fire-and-forget inbound work."""
+        task = asyncio.create_task(self.handle_message(event))
+        self._scheduled_message_tasks.add(task)
+        self._background_tasks.add(task)
+
+        def _discard(completed: asyncio.Task) -> None:
+            self._scheduled_message_tasks.discard(completed)
+            self._background_tasks.discard(completed)
+
+        task.add_done_callback(_discard)
+        return task
+
     async def handle_message(self, event: MessageEvent) -> None:
+        """Track inbound work before the first await for restart drain."""
+        self._active_message_dispatches += 1
+        try:
+            await self._handle_message_impl(event)
+        finally:
+            self._active_message_dispatches = max(
+                0, self._active_message_dispatches - 1
+            )
+
+    async def _handle_message_impl(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
         

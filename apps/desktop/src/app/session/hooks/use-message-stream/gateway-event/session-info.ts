@@ -259,7 +259,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
           branch: statePatch.branch ?? state.branch,
           cwd: statePatch.cwd ?? state.cwd
         }),
-        payload?.stored_session_id || undefined
+        payload?.stored_session_id || undefined,
+        event.profile
       )
     }
 

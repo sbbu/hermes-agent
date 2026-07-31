@@ -971,9 +971,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
-        task = asyncio.create_task(self.handle_message(event))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._schedule_message(event)
 
         return web.json_response(
             {

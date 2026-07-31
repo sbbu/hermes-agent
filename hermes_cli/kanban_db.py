@@ -7247,7 +7247,7 @@ def _regate_dependents_for_reopen(
     """Demote dispatchable children, refusing to invalidate progressed work."""
     progressed = conn.execute(
         "SELECT 1 FROM task_links l JOIN tasks c ON c.id = l.child_id "
-        "WHERE l.parent_id = ? AND c.status IN ('running', 'done', 'archived') LIMIT 1",
+        "WHERE l.parent_id = ? AND c.status IN ('review', 'running', 'done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone()
     if progressed is not None:

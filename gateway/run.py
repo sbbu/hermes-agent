@@ -7043,6 +7043,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
     _exit_code: Optional[int] = None
     _draining: bool = False
+    _inflight_message_handlers: int = 0
     _external_drain_active: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
@@ -7223,6 +7224,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._exit_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
         self._draining = False
+        self._inflight_message_handlers = 0
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
         # External (NAS-driven) drain state — distinct from the shutdown
@@ -8913,6 +8915,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """All agent work the gateway must expose and drain as one total."""
         return (
             self._running_agent_count()
+            + max(0, int(getattr(self, "_inflight_message_handlers", 0)))
+            + self._active_platform_message_work_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + (
@@ -8921,6 +8925,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else 0
             )
         )
+
+    def _active_platform_message_work_count(self) -> int:
+        """Count adapter-owned inbound setup and session tasks during drain."""
+        adapters = list(getattr(self, "adapters", {}).values())
+        for profile_map in getattr(self, "_profile_adapters", {}).values():
+            adapters.extend(profile_map.values())
+        seen: set[int] = set()
+        total = 0
+        for adapter in adapters:
+            identity = id(adapter)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            helper = getattr(adapter, "active_message_work_count", None)
+            if callable(helper):
+                try:
+                    value = helper()
+                    if isinstance(value, int):
+                        total += max(0, value)
+                except Exception:
+                    logger.debug("Adapter active-work count failed", exc_info=True)
+        return total
 
     def _pending_message_count(self) -> int:
         """Count queued inbound turns across primary and multiplex adapters."""
@@ -9363,6 +9389,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._update_runtime_status("draining")
         last_log_at = 0.0
         first = True
+        timeout = max(0.0, float(self._restart_drain_timeout))
+        deadline = time.monotonic() + timeout
         while True:
             active_work = self._active_work_count()
             if active_work == 0:
@@ -9373,6 +9401,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             now = time.monotonic()
+            if now >= deadline:
+                logger.warning(
+                    "Gateway shutdown/restart safe-point wait timed out after %.1fs "
+                    "with %d active work item(s); continuing into bounded stop cleanup",
+                    timeout,
+                    active_work,
+                )
+                return
+
             if first or now - last_log_at >= 30.0:
                 logger.info(
                     "Gateway shutdown/restart waiting for safe point: "
@@ -17626,6 +17663,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """Track the full inbound pipeline so restart drain cannot outrun setup."""
+        self._inflight_message_handlers = (
+            max(0, int(getattr(self, "_inflight_message_handlers", 0))) + 1
+        )
+        try:
+            return await self._handle_message_impl(event)
+        finally:
+            self._inflight_message_handlers = max(
+                0,
+                int(getattr(self, "_inflight_message_handlers", 1)) - 1,
+            )
+
+    async def _handle_message_impl(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         

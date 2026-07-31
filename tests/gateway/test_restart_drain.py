@@ -1,6 +1,7 @@
 import asyncio
 import shutil
 import subprocess
+import threading
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -338,6 +339,76 @@ async def test_wait_for_restart_safe_point_waits_for_all_gateway_work(monkeypatc
     await asyncio.wait_for(runner._wait_for_restart_safe_point(), timeout=1)
 
     assert runner._draining is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_restart_safe_point_waits_for_inbound_handler_setup(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    runner._inflight_message_handlers = 1
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", fast_sleep)
+
+    async def finish_setup():
+        await real_sleep(0)
+        runner._inflight_message_handlers = 0
+
+    asyncio.create_task(finish_setup())
+    await asyncio.wait_for(runner._wait_for_restart_safe_point(), timeout=1)
+
+    assert runner._draining is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_restart_safe_point_is_bounded_when_work_never_finishes():
+    runner, _adapter = make_restart_runner()
+    runner._restart_drain_timeout = 0.0
+    runner._inflight_message_handlers = 1
+
+    await asyncio.wait_for(runner._wait_for_restart_safe_point(), timeout=0.1)
+
+    assert runner._draining is True
+    assert runner._inflight_message_handlers == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_drain_counts_adapter_work_before_topic_recovery_finishes():
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 1.0
+    recovery_started = threading.Event()
+    release_recovery = threading.Event()
+
+    def delayed_recovery(_source):
+        recovery_started.set()
+        assert release_recovery.wait(timeout=1)
+        return None
+
+    adapter.set_topic_recovery_fn(delayed_recovery)
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=make_restart_source("pre-registration"),
+        message_id="pre-registration-1",
+    )
+
+    dispatch = adapter._schedule_message(event)
+    # Registration is synchronous with create_task(), before handle_message gets
+    # its first event-loop turn.
+    assert runner._active_work_count() > 0
+    assert await asyncio.to_thread(recovery_started.wait, 1)
+    assert runner._active_work_count() > 0
+
+    drain = asyncio.create_task(runner._wait_for_restart_safe_point())
+    await asyncio.sleep(0)
+    assert not drain.done()
+
+    release_recovery.set()
+    await dispatch
+    await asyncio.wait_for(drain, timeout=2)
 
 
 @pytest.mark.asyncio

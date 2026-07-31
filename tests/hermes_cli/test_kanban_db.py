@@ -394,6 +394,19 @@ def test_reopening_done_refuses_after_a_dependent_started(kanban_home):
         assert kb.get_task(conn, parent).status == "done"
 
 
+def test_reopening_done_refuses_after_a_dependent_reached_review(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="workflow stage")
+        child = kb.create_task(conn, title="dependent", parents=[parent])
+        assert kb.complete_task(conn, parent)
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (child,))
+
+        assert kb.wait_task(conn, parent, reason="too late") is False
+        assert kb.resume_task(conn, parent, reopen=True) is False
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status == "review"
+
+
 def test_resume_done_requires_explicit_reopen_and_preserves_runs(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="retry stage", assignee="builder")
