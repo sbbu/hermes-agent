@@ -3382,7 +3382,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 pass
             with _sessions_lock:
                 if sid in _sessions:
-                    _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+                    _replace_notification_poller_locked(sid, _sessions[sid])
             _notify_session_boundary("on_session_reset", key, _session_source(current))
 
             info = _session_info(agent, current)
@@ -9315,7 +9315,7 @@ def _init_session(
     _wire_callbacks(sid)
     with _sessions_lock:
         if sid in _sessions:
-            _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+            _replace_notification_poller_locked(sid, _sessions[sid])
     _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
@@ -12959,6 +12959,20 @@ def _start_usage_ticker(
     thread = _RealThread(target=_loop, daemon=True)
     thread.start()
     return stop, thread
+
+
+def _replace_notification_poller_locked(sid: str, session: dict) -> None:
+    """Install one poller for a session, retiring any prior generation.
+
+    Callers hold ``_sessions_lock``. Rebuild/resume paths can wire the same
+    retained session more than once; overwriting ``_notif_stop`` without setting
+    the old event leaks a daemon poller which keeps consuming the process-wide
+    completion queue after its session generation has been replaced.
+    """
+    previous = session.get("_notif_stop")
+    if previous is not None:
+        previous.set()
+    session["_notif_stop"] = _start_notification_poller(sid, session)
 
 
 def _dispatch_claimed_prompt(

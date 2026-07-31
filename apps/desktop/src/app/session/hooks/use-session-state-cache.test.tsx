@@ -124,6 +124,27 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
 
     expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-A')
   })
+
+  it('fences stale aliases synchronously even before profile-switch effects', () => {
+    let cache!: Cache
+
+    $activeGatewayProfile.set('profile-a')
+    const view = render(
+      <Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="stored-A" />
+    )
+    act(() => {
+      cache.updateSessionState('runtime-A', state => state, 'stored-A')
+      cache.updateSessionState('runtime-A', state => state, 'stored-B')
+    })
+    expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-B')
+
+    // Unsubscribe the profile-switch effect while retaining the resolver. This
+    // isolates its synchronous profile fence from the normal callback cleanup.
+    view.unmount()
+    $activeGatewayProfile.set('profile-b')
+
+    expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-A')
+  })
 })
 
 function Harness({ activeSessionId, onReady, selectedStoredSessionId }: HarnessProps) {

@@ -12227,6 +12227,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         returns.
         """
         try:
+            # The transcript may finish persisting after the startup scheduler's
+            # snapshot but before this task reaches the adapter. Re-check at the
+            # dispatch boundary so a completed turn cannot receive a synthetic
+            # "session restored" user turn. Missing entries remain tolerated for
+            # legacy/direct callers; scheduled startup resumes always have one.
+            try:
+                entry = self.session_store._entries.get(session_key)
+            except Exception:
+                entry = None
+            if entry is not None:
+                try:
+                    history = self.session_store.load_transcript(entry.session_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping startup auto-resume for %s: transcript re-check failed: %s",
+                        session_key,
+                        exc,
+                    )
+                    return
+                if not _history_has_unfinished_gateway_work(history):
+                    logger.info(
+                        "Skipping startup auto-resume for %s: interrupted work completed before dispatch",
+                        session_key,
+                    )
+                    return
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None

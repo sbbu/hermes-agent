@@ -6736,6 +6736,23 @@ class _StopAfterOneNotificationPoll:
         return self._checks > 1
 
 
+def test_replacing_notification_poller_stops_previous_generation(monkeypatch):
+    previous = threading.Event()
+    replacement = threading.Event()
+    session = {"_notif_stop": previous}
+
+    monkeypatch.setattr(
+        server,
+        "_start_notification_poller",
+        lambda sid, selected: replacement,
+    )
+
+    server._replace_notification_poller_locked("sid-rebuilt", session)
+
+    assert previous.is_set()
+    assert session["_notif_stop"] is replacement
+
+
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch,
 ):

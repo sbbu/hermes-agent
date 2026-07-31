@@ -5678,7 +5678,11 @@ def launchd_start():
 
 def launchd_stop():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    # Stop the domain that actually owns the loaded job. Profile/SSH/background
+    # callers can resolve a different default domain than the GUI session which
+    # loaded the LaunchAgent; booting out the wrong domain leaves KeepAlive in
+    # force and the PID wait can never observe a durable stop.
+    target = _launchd_loaded_target(label)
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
 
