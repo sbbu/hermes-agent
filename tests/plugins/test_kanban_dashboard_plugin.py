@@ -261,6 +261,47 @@ def test_reopening_parent_demotes_ready_child(client):
     assert child_after_reopen["status"] == "todo"
 
 
+def test_reopening_parent_rejects_progressed_child(client):
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "c", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "done"}
+    ).status_code == 200
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (child["id"],))
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "ready"}
+    )
+
+    assert response.status_code == 409
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{parent['id']}"
+    ).json()["task"]["status"] == "done"
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{child['id']}"
+    ).json()["task"]["status"] == "review"
+
+
+def test_dashboard_rejects_archived_reopen(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "archived"}
+    ).status_code == 200
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"}
+    )
+
+    assert response.status_code == 409
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()["task"]["status"] == "archived"
+
+
 # ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
