@@ -12448,6 +12448,14 @@ def _notification_poller_loop(
         except Exception:
             continue
 
+        # Poller replacement uses the same stop signal as final shutdown, but
+        # the pending queue belongs to the replacement generation. A retired
+        # poller may have been blocked in get() when replacement happened; hand
+        # that event back instead of racing the new poller to dispatch it.
+        if getattr(stop_event, "_hermes_skip_pending_drain", False):
+            process_registry.completion_queue.put(evt)
+            return
+
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
         # process started in session A would surface its completion in whichever
@@ -12555,15 +12563,26 @@ def _notification_poller_loop(
             )
             time.sleep(0.25)
 
+    # A replacement poller owns pending events. Final-shutdown callers retain
+    # the legacy drain behavior below.
+    if getattr(stop_event, "_hermes_skip_pending_drain", False):
+        return
+
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
     # Orphaned events (owner gone) are dropped — same guard as the main loop.
     deferred: list = []
-    while not process_registry.completion_queue.empty():
+    while (
+        not getattr(stop_event, "_hermes_skip_pending_drain", False)
+        and not process_registry.completion_queue.empty()
+    ):
         try:
             evt = process_registry.completion_queue.get_nowait()
         except Exception:
+            break
+        if getattr(stop_event, "_hermes_skip_pending_drain", False):
+            process_registry.completion_queue.put(evt)
             break
         if _notification_event_belongs_elsewhere(sid, session, evt):
             deferred.append(evt)
@@ -12971,6 +12990,10 @@ def _replace_notification_poller_locked(sid: str, session: dict) -> None:
     """
     previous = session.get("_notif_stop")
     if previous is not None:
+        # A normal stop drains pending completion events. During replacement
+        # those events belong to the new poller; mark the old generation before
+        # waking it so it exits without competing for the shared queue.
+        setattr(previous, "_hermes_skip_pending_drain", True)
         previous.set()
     session["_notif_stop"] = _start_notification_poller(sid, session)
 

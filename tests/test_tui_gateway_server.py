@@ -6753,6 +6753,61 @@ def test_replacing_notification_poller_stops_previous_generation(monkeypatch):
     assert session["_notif_stop"] is replacement
 
 
+def test_replaced_notification_poller_leaves_pending_events_for_replacement(monkeypatch):
+    """Retiring a poller must not make its shutdown drain race the new poller."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    previous = threading.Event()
+    replacement = threading.Event()
+    delivered = []
+    emitted = []
+    session = _session(
+        session_key="session-replaced-poller",
+        _notif_stop=previous,
+    )
+    event = {
+        "type": "completion",
+        "session_id": "proc-replaced-poller",
+        "session_key": "session-replaced-poller",
+        "command": "echo replacement owns this",
+        "exit_code": 0,
+        "output": "replacement owns this",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, text: delivered.append(text),
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_notification_poller",
+        lambda _sid, _session: replacement,
+    )
+    server._sessions["sid-replaced-poller"] = session
+    process_registry._completion_consumed.discard(event["session_id"])
+
+    try:
+        server._replace_notification_poller_locked("sid-replaced-poller", session)
+        server._notification_poller_loop(previous, "sid-replaced-poller", session)
+
+        assert delivered == []
+        assert emitted == []
+        assert isolated_queue.qsize() == 1
+        assert isolated_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("sid-replaced-poller", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch,
 ):
