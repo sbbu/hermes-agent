@@ -11079,7 +11079,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, timeout: float, cron_timeout: Optional[float] = None
     ) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
-        last_active_count = self._running_agent_count()
+        def _stop_active_work_count() -> int:
+            # Match the non-queued work admitted by _active_work_count(). The
+            # restart queue itself survives restart, but handlers and adapter
+            # setup tasks must finish before adapters are torn down.
+            return (
+                self._running_agent_count()
+                + max(0, int(getattr(self, "_inflight_message_handlers", 0)))
+                + self._active_platform_message_work_count()
+                + self._active_cron_job_count()
+                + self._active_api_run_count()
+            )
+
+        last_active_count = _stop_active_work_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
         last_status_at = 0.0
@@ -11087,7 +11099,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
             now = asyncio.get_running_loop().time()
-            active_count = self._running_agent_count()
+            active_count = _stop_active_work_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
             if (
@@ -11109,7 +11121,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if last_active_count == 0:
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -11129,11 +11141,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def _still_draining() -> bool:
             now = loop.time()
-            if (
-                len(self._running_agents) or self._active_api_run_count()
-            ) and now < deadline:
+            cron_count = self._active_cron_job_count()
+            non_cron_count = max(0, _stop_active_work_count() - cron_count)
+            if non_cron_count and now < deadline:
                 return True
-            return bool(self._active_cron_job_count()) and now < cron_deadline
+            return bool(cron_count) and now < cron_deadline
 
         # Both budgets at 0 leave this loop unentered, which is the legacy
         # "interrupt immediately" behaviour — expressed as an expired
@@ -11142,11 +11154,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         while _still_draining():
             _maybe_update_status()
             await asyncio.sleep(0.1)
-        timed_out = (
-            bool(len(self._running_agents))
-            or bool(self._active_cron_job_count())
-            or bool(self._active_api_run_count())
-        )
+        timed_out = bool(_stop_active_work_count())
         _maybe_update_status(force=True)
         return snapshot, timed_out
 

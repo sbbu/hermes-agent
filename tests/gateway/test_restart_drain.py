@@ -376,6 +376,33 @@ async def test_wait_for_restart_safe_point_is_bounded_when_work_never_finishes()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("work_kind", ["handler", "adapter"])
+async def test_stop_phase_waits_for_pre_dispatch_message_work(monkeypatch, work_kind):
+    runner, _adapter = make_restart_runner()
+    remaining = [1]
+    if work_kind == "handler":
+        runner._inflight_message_handlers = 1
+    else:
+        monkeypatch.setattr(
+            runner, "_active_platform_message_work_count", lambda: remaining[0]
+        )
+
+    async def finish_work():
+        await asyncio.sleep(0.02)
+        if work_kind == "handler":
+            runner._inflight_message_handlers = 0
+        else:
+            remaining[0] = 0
+
+    task = asyncio.create_task(finish_work())
+    _snapshot, timed_out = await runner._drain_active_agents(1.0)
+    await task
+
+    assert _snapshot == {}
+    assert timed_out is False
+
+
+@pytest.mark.asyncio
 async def test_restart_drain_counts_adapter_work_before_topic_recovery_finishes():
     runner, adapter = make_restart_runner()
     runner._restart_drain_timeout = 1.0

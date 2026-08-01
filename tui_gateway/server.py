@@ -2762,15 +2762,40 @@ def _submit_prompt_to_compute_host(
         frame_params = {}
     frame_kwargs: dict[str, Any] = {}
     if "image_paths" in frame_params:
-        frame_kwargs["image_paths"] = image_paths
+        if image_paths is None:
+            # Claim exactly the images represented by this frame. Clearing the
+            # live list after dispatch would erase attachments appended while
+            # the pipe write was in flight.
+            with session["history_lock"]:
+                claimed_images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            frame_kwargs["image_paths"] = claimed_images
+        else:
+            claimed_images = []
+            frame_kwargs["image_paths"] = image_paths
+    else:
+        claimed_images = []
     if "queued_prompt_generation" in frame_params:
         frame_kwargs["queued_prompt_generation"] = queued_prompt_generation
     if "display_kind" in frame_params:
         frame_kwargs["display_kind"] = display_kind
-    frame = frame_builder(rid, sid, session, text, **frame_kwargs)
+    try:
+        frame = frame_builder(rid, sid, session, text, **frame_kwargs)
+    except Exception:
+        if claimed_images:
+            with session["history_lock"]:
+                session["attached_images"] = claimed_images + list(
+                    session.get("attached_images", [])
+                )
+        raise
     try:
         supervisor = _get_compute_host_supervisor(cfg)
     except Exception as exc:
+        if claimed_images:
+            with session["history_lock"]:
+                session["attached_images"] = claimed_images + list(
+                    session.get("attached_images", [])
+                )
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
 
     def _complete(done: dict) -> None:
@@ -2803,11 +2828,14 @@ def _submit_prompt_to_compute_host(
             # the transport callback boundary.
             supervisor.submit_turn(frame, on_complete=_complete)
         except Exception as exc:
+            if claimed_images:
+                with session["history_lock"]:
+                    session["attached_images"] = claimed_images + list(
+                        session.get("attached_images", [])
+                    )
             return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
         with session["history_lock"]:
             session["_compute_host_active"] = True
-            if image_paths is None:
-                session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 

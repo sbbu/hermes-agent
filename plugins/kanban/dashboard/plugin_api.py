@@ -149,7 +149,7 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "waiting", "ready", "running", "blocked", "review", "done",
 ]
 
 
@@ -1174,6 +1174,16 @@ def _set_status_direct(
             prev["status"] in {"done", "archived"}
             and effective_status not in {"done", "archived"}
         )
+        if reopening_satisfied_parent:
+            # Archived is terminal for notifier subscriptions; reopening it
+            # here would create an active task with no notification route.
+            if prev["status"] == "archived":
+                return False
+            # A completed parent cannot be reopened beneath progressed work.
+            # Route the dashboard's direct drag path through the same guard as
+            # resume_task()/wait_task() before changing either parent or child.
+            if not kanban_db._regate_dependents_for_reopen(conn, task_id):
+                return False
 
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "

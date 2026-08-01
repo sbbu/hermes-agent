@@ -381,6 +381,24 @@ def test_prompt_submit_unknown_session_logs_warning(caplog):
     )
 
 
+def test_compute_host_ambient_image_claim_preserves_concurrent_attachment(monkeypatch):
+    submitted = []
+
+    class _Supervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            submitted.append(frame)
+            session["attached_images"].append("/tmp/c.png")
+
+    session = _session(attached_images=["/tmp/b.png"])
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    response = server._submit_prompt_to_compute_host("r1", "sid", session, "B")
+
+    assert response["result"]["status"] == "streaming"
+    assert submitted[0]["attached_images"] == ["/tmp/b.png"]
+    assert session["attached_images"] == ["/tmp/c.png"]
+
+
 def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
     class _BrokenSupervisor:
         def submit_turn(self, frame, *, on_complete=None):
