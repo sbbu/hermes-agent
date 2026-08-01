@@ -1597,7 +1597,10 @@ class CredentialPool:
                 else:
                     return
 
-                global_root = _global_auth_file_path()
+                # Resolve dynamically so profile/root ownership follows the
+                # active auth backend (and test/profile overrides), rather than
+                # a function object captured when this module was imported.
+                global_root = auth_mod._global_auth_file_path()
                 is_from_root = bool(
                     source_path is not None
                     and global_root is not None

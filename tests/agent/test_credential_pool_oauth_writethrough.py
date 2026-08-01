@@ -103,13 +103,11 @@ def test_pool_refresh_writes_through_to_root_when_profile_reads_root(
         _entry(provider, id="e1", access_token="new-access", refresh_token="new-refresh")
     )
 
-    # Profile got the rotated chain (existing behavior).
+    # The profile remains unshadowed and continues reading the canonical root.
     profile = _read_store(profile_path)
-    assert (
-        profile["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
-    )
+    assert provider not in profile["providers"]
 
-    # AND the global root no longer holds the revoked refresh token (#48415).
+    # The global root no longer holds the revoked refresh token (#48415).
     root = _read_store(root_path)
     assert root["providers"][provider]["tokens"]["access_token"] == "new-access"
     assert root["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"

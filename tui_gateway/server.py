@@ -2755,15 +2755,19 @@ def _submit_prompt_to_compute_host(
     expected_generation: int | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
-    frame = _compute_host_turn_frame(
-        rid,
-        sid,
-        session,
-        text,
-        image_paths=image_paths,
-        queued_prompt_generation=queued_prompt_generation,
-        display_kind=display_kind,
-    )
+    frame_builder = _compute_host_turn_frame
+    try:
+        frame_params = inspect.signature(frame_builder).parameters
+    except (TypeError, ValueError):
+        frame_params = {}
+    frame_kwargs: dict[str, Any] = {}
+    if "image_paths" in frame_params:
+        frame_kwargs["image_paths"] = image_paths
+    if "queued_prompt_generation" in frame_params:
+        frame_kwargs["queued_prompt_generation"] = queued_prompt_generation
+    if "display_kind" in frame_params:
+        frame_kwargs["display_kind"] = display_kind
+    frame = frame_builder(rid, sid, session, text, **frame_kwargs)
     try:
         supervisor = _get_compute_host_supervisor(cfg)
     except Exception as exc:
