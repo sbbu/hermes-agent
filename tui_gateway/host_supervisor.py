@@ -533,8 +533,11 @@ class HostSupervisor:
             raise RuntimeError("compute host respawn disabled after crash loop")
         self._hello_event.clear()
         self._hello = {}
+        # The helper already starts from os.environ. Do not merge the raw parent
+        # environment back afterward: that would undo its Tier-1 credential and
+        # cross-session stripping while the model-driving host still keeps the
+        # provider credentials it legitimately needs.
         env = hermes_subprocess_env(inherit_credentials=True)
-        env.update(os.environ)
         if self.env:
             env.update(self.env)
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
