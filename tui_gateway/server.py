@@ -23,6 +23,7 @@ from agent.secret_scope import (
     reset_secret_scope,
     set_secret_scope,
 )
+from agent.interrupt_compat import request_hard_interrupt
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
     INDICATOR_STYLES,
@@ -3548,11 +3549,12 @@ def _quiesce_abandoned_agent(agent: Any, reason: str) -> None:
     if agent is None:
         return
     try:
-        if hasattr(agent, "interrupt"):
-            try:
-                agent.interrupt(reason)
-            except TypeError:
-                agent.interrupt()
+        try:
+            request_hard_interrupt(agent, reason)
+        except TypeError:
+            # Legacy/test-double interrupt ABIs may not accept a reason while
+            # still requiring the explicit hard-interrupt compatibility path.
+            request_hard_interrupt(agent)
     except Exception:
         pass
     # The old worker thread may be blocked inside an API call and unwind later.
