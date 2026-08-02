@@ -367,9 +367,19 @@ class ComputeHost:
 
     def _handle_interrupt(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
+        hard = bool(frame.get("hard", True))
+
+        def interrupt(agent: Any) -> None:
+            if hard:
+                request_hard_interrupt(agent)
+                return
+            callback = getattr(agent, "interrupt", None)
+            if callable(callback):
+                callback()
+
         spike = self._sessions.get(sid)
         if spike is not None:
-            request_hard_interrupt(spike.agent)
+            interrupt(spike.agent)
             self.emit(
                 {
                     "type": "interrupt.ack",
@@ -389,7 +399,7 @@ class ComputeHost:
                 return
             agent = session.get("agent")
             if agent is not None:
-                request_hard_interrupt(agent)
+                interrupt(agent)
             with session.get("history_lock", threading.Lock()):
                 session["_turn_cancel_requested"] = True
                 session["queued_prompt"] = None
@@ -645,15 +655,27 @@ class ComputeHost:
         key = str(frame.get("session_key") or sid)
         session = server._sessions.get(sid)
         if session is not None:
-            session["transport"] = self._transport
-            if frame.get("cols") is not None:
-                session["cols"] = int(frame.get("cols") or 80)
-            if frame.get("cwd"):
-                session["cwd"] = str(frame.get("cwd"))
-            if frame.get("profile_home"):
-                session["profile_home"] = str(frame.get("profile_home"))
-            if isinstance(frame.get("attached_images"), list):
-                session["attached_images"] = list(frame.get("attached_images") or [])
+            with session["history_lock"]:
+                session["transport"] = self._transport
+                if frame.get("cols") is not None:
+                    session["cols"] = int(frame.get("cols") or 80)
+                if frame.get("cwd"):
+                    session["cwd"] = str(frame.get("cwd"))
+                if frame.get("profile_home"):
+                    session["profile_home"] = str(frame.get("profile_home"))
+                if isinstance(frame.get("attached_images"), list):
+                    session["attached_images"] = list(frame.get("attached_images") or [])
+                # The serving process mirrors only metadata after host-owned
+                # turns, so its ordinary history snapshot is stale and must not
+                # replace the child. A strictly newer version means a serving-
+                # side edit/regenerate truncation was persisted; apply that
+                # authoritative snapshot before the next child turn begins.
+                if isinstance(frame.get("history"), list):
+                    incoming_version = int(frame.get("history_version") or 0)
+                    current_version = int(session.get("history_version", 0) or 0)
+                    if incoming_version > current_version:
+                        session["history"] = list(frame["history"])
+                        session["history_version"] = incoming_version
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
