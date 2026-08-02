@@ -741,7 +741,11 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
-def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+def hermes_subprocess_env(
+    *,
+    inherit_credentials: bool = False,
+    extra: "Mapping[str, str] | None" = None,
+) -> dict[str, str]:
     """Build a sanitized environment dict for a spawned subprocess.
 
     Centralized helper for the **non-terminal** spawn surface (browser,
@@ -774,6 +778,10 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     ``os.environ`` into the returned dict.
     """
     env = os.environ.copy()
+    if extra:
+        # Merge before scrubbing so explicit caller overrides cannot reintroduce
+        # Tier-1 or Hermes-internal secrets after the safety boundary.
+        env.update(extra)
 
     # Tier 1 — always strip.
     for key in _ALWAYS_STRIP_KEYS:

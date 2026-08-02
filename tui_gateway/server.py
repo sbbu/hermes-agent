@@ -10388,7 +10388,9 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
             if use_agent:
                 agent.interrupt()
             else:
-                _get_compute_host_supervisor().interrupt(sid)
+                # A mid-turn redirect is cooperative: protected compression
+                # must finish rather than being rolled back like an explicit Stop.
+                _get_compute_host_supervisor().interrupt(sid, hard=False)
         except Exception:
             pass
         finally:

@@ -430,9 +430,22 @@ class HostSupervisor:
             raise
         return request_id
 
-    def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
+    def interrupt(
+        self,
+        sid: str,
+        *,
+        request_id: str | None = None,
+        hard: bool = True,
+    ) -> None:
         self.start()
-        self._send_frame({"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex})
+        self._send_frame(
+            {
+                "type": "interrupt",
+                "sid": sid,
+                "request_id": request_id or uuid.uuid4().hex,
+                "hard": hard,
+            }
+        )
 
     def force_release(
         self,
@@ -537,9 +550,10 @@ class HostSupervisor:
         # environment back afterward: that would undo its Tier-1 credential and
         # cross-session stripping while the model-driving host still keeps the
         # provider credentials it legitimately needs.
-        env = hermes_subprocess_env(inherit_credentials=True)
-        if self.env:
-            env.update(self.env)
+        env = hermes_subprocess_env(
+            inherit_credentials=True,
+            extra=self.env,
+        )
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         env.setdefault("PYTHONPATH", str(_repo_root()))
         if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):

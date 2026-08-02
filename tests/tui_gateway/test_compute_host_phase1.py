@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from tui_gateway import compute_host, server
-from tui_gateway.compute_host import ComputeHost, _default_workers
+from tui_gateway.compute_host import ComputeHost, HostSession, _default_workers
 from tui_gateway.host_supervisor import (
     MUTATOR_ROUTE_TABLE,
     HostSupervisor,
@@ -77,6 +77,10 @@ for raw in sys.stdin:
     supervisor = HostSupervisor(
         registry_path=tmp_path / "dashboard-compute-host.json",
         argv=[sys.executable, str(script), str(env_output)],
+        env={
+            "GH_TOKEN": "tier1-override-must-still-be-stripped",
+            "SAFE_RUNTIME_VALUE": "safe-explicit-override",
+        },
         expected_build_sha="test",
         autostart=False,
     )
@@ -89,8 +93,58 @@ for raw in sys.stdin:
 
     assert child_env == {
         "OPENAI_API_KEY": "provider-key-required-by-host",
-        "SAFE_RUNTIME_VALUE": "keep-me",
+        "SAFE_RUNTIME_VALUE": "safe-explicit-override",
     }
+
+
+def test_busy_compute_host_interrupt_remains_cooperative():
+    calls = []
+
+    class _Agent:
+        def interrupt(self):
+            calls.append("soft")
+
+        def hard_interrupt(self):
+            calls.append("hard")
+
+    host = ComputeHost(heartbeat_secs=0)
+    host._sessions["s1"] = HostSession(sid="s1", agent=_Agent())
+    try:
+        host._handle_interrupt({"sid": "s1", "request_id": "redirect", "hard": False})
+    finally:
+        host.close()
+
+    assert calls == ["soft"]
+
+
+def test_existing_compute_host_session_applies_only_newer_authoritative_history():
+    host = ComputeHost(heartbeat_secs=0)
+    session = {
+        "history_lock": threading.Lock(),
+        "history": [{"role": "user", "content": "old tail"}],
+        "history_version": 4,
+    }
+
+    class _Server:
+        _sessions = {"s1": session}
+
+    try:
+        # Equal-version parent mirrors are metadata-only and carry stale history.
+        host._ensure_server_session(
+            _Server,
+            {"sid": "s1", "history": [], "history_version": 4},
+        )
+        assert session["history"] == [{"role": "user", "content": "old tail"}]
+
+        # Edit/regenerate increments the parent version after durable truncation.
+        host._ensure_server_session(
+            _Server,
+            {"sid": "s1", "history": [], "history_version": 5},
+        )
+        assert session["history"] == []
+        assert session["history_version"] == 5
+    finally:
+        host.close()
 
 
 def test_compute_host_frame_protocol_round_trip():
