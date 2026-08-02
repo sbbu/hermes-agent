@@ -49,6 +49,50 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
     assert _default_workers() == 8
 
 
+def test_supervisor_compute_host_env_preserves_provider_keys_but_strips_tier1(
+    tmp_path,
+    monkeypatch,
+):
+    env_output = tmp_path / "child-env.json"
+    script = tmp_path / "capture_env_host.py"
+    script.write_text(
+        """
+import json, os, sys
+keys = ['GH_TOKEN', 'TELEGRAM_BOT_TOKEN', 'OPENAI_API_KEY', 'SAFE_RUNTIME_VALUE']
+with open(sys.argv[1], 'w', encoding='utf-8') as handle:
+    json.dump({key: os.environ[key] for key in keys if key in os.environ}, handle)
+print(json.dumps({'type':'hello','host_pid':os.getpid(),'boot_id':'env-test','build_sha':'test','hermes_home':os.environ.get('HERMES_HOME','')}), flush=True)
+for raw in sys.stdin:
+    frame = json.loads(raw)
+    if frame.get('type') == 'shutdown':
+        print(json.dumps({'type':'shutdown.ack','request_id':frame.get('request_id')}), flush=True)
+        break
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GH_TOKEN", "gh-tier1-secret")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-tier1-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-key-required-by-host")
+    monkeypatch.setenv("SAFE_RUNTIME_VALUE", "keep-me")
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, str(script), str(env_output)],
+        expected_build_sha="test",
+        autostart=False,
+    )
+
+    try:
+        supervisor.start()
+        child_env = json.loads(env_output.read_text(encoding="utf-8"))
+    finally:
+        supervisor.shutdown()
+
+    assert child_env == {
+        "OPENAI_API_KEY": "provider-key-required-by-host",
+        "SAFE_RUNTIME_VALUE": "keep-me",
+    }
+
+
 def test_compute_host_frame_protocol_round_trip():
     out = io.StringIO()
     host = ComputeHost(stdout=out, max_workers=2, heartbeat_secs=0)
