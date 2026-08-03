@@ -180,7 +180,7 @@ def test_compute_host_frame_protocol_round_trip():
 def test_compute_host_future_completion_serializes_with_heartbeat_snapshot(
     monkeypatch,
 ):
-    """A completed turn must not mutate the tracked set during a snapshot."""
+    """A completed turn must not mutate the tracked map during a snapshot."""
     callback_attempted = threading.Event()
 
     class _Future:
@@ -200,7 +200,7 @@ def test_compute_host_future_completion_serializes_with_heartbeat_snapshot(
             assert self.callback is not None
             self.callback(self)
 
-    class _GuardedFutureSet(set):
+    class _GuardedFutureMap(dict):
         def __init__(self):
             super().__init__()
             self.iterating = threading.Event()
@@ -212,14 +212,14 @@ def test_compute_host_future_completion_serializes_with_heartbeat_snapshot(
             assert callback_attempted.wait(timeout=1)
             yield from iterator
 
-        def discard(self, item):
+        def pop(self, item, default=None):
             if self.iterating.is_set() and not self.iteration_done.is_set():
                 raise AssertionError("turn future mutated during heartbeat snapshot")
-            super().discard(item)
+            return super().pop(item, default)
 
     host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
     future = _Future()
-    tracked = _GuardedFutureSet()
+    tracked = _GuardedFutureMap()
     host._turn_futures = tracked
     monkeypatch.setattr(host._executor, "submit", lambda *_args, **_kwargs: future)
     snapshot_errors: list[BaseException] = []
