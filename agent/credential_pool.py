@@ -2449,15 +2449,14 @@ class CredentialPool:
         entry, pending_refresh = self._select_under_lock()
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
+            # Deferred refresh can replace the selected entry or observe a
+            # shared-owner logout/generation change. Never return the snapshot
+            # selected before that cross-process mutation; select once more
+            # from the authoritative post-refresh pool.
+            entry, _ = self._select_under_lock()
         if entry is not None:
             self._unmatched_rotation_streak = 0
             return entry
-        # If no entry was available but we just refreshed some, re-select
-        # now that the refreshed entries are back in the pool.
-        if pending_refresh:
-            entry, _ = self._select_under_lock()
-            if entry is not None:
-                self._unmatched_rotation_streak = 0
         return entry
 
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
