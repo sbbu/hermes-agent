@@ -2703,7 +2703,7 @@ class CredentialPool:
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
             if not self._persist():
-                return None
+                return None, pending_refresh
             self._current_id = entry.id
             return self._current_unlocked() or entry, pending_refresh
 
@@ -2865,7 +2865,7 @@ class CredentialPool:
                     return None
                 if not mark_failed_entries():
                     self._current_id = None
-                    return self._select_unlocked()
+                    return self._select_unlocked(refresh=False)[0]
                 if not self._persist():
                     self._current_id = None
                     return None
@@ -2920,7 +2920,7 @@ class CredentialPool:
             if not self._shared_owner_generation_is_current(
                 continue_after_reload=credential_id is None,
             ):
-                return None
+                return None, []
             if credential_id:
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id

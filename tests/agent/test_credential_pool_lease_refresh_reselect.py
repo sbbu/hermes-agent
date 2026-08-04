@@ -40,6 +40,8 @@ def _bare_pool(entries):
     pool._current_id = None
     pool._max_concurrent = 2
     pool._unmatched_rotation_streak = 0
+    pool._owner_generation = None
+    pool._owner_invalidated = False
     pool.provider = "anthropic"
     return pool
 
