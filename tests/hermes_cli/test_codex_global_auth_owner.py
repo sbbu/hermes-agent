@@ -1199,6 +1199,84 @@ def test_exhaustion_retries_after_concurrent_owner_generation_write(
     assert {entry.get("last_status") for entry in persisted} == {"exhausted"}
 
 
+def test_exhaustion_generation_race_returns_reloaded_replacement(
+    profile_and_root,
+    monkeypatch,
+):
+    profile_path, root_path = profile_and_root
+    failed = _entry()
+    replacement = _entry(
+        access="replacement-access",
+        refresh="replacement-refresh",
+        source="manual:device_code",
+    )
+    replacement.id = "replacement"
+    _write(
+        root_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {PROVIDER: [failed.to_dict()]},
+            "shared_auth_owners": {
+                PROVIDER: {"generation": 0, "deleted": False}
+            },
+        },
+    )
+    _write(profile_path, {"version": 1, "providers": {}})
+    pool = CredentialPool(PROVIDER, [failed], owner_generation=0)
+    real_persist = pool._persist
+    persist_calls = 0
+
+    def persist_after_replacement(**kwargs):
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 1:
+            assert A.write_credential_pool(
+                PROVIDER,
+                [replacement.to_dict()],
+            ) == root_path
+        return real_persist(**kwargs)
+
+    monkeypatch.setattr(pool, "_persist", persist_after_replacement)
+
+    selected = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        api_key_hint=failed.runtime_api_key,
+    )
+
+    assert selected is not None
+    assert selected.id == replacement.id
+    assert selected.last_status is None
+    assert persist_calls >= 1
+
+
+def test_round_robin_persist_race_keeps_select_return_shape(monkeypatch):
+    first = _entry()
+    second = _entry(
+        access="second-access",
+        refresh="second-refresh",
+        source="manual:device_code",
+    )
+    second.id = "second"
+    second.priority = 1
+    pool = CredentialPool(PROVIDER, [first, second])
+    pool._strategy = "round_robin"
+    monkeypatch.setattr(pool, "_persist", lambda **kwargs: False)
+
+    assert pool.select() is None
+
+
+def test_generation_fence_keeps_acquire_lease_return_shape(monkeypatch):
+    pool = CredentialPool(PROVIDER, [_entry()], owner_generation=0)
+    monkeypatch.setattr(
+        pool,
+        "_shared_owner_generation_is_current",
+        lambda **kwargs: False,
+    )
+
+    assert pool.acquire_lease() is None
+
+
 def test_refresh_generation_change_stops_iteration_over_stale_snapshot(
     profile_and_root,
     monkeypatch,
