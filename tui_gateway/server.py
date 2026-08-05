@@ -2503,6 +2503,7 @@ _ABANDONED_AGENT_CALLBACK_ATTRS = (
     "reasoning_callback",
     "clarify_callback",
     "read_terminal_callback",
+    "read_preview_callback",
     "step_callback",
     "stream_delta_callback",
     "interim_assistant_callback",
