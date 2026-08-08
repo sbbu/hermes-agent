@@ -234,6 +234,24 @@ async def test_gateway_stop_interrupts_after_drain_timeout():
     assert runner._shutdown_event.is_set() is True
 
 
+def test_shutdown_resignal_only_interrupts_late_materialized_agents():
+    runner, _adapter = make_restart_runner()
+    already_interrupted = MagicMock()
+    late_agent = MagicMock()
+    runner._running_agents = {
+        "existing": already_interrupted,
+        "late": late_agent,
+    }
+
+    runner._interrupt_running_agents(
+        "Gateway shutting down",
+        skip_agent_ids={id(already_interrupted)},
+    )
+
+    already_interrupted.interrupt.assert_not_called()
+    late_agent.interrupt.assert_called_once_with("Gateway shutting down")
+
+
 @pytest.mark.asyncio
 async def test_gateway_stop_systemd_service_restart_uses_tempfail(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)

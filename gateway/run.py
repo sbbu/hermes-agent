@@ -11158,9 +11158,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _maybe_update_status(force=True)
         return snapshot, timed_out
 
-    def _interrupt_running_agents(self, reason: str) -> None:
+    def _interrupt_running_agents(
+        self,
+        reason: str,
+        *,
+        skip_agent_ids: Optional[set[int]] = None,
+    ) -> None:
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            if skip_agent_ids is not None and id(agent) in skip_agent_ids:
                 continue
             try:
                 request_hard_interrupt(agent, reason)
@@ -15868,6 +15875,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "mark_resume_pending failed for %s: %s",
                             _sk, _e,
                         )
+                _initially_interrupted_agent_ids = {
+                    id(_agent)
+                    for _agent in self._running_agents.values()
+                    if _agent is not _AGENT_PENDING_SENTINEL
+                }
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
@@ -15893,11 +15905,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # at settle-loop exit, re-signal so a late-materializing
                 # agent gets a cooperative interrupt instead of going
                 # straight to the tool-subprocess kill.
-                if self._running_agents or self._active_api_run_count():
+                _late_running_agent = any(
+                    _agent is not _AGENT_PENDING_SENTINEL
+                    and id(_agent) not in _initially_interrupted_agent_ids
+                    for _agent in self._running_agents.values()
+                )
+                if _late_running_agent or self._active_api_run_count():
                     self._interrupt_running_agents(
                         _INTERRUPT_REASON_GATEWAY_RESTART
                         if self._restart_requested
-                        else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                        else _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
+                        skip_agent_ids=_initially_interrupted_agent_ids,
                     )
                     logger.debug(
                         "Re-signaled interrupt for work still live at settle-window exit"
