@@ -151,76 +151,76 @@ export function useSessionStateCache({
     [syncStoredSessionAliasProfile]
   )
 
-  const ensureSessionState = useCallback((
-    sessionId: string,
-    storedSessionId?: string | null,
-    sourceProfile?: string | null
-  ) => {
-    const existing = sessionStateByRuntimeIdRef.current.get(sessionId)
+  const ensureSessionState = useCallback(
+    (sessionId: string, storedSessionId?: string | null, sourceProfile?: string | null) => {
+      const existing = sessionStateByRuntimeIdRef.current.get(sessionId)
 
-    if (existing) {
-      if (storedSessionId !== undefined && storedSessionId !== existing.storedSessionId) {
-        // Stored id changed (e.g. auto-compression rotated it). Create a NEW
-        // state object rather than mutating in place — updateSessionState needs
-        // the PREVIOUS state to detect transitions (busy→idle, id rotation).
-        const updated = { ...existing, storedSessionId }
+      if (existing) {
+        if (storedSessionId !== undefined && storedSessionId !== existing.storedSessionId) {
+          // Stored id changed (e.g. auto-compression rotated it). Create a NEW
+          // state object rather than mutating in place — updateSessionState needs
+          // the PREVIOUS state to detect transitions (busy→idle, id rotation).
+          const updated = { ...existing, storedSessionId }
 
-        sessionStateByRuntimeIdRef.current.set(sessionId, updated)
+          sessionStateByRuntimeIdRef.current.set(sessionId, updated)
 
-        // Drop the obsolete stored→runtime reverse mapping as soon as the id
-        // rotates (e.g. auto-compression forks a continuation). Leaving the
-        // stale key lets getRuntimeIdForStoredSession resolve the old stored id
-        // to this runtime, which the compression route-follow logic relies on
-        // being absent. The rotation signal was previously emitted centrally
-        // from handleTransition (session-states.ts), but updateSessionState
-        // now skips publishSessionState (and thus handleTransition) when the
-        // updater is a no-op — fire it here so the route-follow effect still
-        // tracks compression without needing a dummy state write.
-        if (existing.storedSessionId && existing.storedSessionId !== storedSessionId) {
-          runtimeIdByStoredSessionIdRef.current.delete(existing.storedSessionId)
+          // Drop the obsolete stored→runtime reverse mapping as soon as the id
+          // rotates (e.g. auto-compression forks a continuation). Leaving the
+          // stale key lets getRuntimeIdForStoredSession resolve the old stored id
+          // to this runtime, which the compression route-follow logic relies on
+          // being absent. The rotation signal was previously emitted centrally
+          // from handleTransition (session-states.ts), but updateSessionState
+          // now skips publishSessionState (and thus handleTransition) when the
+          // updater is a no-op — fire it here so the route-follow effect still
+          // tracks compression without needing a dummy state write.
+          if (existing.storedSessionId && existing.storedSessionId !== storedSessionId) {
+            runtimeIdByStoredSessionIdRef.current.delete(existing.storedSessionId)
 
-          // A rotation event needs a real next id — a null/cleared stored id
-          // is a detach, not a rotation the route-follow effect should chase.
+            // A rotation event needs a real next id — a null/cleared stored id
+            // is a detach, not a rotation the route-follow effect should chase.
+            if (storedSessionId) {
+              syncStoredSessionAliasProfile()
+              const activeProfile = storedSessionAliasProfileRef.current
+
+              const rotationBelongsToActiveProfile =
+                !sourceProfile || normalizeProfileKey(sourceProfile) === activeProfile
+
+              // Gateway events can already be queued when the renderer switches
+              // profiles. Never attribute a late old-profile compression rotation
+              // to the newly active profile's route lineage.
+              if (rotationBelongsToActiveProfile) {
+                storedSessionIdAliasesRef.current.set(existing.storedSessionId, storedSessionId)
+              }
+
+              if (rotationBelongsToActiveProfile && sessionId === $activeSessionId.get()) {
+                setActiveSessionStoredIdRotation({
+                  nextStoredSessionId: storedSessionId,
+                  previousStoredSessionId: existing.storedSessionId,
+                  runtimeSessionId: sessionId
+                })
+              }
+            }
+          }
+
           if (storedSessionId) {
-            syncStoredSessionAliasProfile()
-            const activeProfile = storedSessionAliasProfileRef.current
-            const rotationBelongsToActiveProfile =
-              !sourceProfile || normalizeProfileKey(sourceProfile) === activeProfile
-
-            // Gateway events can already be queued when the renderer switches
-            // profiles. Never attribute a late old-profile compression rotation
-            // to the newly active profile's route lineage.
-            if (rotationBelongsToActiveProfile) {
-              storedSessionIdAliasesRef.current.set(existing.storedSessionId, storedSessionId)
-            }
-
-            if (rotationBelongsToActiveProfile && sessionId === $activeSessionId.get()) {
-              setActiveSessionStoredIdRotation({
-                nextStoredSessionId: storedSessionId,
-                previousStoredSessionId: existing.storedSessionId,
-                runtimeSessionId: sessionId
-              })
-            }
+            runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
           }
         }
 
-        if (storedSessionId) {
-          runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
-        }
+        return sessionStateByRuntimeIdRef.current.get(sessionId)!
       }
 
-      return sessionStateByRuntimeIdRef.current.get(sessionId)!
-    }
+      const created = createClientSessionState(storedSessionId ?? null)
+      sessionStateByRuntimeIdRef.current.set(sessionId, created)
 
-    const created = createClientSessionState(storedSessionId ?? null)
-    sessionStateByRuntimeIdRef.current.set(sessionId, created)
+      if (storedSessionId) {
+        runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+      }
 
-    if (storedSessionId) {
-      runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
-    }
-
-    return created
-  }, [syncStoredSessionAliasProfile])
+      return created
+    },
+    [syncStoredSessionAliasProfile]
+  )
 
   const resetViewSync = useCallback(() => {
     // Drop any RAF-pending transcript stage so a backgrounded turn cannot
