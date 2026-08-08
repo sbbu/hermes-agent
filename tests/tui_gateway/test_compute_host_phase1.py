@@ -874,14 +874,22 @@ def test_supervisor_reaps_child_rejected_after_hello(tmp_path, monkeypatch):
     from tui_gateway import host_supervisor
 
     created: list[Any] = []
-    real_popen = host_supervisor.subprocess.Popen
+    real_subprocess = host_supervisor.subprocess
 
     def _popen(*args, **kwargs):
-        proc = real_popen(*args, **kwargs)
+        proc = real_subprocess.Popen(*args, **kwargs)
         created.append(proc)
         return proc
 
-    monkeypatch.setattr(host_supervisor.subprocess, "Popen", _popen)
+    class _SubprocessProxy:
+        Popen = staticmethod(_popen)
+
+        def __getattr__(self, name):
+            return getattr(real_subprocess, name)
+
+    # Patch only the supervisor module's binding. Mutating subprocess.Popen on
+    # the shared module lets unrelated background source-checks pollute this probe.
+    monkeypatch.setattr(host_supervisor, "subprocess", _SubprocessProxy())
     supervisor = HostSupervisor(
         registry_path=tmp_path / "dashboard-compute-host.json",
         expected_build_sha="definitely-not-the-current-build",
