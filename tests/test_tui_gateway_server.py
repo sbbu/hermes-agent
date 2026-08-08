@@ -942,9 +942,12 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
         t.join()
 
     lines = "".join(out.parts).splitlines()
+    seq_lines = [line for line in lines if '"seq":' in line]
 
-    assert len(lines) == 8
-    assert {json.loads(line)["seq"] for line in lines} == set(range(8))
+    # Other tests can leave a daemon producer finishing an unrelated frame;
+    # this probe only owns and validates the eight sequence-tagged frames.
+    assert len(seq_lines) == 8
+    assert {json.loads(line)["seq"] for line in seq_lines} == set(range(8))
 
 
 def test_write_json_returns_false_on_broken_pipe(monkeypatch):

@@ -166,18 +166,41 @@ def _(rid, params: dict) -> dict:
                         )
                     if claim_error is None and ordinal is not None:
                         history = session.get("history", [])
+                        # An ordinal alone is not consent. A client that carries a
+                        # leftover ordinal into an ordinary submit is indistinguishable
+                        # from a real rewind, so refuse destructive truncation unless
+                        # the client explicitly confirms that intent.
+                        if not is_truthy_value(params.get("confirm_truncate")):
+                            logger.warning(
+                                "prompt.submit: REFUSED unconfirmed truncation of session %s "
+                                "(%d messages held; ordinal=%d). The client attached "
+                                "truncate_before_user_ordinal without confirm_truncate — "
+                                "likely a stale ordinal on an ordinary submit.",
+                                sid,
+                                len(history),
+                                ordinal,
+                            )
+                            claim_error = _err(
+                                rid,
+                                4029,
+                                "truncate_before_user_ordinal requires confirm_truncate=true; "
+                                "an ordinary prompt.submit must not drop session history "
+                                "(update your Hermes client if a rewind was intended)",
+                            )
                         user_indices = [
                             i
                             for i, m in enumerate(history)
                             if m.get("role") == "user" and not m.get("display_kind")
                         ]
-                        if ordinal < 0 or ordinal >= len(user_indices):
+                        if claim_error is None and (
+                            ordinal < 0 or ordinal >= len(user_indices)
+                        ):
                             claim_error = _err(
                                 rid,
                                 4018,
                                 "target user message is no longer in session history",
                             )
-                        else:
+                        elif claim_error is None:
                             truncated = history[: user_indices[ordinal]]
                             # Stale clients can attach truncate_before_user_ordinal=0
                             # to an ordinary submit. Refuse the destructive empty
@@ -213,7 +236,9 @@ def _(rid, params: dict) -> dict:
                                 if (db := _get_db()) is not None:
                                     try:
                                         db.replace_messages(
-                                            session["session_key"], truncated
+                                            session["session_key"],
+                                            truncated,
+                                            active_only=True,
                                         )
                                     except Exception as exc:
                                         logger.error(
