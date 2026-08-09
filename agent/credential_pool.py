@@ -2745,20 +2745,31 @@ class CredentialPool:
                     None,
                 )
                 # A shared owner can refresh an entry under the same stable id
-                # while an older request is still in flight. When that request
-                # reports a string credential that no longer matches, treating
-                # the id as authoritative would quarantine the fresh generation.
-                # Non-shared pools retain the upstream stable-id contract: their
-                # runtime wrapper/key may legitimately differ from the pool key.
+                # while an older request is still in flight. Prefer a matching
+                # key hint when one exists; otherwise, only shared pools reject
+                # the stale id because non-shared runtime wrappers may legitimately
+                # differ from the stored pool key.
+                entry = identified
                 if (
-                    self._owner_generation is not None
-                    and identified is not None
+                    identified is not None
                     and isinstance(api_key_hint, str)
-                    and isinstance(identified.runtime_api_key, str)
                     and identified.runtime_api_key != api_key_hint
                 ):
-                    identified = None
-                entry = identified
+                    hinted = next(
+                        (
+                            e
+                            for e in self._entries
+                            if e.runtime_api_key == api_key_hint
+                        ),
+                        None,
+                    )
+                    if hinted is not None:
+                        entry = hinted
+                    elif (
+                        self._owner_generation is not None
+                        and isinstance(identified.runtime_api_key, str)
+                    ):
+                        entry = None
             if entry is None and api_key_hint:
                 # Prefer the specific entry whose API key matches the one that
                 # actually failed. When this pool was freshly loaded from disk
