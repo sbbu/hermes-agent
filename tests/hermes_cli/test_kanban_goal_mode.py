@@ -173,7 +173,10 @@ def test_completed_worker_supervisor_cannot_mutate_reopened_task(
     fake_cli = cli_mod.HermesCLI.__new__(cli_mod.HermesCLI)
     cli_mod._run_kanban_goal_loop_q(fake_cli, "already done")
 
-    assert observed["status"] == "stale_run"
+    # Upstream binds terminal handoffs to the original run. The old supervisor
+    # sees its own terminal outcome, not the reopened card's state; run_turn
+    # refuses it and block_task's expected_run_id fence cannot mutate the new lifecycle.
+    assert observed["status"] == "done"
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
         assert task is not None
