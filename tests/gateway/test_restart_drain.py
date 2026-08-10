@@ -539,6 +539,7 @@ def test_windows_gateway_venv_imports_add_site_packages(monkeypatch, tmp_path):
     assert pythonpath[:3] == [project_root, str(site_packages), "already-there"]
 
 
+@pytest.mark.windows_only
 @pytest.mark.asyncio
 async def test_windows_detached_restart_scrubs_gateway_marker(monkeypatch, tmp_path):
     """Faking sys.platform="win32" on Linux could not reach the real Windows

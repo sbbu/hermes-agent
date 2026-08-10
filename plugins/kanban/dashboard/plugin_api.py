@@ -1179,11 +1179,8 @@ def _set_status_direct(
             # here would create an active task with no notification route.
             if prev["status"] == "archived":
                 return False
-            # A completed parent cannot be reopened beneath progressed work.
-            # Route the dashboard's direct drag path through the same guard as
-            # resume_task()/wait_task() before changing either parent or child.
-            if not kanban_db._regate_dependents_for_reopen(conn, task_id):
-                return False
+            # Upstream's domain invalidation below retracts progressed
+            # descendants atomically and records the audit trail.
 
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "

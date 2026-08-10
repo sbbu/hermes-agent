@@ -1836,6 +1836,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        graph = kb.task_graph_context(conn, task.id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
