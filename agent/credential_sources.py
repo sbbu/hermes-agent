@@ -319,6 +319,21 @@ def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
     those must not delete or suppress the unrelated singleton.
     """
     result = RemovalResult(suppress=False)
+    from hermes_cli import auth as auth_mod
+
+    # A manual account is independent when a canonical singleton still exists;
+    # removing it must not disable singleton seeding. If no singleton remains,
+    # suppress both source spellings so the deleted pool-only account cannot be
+    # reconstructed from legacy CLI state.
+    target_path = auth_mod._auth_store_path_for_provider(provider)
+    with auth_mod._auth_store_lock(target_path=target_path):
+        store = auth_mod._load_auth_store(target_path)
+        has_singleton = auth_mod._provider_state_has_credentials(
+            (store.get("providers") or {}).get(provider)
+        )
+    if not has_singleton:
+        auth_mod.suppress_credential_source(provider, "device_code")
+        auth_mod.suppress_credential_source(provider, "manual:device_code")
     result.hints.extend([
         "Suppressed openai-codex device_code source — it will not be re-seeded.",
         "Note: Codex CLI credentials still live in ~/.codex/auth.json",
@@ -421,6 +436,7 @@ def _register_all_sources() -> None:
     ))
     register(RemovalStep(
         provider="openai-codex", source_id="device_code",
+        match_fn=lambda src: src in ("device_code", "manual:device_code"),
         remove_fn=_remove_codex_device_code,
         description="auth.json providers.openai-codex + ~/.codex/auth.json",
     ))

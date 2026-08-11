@@ -2752,8 +2752,19 @@ def suppress_credential_source(provider_id: str, source: str) -> None:
     target_path = _auth_store_path_for_provider(provider_id)
     with _auth_store_lock(target_path=target_path):
         auth_store = _load_auth_store(target_path)
-        suppressed = auth_store.setdefault("suppressed_sources", {})
-        provider_list = suppressed.setdefault(provider_id, [])
+        suppressed = auth_store.get("suppressed_sources")
+        if not isinstance(suppressed, dict):
+            suppressed = {}
+            auth_store["suppressed_sources"] = suppressed
+        raw_sources = suppressed.get(provider_id)
+        if isinstance(raw_sources, list):
+            provider_list = raw_sources
+        elif isinstance(raw_sources, dict):
+            provider_list = [str(name) for name in raw_sources]
+            suppressed[provider_id] = provider_list
+        else:
+            provider_list = []
+            suppressed[provider_id] = provider_list
         changed = source not in provider_list
         if changed:
             provider_list.append(source)

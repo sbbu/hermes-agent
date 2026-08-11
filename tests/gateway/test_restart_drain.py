@@ -9,6 +9,7 @@ import pytest
 
 import gateway.run as gateway_run
 from agent.i18n import t
+from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 from gateway.session import SessionEntry, build_session_key
@@ -465,6 +466,38 @@ async def test_wait_for_restart_safe_point_waits_for_queued_drain_message(monkey
     await asyncio.wait_for(runner._wait_for_restart_safe_point(), timeout=1)
 
     assert runner._draining is True
+
+
+@pytest.mark.asyncio
+async def test_restart_safe_point_counts_profile_queue_under_interrupt_default(monkeypatch):
+    """A routed profile's queue policy must hold the global restart safe point."""
+    runner, _adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner._restart_drain_timeout = 1.0
+    runner._busy_input_mode = "interrupt"
+    profile_adapter = MagicMock()
+    profile_adapter._pending_messages = {
+        "agent:research:telegram:dm:999": MessageEvent(
+            text="queued by routed profile",
+            message_type=MessageType.TEXT,
+            source=make_restart_source(),
+            message_id="profile-queued-1",
+        )
+    }
+    runner._profile_adapters = {"research": {Platform.TELEGRAM: profile_adapter}}
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", fast_sleep)
+    wait_task = asyncio.create_task(runner._wait_for_restart_safe_point())
+    await real_sleep(0)
+
+    assert not wait_task.done()
+    profile_adapter._pending_messages.clear()
+    await asyncio.wait_for(wait_task, timeout=1)
 
 
 @pytest.mark.asyncio

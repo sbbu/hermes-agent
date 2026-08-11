@@ -8921,7 +8921,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             + self._active_api_run_count()
             + (
                 self._pending_message_count()
-                if self._queue_during_drain_enabled()
+                # Per-profile busy modes may queue work even when the primary
+                # gateway mode is "interrupt". During a planned restart every
+                # queued turn must hold the safe point, regardless of which
+                # profile supplied the queue policy.
+                if self._restart_requested
                 else 0
             )
         )
