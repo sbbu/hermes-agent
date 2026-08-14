@@ -375,6 +375,20 @@ def adapter():
     return _make_adapter()
 
 
+@pytest.mark.asyncio
+async def test_disconnect_stops_http_handlers_before_closing_response_store(adapter):
+    order = []
+    adapter._site = AsyncMock()
+    adapter._site.stop.side_effect = lambda: order.append("site.stop")
+    adapter._runner = AsyncMock()
+    adapter._runner.cleanup.side_effect = lambda: order.append("runner.cleanup")
+    adapter._response_store.close = MagicMock(side_effect=lambda: order.append("store.close"))
+
+    await adapter.disconnect()
+
+    assert order == ["site.stop", "runner.cleanup", "store.close"]
+
+
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")

@@ -340,10 +340,24 @@ class ComputeHost:
         if bypass_exhausted_pool:
             # A genuinely wedged turn still occupies its executor worker. Run
             # the first replacement on a dedicated daemon so recovery also
-            # works when every bounded-pool worker is stuck.
+            # works when every bounded-pool worker is stuck. Represent the
+            # daemon in the same future registry as executor work so shutdown
+            # cannot finalize its session while the recovery turn is live.
+            future: concurrent.futures.Future = concurrent.futures.Future()
+
+            def _run_bypass_turn() -> None:
+                if not future.set_running_or_notify_cancel():
+                    return
+                try:
+                    self._run_real_turn(turn_frame)
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(None)
+
+            self._track_turn_future(future, sid)
             threading.Thread(
-                target=self._run_real_turn,
-                args=(turn_frame,),
+                target=_run_bypass_turn,
                 name=f"compute-host-recovery-{sid}",
                 daemon=True,
             ).start()
