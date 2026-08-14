@@ -287,7 +287,7 @@ def test_same_session_recorded_cwd_survives_across_commands(monkeypatch):
 
         def execute(self, command, **kwargs):
             calls.append((command, kwargs))
-            return {"output": "ok", "returncode": 0}
+            return {"output": "ok", "returncode": 0, "cwd_observed": True}
 
     env = FakeEnv()
     task_id = "session-X"
