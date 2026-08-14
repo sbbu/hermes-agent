@@ -8539,13 +8539,9 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
-        if self._response_store is not None:
-            try:
-                self._response_store.close()
-            except Exception:
-                logger.debug(
-                    "Failed to close response store for %s", self.name, exc_info=True,
-                )
+        # Stop admission and await aiohttp's in-flight handlers before closing
+        # the store they use. Closing SQLite first lets a request already past
+        # routing resume into a dead connection during shutdown.
         try:
             if self._site:
                 await self._site.stop()
@@ -8553,6 +8549,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if self._runner:
                 await self._runner.cleanup()
                 self._runner = None
+            if self._response_store is not None:
+                try:
+                    self._response_store.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close response store for %s", self.name, exc_info=True,
+                    )
         finally:
             self._close_cached_session_dbs()
             self._app = None

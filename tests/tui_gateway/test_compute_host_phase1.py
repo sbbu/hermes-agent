@@ -415,6 +415,34 @@ def test_force_release_invalidates_turn_queued_before_child_registration(monkeyp
     assert "queued-real-sid" in host._force_release_bypass
 
 
+def test_shutdown_tracks_force_release_bypass_turn(monkeypatch):
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+    started = threading.Event()
+    release = threading.Event()
+    flushed = []
+
+    def _run_real_turn(_frame):
+        started.set()
+        release.wait(timeout=2)
+
+    monkeypatch.setattr(host, "_run_real_turn", _run_real_turn)
+    monkeypatch.setattr(
+        host,
+        "flush_all_sessions",
+        lambda **kwargs: flushed.append(set(kwargs.get("skip_sids") or ())),
+    )
+    host._force_release_bypass.add("recovery-sid")
+
+    try:
+        host._handle_turn_start({"sid": "recovery-sid", "request_id": "turn-1"})
+        assert started.wait(timeout=1)
+        host.shutdown(wait=0.01)
+    finally:
+        release.set()
+
+    assert flushed == [{"recovery-sid"}]
+
+
 def test_real_turn_exception_does_not_clear_replacement_session(monkeypatch):
     from tui_gateway import server
 

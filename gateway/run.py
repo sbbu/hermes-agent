@@ -15991,6 +15991,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
 
+            # Adapter pending slots are the authoritative queue for busy
+            # follow-ups. Snapshot them while adapters are alive: teardown
+            # clears those dicts, and the runner-level legacy pending view does
+            # not contain them.
+            try:
+                from gateway.shutdown_flush import flush_pending_to_file
+
+                _pending_adapters = list(self.adapters.values())
+                for _amap in getattr(self, "_profile_adapters", {}).values():
+                    _pending_adapters.extend(_amap.values())
+                _seen_pending_adapters: set[int] = set()
+                for _adapter in _pending_adapters:
+                    if id(_adapter) in _seen_pending_adapters:
+                        continue
+                    _seen_pending_adapters.add(id(_adapter))
+                    _adapter_pending = getattr(_adapter, "_pending_messages", None)
+                    if isinstance(_adapter_pending, dict) and _adapter_pending:
+                        flush_pending_to_file(
+                            dict(_adapter_pending), reason="shutdown-adapter"
+                        )
+            except Exception:
+                logger.debug("Failed to flush adapter pending messages", exc_info=True)
+
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
 

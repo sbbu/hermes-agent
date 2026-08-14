@@ -169,6 +169,40 @@ async def test_planned_service_exit_issues_no_restart_of_its_own(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_spools_adapter_pending_before_disconnect():
+    runner, adapter = make_restart_runner()
+    queued = MessageEvent(
+        text="queued follow-up",
+        source=make_restart_source(),
+        message_id="queued-1",
+    )
+    adapter._pending_messages = {"telegram:dm:123:u1": queued}
+    order = []
+
+    async def _disconnect():
+        order.append("disconnect")
+        adapter._pending_messages.clear()
+
+    def _flush(pending, *, reason):
+        order.append((reason, pending))
+        return len(pending)
+
+    adapter.disconnect = _disconnect
+    with patch("gateway.shutdown_flush.flush_pending_to_file", side_effect=_flush):
+        with patch("gateway.status.remove_pid_file"), patch(
+            "gateway.status.write_runtime_status"
+        ):
+            await runner.stop()
+
+    assert order[0] == (
+        "shutdown-adapter",
+        {"telegram:dm:123:u1": queued},
+    )
+    assert "disconnect" in order
+    assert order.index("disconnect") > 0
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_drains_running_agents_before_disconnect():
     runner, adapter = make_restart_runner()
     # Opt into a grace window (the default is 0 = interrupt immediately).
