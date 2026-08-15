@@ -542,6 +542,42 @@ def _(rid, params: dict) -> dict:
                             if err is not None:
                                 return err
                         else:
+                            if client_ordinal < 0 or client_ordinal >= len(user_indices):
+                                return _err(
+                                    rid, 4018, "target user message is no longer in session history"
+                                )
+                            # Durability is a state.db property, not an optional
+                            # annotation on the live copy. Resume/reload paths
+                            # historically omitted _row_id stamps, which made an
+                            # ordinal-only request look safe even though it could
+                            # destructively replace a long transcript. If durable
+                            # state cannot be read, fail closed too.
+                            has_stamped_user = any(
+                                _message_row_id(history[h_idx]) is not None
+                                for h_idx in user_indices
+                            )
+                            durable_history = (
+                                []
+                                if has_stamped_user
+                                else _load_durable_truncation_history(session, sid)
+                            )
+                            if (
+                                has_stamped_user
+                                or durable_history is None
+                                or durable_history
+                            ):
+                                logger.warning(
+                                    "prompt.submit: REFUSED ordinal-only truncation of durable "
+                                    "session %s (ordinal=%d); truncate_before_row_id required",
+                                    sid,
+                                    client_ordinal,
+                                )
+                                return _err(
+                                    rid,
+                                    4004,
+                                    "ordinal-only truncation is unsafe for durable session history; "
+                                    "include truncate_before_row_id",
+                                )
                             ordinal = client_ordinal
 
                         # Reject out-of-range ordinals on BOTH ends. A negative value would
@@ -611,8 +647,11 @@ def _(rid, params: dict) -> dict:
                                 # #82756). Soft-archiving keeps them on disk (active=0) and
                                 # in the FTS index, so a mis-aimed cut is recoverable
                                 # instead of terminal. The live transcript is unchanged.
+                                # Fall back to the live sid for legacy sessions
+                                # whose session_key is NULL; None violates the FK.
+                                truncation_key = session.get("session_key") or sid
                                 db.replace_messages(
-                                    session["session_key"],
+                                    truncation_key,
                                     truncated,
                                     active_only=True,
                                     archive_dropped=True,
@@ -692,6 +731,7 @@ def _(rid, params: dict) -> dict:
     if claim_error is not None:
         return claim_error
     assert submit_generation is not None
+
 
     # Filled when this submit performed a truncation against a durable session:
     # the fresh post-rewrite row ids of the surviving user turns, for client
@@ -1123,6 +1163,7 @@ def _(rid, params: dict) -> dict:
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
+
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
