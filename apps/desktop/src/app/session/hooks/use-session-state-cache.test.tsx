@@ -146,7 +146,7 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-A')
   })
 
-  it('does not repopulate aliases from a late event for the previous profile', () => {
+  it('does not repopulate aliases or route maps from a late event for the previous profile', () => {
     let cache!: Cache
 
     $activeGatewayProfile.set('profile-a')
@@ -160,7 +160,29 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     })
 
     expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-A')
+    expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
+    expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A-next')).toBe(false)
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')?.storedSessionId).toBe('stored-A')
     expect($activeSessionStoredIdRotation.get()).toBeNull()
+  })
+
+  it('keeps the active profile route when a late old-profile rotation reuses its stored id', () => {
+    let cache!: Cache
+
+    $activeGatewayProfile.set('profile-a')
+    render(
+      <Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="stored-old" />
+    )
+    act(() => {
+      cache.updateSessionState('runtime-A', state => state, 'stored-old', 'profile-a')
+      $activeGatewayProfile.set('profile-b')
+      cache.updateSessionState('runtime-B', state => state, 'stored-shared', 'profile-b')
+      cache.updateSessionState('runtime-A', state => state, 'stored-shared', 'profile-a')
+    })
+
+    expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-shared')).toBe('runtime-B')
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')?.storedSessionId).toBe('stored-old')
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-B')?.storedSessionId).toBe('stored-shared')
   })
 })
 

@@ -151,6 +151,10 @@ export function useSessionStateCache({
 
     if (storedSessionAliasProfileRef.current !== currentProfile) {
       storedSessionIdAliasesRef.current.clear()
+      // The reverse map is profile-blind too. A stored id is only unique
+      // inside one profile, so carrying this map across a live profile swap
+      // can route the new profile into the previous profile's runtime.
+      runtimeIdByStoredSessionIdRef.current.clear()
       storedSessionAliasProfileRef.current = currentProfile
     }
   }, [])
@@ -197,6 +201,18 @@ export function useSessionStateCache({
 
   const ensureSessionState = useCallback(
     (sessionId: string, storedSessionId?: string | null, sourceProfile?: string | null) => {
+      syncStoredSessionAliasProfile()
+
+      if (
+        sourceProfile &&
+        normalizeProfileKey(sourceProfile) !== storedSessionAliasProfileRef.current
+      ) {
+        // A queued event from the profile we just left must not mutate this
+        // profile-blind cache or either profile-blind route map. Return a
+        // detached snapshot so direct callers still receive a valid state.
+        return sessionStateCache.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
+      }
+
       const existing = sessionStateCache.get(sessionId)
 
       if (existing) {
@@ -416,6 +432,17 @@ export function useSessionStateCache({
       storedSessionId?: string | null,
       sourceProfile?: string | null
     ) => {
+      syncStoredSessionAliasProfile()
+
+      if (
+        sourceProfile &&
+        normalizeProfileKey(sourceProfile) !== storedSessionAliasProfileRef.current
+      ) {
+        // Do not invoke the updater: besides the cache write below, callers can
+        // perform edge-triggered side effects from inside it.
+        return sessionStateCache.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
+      }
+
       const previous = ensureSessionState(sessionId, storedSessionId, sourceProfile)
       // Give the updater the raw previous state so it can return the same
       // reference when nothing changed (the caller sees a no-op). Previously
@@ -447,7 +474,7 @@ export function useSessionStateCache({
 
       return next
     },
-    [ensureSessionState, sessionStateCache, syncSessionStateToView]
+    [ensureSessionState, sessionStateCache, syncSessionStateToView, syncStoredSessionAliasProfile]
   )
 
   useEffect(() => {
