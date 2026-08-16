@@ -14242,8 +14242,24 @@ def _run_prompt_submit(
             launch_cancelled.set()
             launch_gate.set()
             raise
+    # message.start can synchronously yield to a close. Revalidate publication
+    # ownership before releasing the worker parked on launch_gate.
+    with _sessions_lock:
+        can_publish = (
+            _sessions.get(sid) is session
+            and not session.get("_closing")
+        )
+    if not can_publish:
+        launch_cancelled.set()
+        launch_gate.set()
+        if expected_generation is None:
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
         else:
-            launch_gate.set()
+            _abandon_claimed_run(session, expected_generation)
+        return False
+    launch_gate.set()
     return True
 
 

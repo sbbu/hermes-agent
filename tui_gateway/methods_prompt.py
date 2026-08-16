@@ -476,7 +476,29 @@ def _(rid, params: dict) -> dict:
                                 "(update your Hermes client if a rewind was intended)",
                             )
 
+                        # Desktop/TUI ordinals count the full displayed lineage.
+                        # The live history contains only the post-compression tip.
+                        prefix_user_count = sum(
+                            1
+                            for message in session.get("display_history_prefix") or []
+                            if isinstance(message, dict)
+                            and message.get("role") == "user"
+                            and not message.get("display_kind")
+                        )
                         user_indices = _history_user_indices(history)
+
+                        def _stale_target_data(resolved_ordinal=None):
+                            segment = (
+                                client_ordinal - prefix_user_count
+                                if client_ordinal is not None
+                                else resolved_ordinal
+                            )
+                            return {
+                                "user_turn_count": len(user_indices),
+                                "ordinal": client_ordinal,
+                                "segment_ordinal": segment,
+                                "prefix_user_count": prefix_user_count,
+                            }
 
                         ordinal = None
 
@@ -500,12 +522,14 @@ def _(rid, params: dict) -> dict:
                                     rid,
                                     4018,
                                     "target user message is no longer in session history",
+                                    data=_stale_target_data(),
                                 )
 
                             msg_ordinal, _ = found_match
                             ordinal, err = _reconcile_client_ordinal(
                                 rid, sid, client_ordinal, msg_ordinal,
                                 "truncate_before_row_id", target_row_id,
+                                prefix_user_count=prefix_user_count,
                             )
                             if err is not None:
                                 return err
@@ -532,19 +556,25 @@ def _(rid, params: dict) -> dict:
                                     rid,
                                     4018,
                                     "target user message is no longer in session history",
+                                    data=_stale_target_data(),
                                 )
 
                             msg_ordinal, _ = found_match
                             ordinal, err = _reconcile_client_ordinal(
                                 rid, sid, client_ordinal, msg_ordinal,
                                 "truncate_before_message_id", msg_id_str,
+                                prefix_user_count=prefix_user_count,
                             )
                             if err is not None:
                                 return err
                         else:
-                            if client_ordinal < 0 or client_ordinal >= len(user_indices):
+                            segment_ordinal = client_ordinal - prefix_user_count
+                            if segment_ordinal < 0 or segment_ordinal >= len(user_indices):
                                 return _err(
-                                    rid, 4018, "target user message is no longer in session history"
+                                    rid,
+                                    4018,
+                                    "target user message is no longer in session history",
+                                    data=_stale_target_data(),
                                 )
                             # Durability is a state.db property, not an optional
                             # annotation on the live copy. Resume/reload paths
@@ -578,7 +608,7 @@ def _(rid, params: dict) -> dict:
                                     "ordinal-only truncation is unsafe for durable session history; "
                                     "include truncate_before_row_id",
                                 )
-                            ordinal = client_ordinal
+                            ordinal = segment_ordinal
 
                         # Reject out-of-range ordinals on BOTH ends. A negative value would
                         # otherwise sail past the upper-bound check and hit Python's negative
@@ -586,7 +616,12 @@ def _(rid, params: dict) -> dict:
                         # truncating history to everything before it and persisting that loss
                         # via replace_messages — an unrecoverable overwrite of the session DB.
                         if ordinal < 0 or ordinal >= len(user_indices):
-                            return _err(rid, 4018, "target user message is no longer in session history")
+                            return _err(
+                                rid,
+                                4018,
+                                "target user message is no longer in session history",
+                                data=_stale_target_data(resolved_ordinal=ordinal),
+                            )
                         truncated = history[: user_indices[ordinal]]
                         # Second gate, on top of confirm_truncate: ordinal 0 resolves to
                         # history[:0] == [] and replace_messages() DELETEs every durable
