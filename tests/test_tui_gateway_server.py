@@ -399,6 +399,31 @@ def test_compute_host_ambient_image_claim_preserves_concurrent_attachment(monkey
     assert session["attached_images"] == ["/tmp/c.png"]
 
 
+def test_compute_host_stale_generation_restores_claimed_images(monkeypatch):
+    class _Supervisor:
+        def submit_turn(self, _frame, *, on_complete=None):
+            raise AssertionError("stale generation must not dispatch")
+
+    session = _session(attached_images=["/tmp/b.png"], run_generation=1)
+    server._sessions["sid"] = session
+
+    def _replace_generation(_cfg=None):
+        session["run_generation"] = 2
+        session["attached_images"].append("/tmp/c.png")
+        return _Supervisor()
+
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", _replace_generation)
+
+    try:
+        response = server._submit_prompt_to_compute_host(
+            "r1", "sid", session, "B", expected_generation=1
+        )
+        assert response["error"]["code"] == 4020
+        assert session["attached_images"] == ["/tmp/b.png", "/tmp/c.png"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
     class _BrokenSupervisor:
         def submit_turn(self, frame, *, on_complete=None):

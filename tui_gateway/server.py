@@ -2821,6 +2821,10 @@ def _submit_prompt_to_compute_host(
                 _sessions.get(sid) is not session
                 or not _run_current_locked(session, expected_generation)
             ):
+                if claimed_images:
+                    session["attached_images"] = claimed_images + list(
+                        session.get("attached_images", [])
+                    )
                 return _err(rid, 4020, "session changed during stale-turn recovery")
             run_generation = int(session.get("run_generation", 0) or 0)
         try:
