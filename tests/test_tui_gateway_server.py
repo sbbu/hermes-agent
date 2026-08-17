@@ -424,6 +424,30 @@ def test_compute_host_stale_generation_restores_claimed_images(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_attachment_append_serializes_with_compute_host_claim():
+    session = _session(attached_images=["/tmp/b.png"])
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _append():
+        started.set()
+        server._append_attached_image(session, "/tmp/c.png")
+        finished.set()
+
+    with session["history_lock"]:
+        thread = threading.Thread(target=_append)
+        thread.start()
+        assert started.wait(timeout=1)
+        assert not finished.wait(timeout=0.05)
+        claimed = list(session["attached_images"])
+        session["attached_images"] = []
+
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert claimed == ["/tmp/b.png"]
+    assert session["attached_images"] == ["/tmp/c.png"]
+
+
 def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
     class _BrokenSupervisor:
         def submit_turn(self, frame, *, on_complete=None):

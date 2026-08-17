@@ -14355,6 +14355,24 @@ def _session_images_dir(session: dict) -> Path:
     return base / "images"
 
 
+def _append_attached_image(session: dict, path: str) -> int:
+    """Queue one image under the same lock used to claim prompt attachments."""
+    with session["history_lock"]:
+        images = session.setdefault("attached_images", [])
+        images.append(path)
+        return len(images)
+
+
+def _detach_attached_image(session: dict, path: str) -> tuple[bool, int]:
+    """Remove one queued image without racing prompt attachment claims."""
+    with session["history_lock"]:
+        images = session.setdefault("attached_images", [])
+        before = len(images)
+        session["attached_images"] = [item for item in images if item != path]
+        count = len(session["attached_images"])
+        return count != before, count
+
+
 def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str) -> Path:
     """Write image bytes into the gateway's images dir and queue them.
 
@@ -14372,7 +14390,7 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     except Exception:
         session["image_counter"] = max(0, session["image_counter"] - 1)
         raise
-    session.setdefault("attached_images", []).append(str(img_path))
+    _append_attached_image(session, str(img_path))
     return img_path
 
 
