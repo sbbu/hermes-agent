@@ -13133,6 +13133,19 @@ def _run_prompt_submit(
             if expected_generation is not None
             else _run_generation(session)
         )
+    claimed_images = list(images) if image_paths is None else []
+
+    def _restore_claimed_images() -> None:
+        """Return ambient attachments when dispatch loses ownership pre-publication."""
+        if not claimed_images:
+            return
+        with session["history_lock"]:
+            if not claimed_images:
+                return
+            session["attached_images"] = claimed_images + list(
+                session.get("attached_images", [])
+            )
+            claimed_images.clear()
     agent = session["agent"]
     _turn_started_monotonic = time.monotonic()
     launch_gate = threading.Event()
@@ -14200,28 +14213,34 @@ def _run_prompt_submit(
             and (registered is None or registered is session)
         )
     if not can_start:
+        _restore_claimed_images()
         with session["history_lock"]:
             session["running"] = False
             _clear_inflight_turn(session)
         return False
     real_thread = type(run_thread).__module__ == "threading"
+    stale_before_start = False
     with session["history_lock"]:
         if expected_generation is not None and not _run_current_locked(
             session, expected_generation
         ):
             launch_cancelled.set()
             launch_gate.set()
-            return False
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                agent.clear_interrupt()
-            except Exception:
-                pass
-        session["_run_thread"] = run_thread
-        if not real_thread:
-            _log_turn_accepted()
-            _emit("message.start", sid)
-            launch_gate.set()
+            stale_before_start = True
+        else:
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    agent.clear_interrupt()
+                except Exception:
+                    pass
+            session["_run_thread"] = run_thread
+            if not real_thread:
+                _log_turn_accepted()
+                _emit("message.start", sid)
+                launch_gate.set()
+    if stale_before_start:
+        _restore_claimed_images()
+        return False
     try:
         run_thread.start()
     except Exception:
@@ -14229,33 +14248,49 @@ def _run_prompt_submit(
         with session["history_lock"]:
             if session.get("_run_thread") is run_thread:
                 session["_run_thread"] = None
+        _restore_claimed_images()
         raise
     if not real_thread:
         return True
-    with session["history_lock"]:
-        if expected_generation is not None and not _run_current_locked(
-            session, expected_generation
-        ):
-            launch_cancelled.set()
-            launch_gate.set()
-            return False
-        try:
-            _log_turn_accepted()
-            _emit("message.start", sid)
-        except Exception:
-            launch_cancelled.set()
-            launch_gate.set()
-            raise
-    # message.start can synchronously yield to a close. Revalidate publication
-    # ownership before releasing the worker parked on launch_gate.
+    stale_after_start = False
+    try:
+        with session["history_lock"]:
+            if expected_generation is not None and not _run_current_locked(
+                session, expected_generation
+            ):
+                launch_cancelled.set()
+                launch_gate.set()
+                stale_after_start = True
+            else:
+                _log_turn_accepted()
+                _emit("message.start", sid)
+    except Exception:
+        launch_cancelled.set()
+        launch_gate.set()
+        _restore_claimed_images()
+        raise
+    if stale_after_start:
+        _restore_claimed_images()
+        return False
+    # message.start can synchronously yield to a close or invalidate ownership.
+    # Revalidate publication before releasing the worker parked on launch_gate.
     with _sessions_lock:
-        can_publish = (
-            _sessions.get(sid) is session
-            and not session.get("_closing")
-        )
+        with session["history_lock"]:
+            can_publish = (
+                _sessions.get(sid) is session
+                and not session.get("_closing")
+                and (
+                    expected_generation is None
+                    or _run_current_locked(session, expected_generation)
+                )
+            )
+            if can_publish:
+                claimed_images.clear()
+                launch_gate.set()
     if not can_publish:
         launch_cancelled.set()
         launch_gate.set()
+        _restore_claimed_images()
         if expected_generation is None:
             with session["history_lock"]:
                 session["running"] = False
@@ -14263,7 +14298,6 @@ def _run_prompt_submit(
         else:
             _abandon_claimed_run(session, expected_generation)
         return False
-    launch_gate.set()
     return True
 
 

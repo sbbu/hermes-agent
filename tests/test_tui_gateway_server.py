@@ -7304,6 +7304,52 @@ def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     assert turns == []
 
 
+def test_run_prompt_submit_restores_images_when_generation_loses_publication(
+    monkeypatch, tmp_path
+):
+    """A generation invalidated while starting the worker must retain attachments."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    turns = []
+    sid = "generation-loses-publication"
+    session = _session(
+        session_key="generation-loses-publication-key",
+        agent=_RecordingAgent(turns),
+        attached_images=["/tmp/claimed.png"],
+        run_generation=1,
+        running=True,
+    )
+
+    class _InvalidatingThread:
+        __module__ = "threading"
+
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            with session["history_lock"]:
+                session["run_generation"] = 2
+                session["attached_images"].append("/tmp/later.png")
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(server.threading, "Thread", _InvalidatingThread)
+    server._sessions[sid] = session
+    try:
+        result = server._run_prompt_submit(
+            "rid", sid, session, "turn", expected_generation=1
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert result is False
+    assert turns == []
+    assert session["attached_images"] == ["/tmp/claimed.png", "/tmp/later.png"]
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_run_prompt_submit_requeues_foreign_completion(
     monkeypatch, tmp_path, exit_code
