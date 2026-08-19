@@ -3528,6 +3528,7 @@ def _mark_run_activity_locked(session: dict) -> None:
 _ABANDONED_AGENT_CALLBACK_ATTRS = (
     "_session_db",
     "setup_mcp_callback",
+    "tour_callback",
     "tool_progress_callback",
     "tool_start_callback",
     "tool_complete_callback",
