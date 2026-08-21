@@ -188,10 +188,7 @@ export function useSessionStateCache({
     (sessionId: string, storedSessionId?: string | null, sourceProfile?: string | null) => {
       syncStoredSessionAliasProfile()
 
-      if (
-        sourceProfile &&
-        normalizeProfileKey(sourceProfile) !== storedSessionAliasProfileRef.current
-      ) {
+      if (sourceProfile && normalizeProfileKey(sourceProfile) !== storedSessionAliasProfileRef.current) {
         // A queued event from the profile we just left must not mutate this
         // profile-blind cache or either profile-blind route map. Return a
         // detached snapshot so direct callers still receive a valid state.
@@ -225,6 +222,7 @@ export function useSessionStateCache({
               syncStoredSessionAliasProfile()
 
               const activeProfile = storedSessionAliasProfileRef.current
+
               const rotationBelongsToActiveProfile =
                 !sourceProfile || normalizeProfileKey(sourceProfile) === activeProfile
 
@@ -406,10 +404,7 @@ export function useSessionStateCache({
     ) => {
       syncStoredSessionAliasProfile()
 
-      if (
-        sourceProfile &&
-        normalizeProfileKey(sourceProfile) !== storedSessionAliasProfileRef.current
-      ) {
+      if (sourceProfile && normalizeProfileKey(sourceProfile) !== storedSessionAliasProfileRef.current) {
         // Do not invoke the updater: besides the cache write below, callers can
         // perform edge-triggered side effects from inside it.
         return sessionStateCache.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
