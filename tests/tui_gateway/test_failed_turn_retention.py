@@ -209,7 +209,8 @@ def test_returned_error_result_carries_error_surface(emits, turn_env):
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     payload = _events(emits, "message.complete")[0]
     assert payload["error_surface"] == {
@@ -242,7 +243,8 @@ def test_returned_error_without_reason_omits_no_frame(emits, turn_env):
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "go")
 
-    server._run_prompt_submit("rid", "sid", session, "go")
+    with _registered_session("sid", session):
+        server._run_prompt_submit("rid", "sid", session, "go")
 
     payload = _events(emits, "message.complete")[0]
     assert payload["status"] == "error"
