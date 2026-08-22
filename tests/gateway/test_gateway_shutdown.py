@@ -292,19 +292,14 @@ async def test_gateway_stop_systemd_service_restart_uses_tempfail(tmp_path, monk
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
     monkeypatch.setenv("INVOCATION_ID", "systemd-test")
-    runner._launch_systemd_restart_shortcut = MagicMock()
 
     with patch("gateway.run.sys.platform", "linux"), patch(
         "gateway.status.remove_pid_file"
     ), patch("gateway.status.write_runtime_status"):
         await runner.stop(restart=True, service_restart=True)
 
-    runner._launch_systemd_restart_shortcut.assert_called_once_with()
-    # Exit 75 (EX_TEMPFAIL) so RestartForceExitStatus=75 in the unit
-    # file revives the gateway via Restart=on-failure, even when the
-    # planned-restart helper fails (Polkit denial, missing user bus,
-    # headless box, or operator-managed unit using on-failure instead
-    # of always).  StartLimitBurst still bounds accidental loops.
+    # The service manager is the sole restart owner; exit 75 asks it to
+    # replace this process without racing a detached restart helper.
     assert runner._exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert (tmp_path / ".restart_pending.json").exists()
 
