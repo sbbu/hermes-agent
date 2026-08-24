@@ -385,6 +385,17 @@ def _(rid, params: dict) -> dict:
     claimed = False
     submit_generation = None
     survivor_user_row_ids = None
+    survivor_row_id_map = None
+    raw_rebind_ids = params.get("rebind_survivor_row_ids")
+    requested_rebind_ids = (
+        {
+            row_id
+            for row_id in raw_rebind_ids
+            if isinstance(row_id, int) and not isinstance(row_id, bool)
+        }
+        if isinstance(raw_rebind_ids, list)
+        else None
+    )
     while True:
         busy = False
         busy_transport = None
@@ -426,7 +437,9 @@ def _(rid, params: dict) -> dict:
                         or truncate_message_id is not None
                         or truncate_row_id is not None
                     ):
-                        history = session.get("history", [])
+                        history = _history_without_ephemeral_scaffolding(
+                            session.get("history", [])
+                        )
 
                         # Malformed params refuse first (4004), regardless of consent —
                         # the historical ordinal-path precedence.
@@ -478,12 +491,10 @@ def _(rid, params: dict) -> dict:
 
                         # Desktop/TUI ordinals count the full displayed lineage.
                         # The live history contains only the post-compression tip.
-                        prefix_user_count = sum(
-                            1
-                            for message in session.get("display_history_prefix") or []
-                            if isinstance(message, dict)
-                            and message.get("role") == "user"
-                            and not message.get("display_kind")
+                        prefix_user_count = len(
+                            _history_user_indices(
+                                session.get("display_history_prefix") or []
+                            )
                         )
                         user_indices = _history_user_indices(history)
 
@@ -622,7 +633,11 @@ def _(rid, params: dict) -> dict:
                                 "target user message is no longer in session history",
                                 data=_stale_target_data(resolved_ordinal=ordinal),
                             )
-                        truncated = history[: user_indices[ordinal]]
+                        from agent.context_compressor import history_before_user_originated_turn
+
+                        truncated, _live_view = history_before_user_originated_turn(
+                            history, user_indices[ordinal]
+                        )
                         # Second gate, on top of confirm_truncate: ordinal 0 resolves to
                         # history[:0] == [] and replace_messages() DELETEs every durable
                         # row. A confirmed rewind that happens to erase the whole
@@ -658,72 +673,91 @@ def _(rid, params: dict) -> dict:
                             ordinal,
                         )
                         # Write-before-memory (mirrors gateway hygiene / manual /compress):
-                        # persist the truncated transcript first. If replace_messages fails
-                        # after we already rewrote session["history"], the turn still runs
-                        # against the short list while state.db keeps the old tail. The
-                        # agent flush is append-only for history-dict identities, so the
-                        # new exchange is appended on top of the "undone" turns — durable
-                        # zombie history on resume, and the edit/regenerate never sticks.
-                        # Fail closed: refuse the turn and leave memory/DB unchanged.
-                        if (db := _get_db()) is not None:
-                            try:
-                                # active_only=True: replace only the live (active=1) rows.
-                                # In-place compaction (#38763) keeps the pre-compaction
-                                # transcript as active=0/compacted=1 rows under this same
-                                # session key; a bare replace_messages() would DELETE that
-                                # durable archive on every edit/regenerate — the same bug
-                                # class #80216 fixed for /retry. On an uncompacted session
-                                # all rows are active=1, so this is behaviorally identical
-                                # to the full replace.
-                                # archive_dropped: a rewind overwrites turns the user may
-                                # not have meant to drop, and this write is the last step
-                                # before they are gone — three reported incidents ended
-                                # here with nothing to restore from (#70516, #80763,
-                                # #82756). Soft-archiving keeps them on disk (active=0) and
-                                # in the FTS index, so a mis-aimed cut is recoverable
-                                # instead of terminal. The live transcript is unchanged.
-                                # Fall back to the live sid for legacy sessions
-                                # whose session_key is NULL; None violates the FK.
-                                truncation_key = session.get("session_key") or sid
-                                db.replace_messages(
-                                    truncation_key,
-                                    truncated,
-                                    active_only=True,
-                                    archive_dropped=True,
-                                )
-                            except Exception as exc:
-                                logger.error(
-                                    "prompt.submit: replace_messages failed for session %s "
-                                    "(ordinal=%d); refusing turn so memory and DB stay "
-                                    "aligned: %s",
-                                    sid,
-                                    ordinal,
-                                    exc,
-                                    exc_info=True,
-                                )
-                                return _err(
-                                    rid,
-                                    5008,
-                                    f"failed to persist history truncation: {exc}",
-                                )
+                        # persist the truncated transcript first. Fail closed and use
+                        # the profile-scoped DB that owns this session.
+                        with _session_db(session) as db:
+                            if db is not None:
+                                try:
+                                    truncation_key = session.get("session_key") or sid
+                                    old_active_row_ids = {
+                                        row_id
+                                        for message in history
+                                        if isinstance(
+                                            (row_id := _message_row_id(message)), int
+                                        )
+                                    }
+                                    if requested_rebind_ids is not None:
+                                        durable_rebind_history = (
+                                            _load_durable_truncation_history(
+                                                session,
+                                                truncation_key,
+                                                repair_alternation=False,
+                                            )
+                                        )
+                                        if durable_rebind_history is None:
+                                            raise RuntimeError(
+                                                "could not load durable row identities for truncation"
+                                            )
+                                        old_active_row_ids.update(
+                                            row_id
+                                            for message in durable_rebind_history
+                                            if isinstance(
+                                                (row_id := _message_row_id(message)), int
+                                            )
+                                        )
+                                    old_survivor_row_ids = [
+                                        _message_row_id(message) for message in truncated
+                                    ]
+                                    db.replace_messages(
+                                        truncation_key,
+                                        truncated,
+                                        active_only=True,
+                                        archive_dropped=True,
+                                        reject_active_turn_lease=True,
+                                    )
+                                except Exception as exc:
+                                    logger.error(
+                                        "prompt.submit: replace_messages failed for session %s "
+                                        "(ordinal=%d); refusing turn so memory and DB stay "
+                                        "aligned: %s",
+                                        sid,
+                                        ordinal,
+                                        exc,
+                                        exc_info=True,
+                                    )
+                                    return _err(
+                                        rid,
+                                        5008,
+                                        f"failed to persist history truncation: {exc}",
+                                    )
+                                # replace_messages re-inserted and re-stamped the
+                                # surviving prefix with fresh durable row ids.
+                                survivor_user_row_ids = [
+                                    _message_row_id(truncated[i])
+                                    for i in _history_user_indices(truncated)
+                                ]
+                                if requested_rebind_ids is not None:
+                                    survivor_row_id_map = {
+                                        str(old_row_id): new_row_id
+                                        for old_row_id, new_row_id in zip(
+                                            old_survivor_row_ids,
+                                            (
+                                                _message_row_id(message)
+                                                for message in truncated
+                                            ),
+                                        )
+                                        if isinstance(old_row_id, int)
+                                        and isinstance(new_row_id, int)
+                                        and old_row_id in requested_rebind_ids
+                                    }
+                                    for dropped_row_id in requested_rebind_ids.intersection(
+                                        old_active_row_ids
+                                    ):
+                                        survivor_row_id_map.setdefault(
+                                            str(dropped_row_id), None
+                                        )
                         session["history"] = truncated
                         session["history_version"] = int(session.get("history_version", 0)) + 1
-                        if db is not None:
-                            # replace_messages re-inserted the surviving prefix as NEW rows
-                            # and stamped fresh _row_id values onto these same dicts.
-                            # Surface the surviving user-turn ids (in visible-user-ordinal
-                            # order) so the client can rebind its cached rowId stamps —
-                            # otherwise a second rewind targeting an older surviving turn
-                            # sends the pre-rewind id and the fail-closed resolver refuses
-                            # it with 4018 (#83202 review: consecutive-rewind staleness).
-                            # Ordinal order matches the client's visible-user filter the
-                            # same way truncate ordinals already do. Entries are None when
-                            # a row somehow has no stamp — the client must drop its cached
-                            # id for that turn rather than keep a stale one.
-                            survivor_user_row_ids = [
-                                _message_row_id(truncated[i])
-                                for i in _history_user_indices(truncated)
-                            ]
                 if claim_error is None:
                     # A previously accepted queued prompt is older than this
                     # submission. Merge them losslessly so an idle-claim race
