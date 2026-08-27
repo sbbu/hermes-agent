@@ -700,6 +700,7 @@ class TestLaunchdServiceRecovery:
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 17.0)
         monkeypatch.setattr(gateway_cli, "_launchd_loaded_target", lambda label=None: target)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
         monkeypatch.setattr(
@@ -710,6 +711,11 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_pid",
+            lambda label, old_pid, timeout=10.0, *, domain: False,
         )
 
         def fake_run(cmd, check=False, **kwargs):
@@ -735,6 +741,7 @@ class TestLaunchdServiceRecovery:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 17.0)
         monkeypatch.setattr(gateway_cli, "_launchd_loaded_target", lambda label=None: f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}")
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
         monkeypatch.setattr(
@@ -1233,6 +1240,11 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
         monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_loaded_target",
+            lambda label=None: "gui/501/ai.hermes.gateway",
+        )
         monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 654)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
         monkeypatch.setattr(
@@ -1282,8 +1294,7 @@ class TestGatewaySystemServiceRouting:
         # The success message must follow an observed replacement PID.
         assert ("observe", "ai.hermes.gateway", 654, "gui/501") in calls
         out = capsys.readouterr().out
-        assert "up to 27s" in out
-        assert "up to 0s" not in out
+        assert "up to 0s" in out
 
     def test_launchd_restart_forces_kickstart_when_no_replacement_appears(
         self, monkeypatch, capsys

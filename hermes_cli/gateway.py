@@ -5808,6 +5808,7 @@ def launchd_restart():
     target = _launchd_loaded_target(label)
     target_domain = target.rsplit("/", 1)[0]
     domain = target_domain
+    drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
     try:
@@ -5855,7 +5856,7 @@ def launchd_restart():
             wait_budget = _get_restart_exit_wait_budget()
             print(
                 f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
-                f"(up to {wait_budget:.0f}s)..."
+                f"(up to {drain_timeout:.0f}s)..."
             )
             if _graceful_restart_via_sigusr1(pid, wait_budget):
                 # The gateway exited with the planned-restart code. When
@@ -5878,11 +5879,15 @@ def launchd_restart():
                     "⚠ launchd did not revive the gateway after its graceful "
                     "exit — forcing restart"
                 )
+                kickstart_cmd = ["launchctl", "kickstart", target]
             else:
                 print(
-                    f"⚠ Gateway drain timed out after {wait_budget:.0f}s — forcing launchd restart"
+                    f"⚠ Gateway is still draining after {drain_timeout:.0f}s — not forcing restart"
                 )
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+                return
+        else:
+            kickstart_cmd = ["launchctl", "kickstart", "-k", target]
+        subprocess.run(kickstart_cmd, check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
     except subprocess.CalledProcessError as e:
