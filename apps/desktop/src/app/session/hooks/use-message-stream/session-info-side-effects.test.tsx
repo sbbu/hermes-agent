@@ -36,8 +36,8 @@ function mountStream() {
   sessionStates = stream.states
 }
 
-const sessionInfo = (sessionId: string, payload: Record<string, unknown>) =>
-  act(() => stream.handleEvent({ payload, session_id: sessionId, type: 'session.info' }))
+const sessionInfo = (sessionId: string, payload: Record<string, unknown>, profile?: string) =>
+  act(() => stream.handleEvent({ payload, profile, session_id: sessionId, type: 'session.info' }))
 
 beforeEach(() => {
   sessionStates = null
@@ -58,6 +58,18 @@ afterEach(() => {
 })
 
 describe('session.info config refetch gating', () => {
+  it('does not recreate cache routes from a queued old-profile running update', () => {
+    mountStream()
+
+    sessionInfo(
+      'old-profile-runtime',
+      { running: true, stored_session_id: 'old-profile-stored' },
+      'profile-we-left'
+    )
+
+    expect(sessionStates!.get('old-profile-runtime')?.storedSessionId).not.toBe('old-profile-stored')
+  })
+
   it('coalesces active-session bursts into one trailing config fetch', async () => {
     // Mount under real timers (waitFor), then freeze time for the debounce.
     mountStream()

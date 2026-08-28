@@ -379,7 +379,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             turnLive: false
           }
         },
-        payload?.stored_session_id || undefined
+        payload?.stored_session_id || undefined,
+        event.profile
       )
 
       if (recoveredWithoutPayload) {
