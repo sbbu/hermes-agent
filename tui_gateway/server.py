@@ -3584,6 +3584,37 @@ def _detach_running_agent_locked(
 ) -> Any:
     """Invalidate a stuck turn and prepare this session to build a fresh agent."""
     old_agent = session.get("agent")
+    # The turn prologue persists the inbound user row before the first provider
+    # call and mirrors that live list onto the agent.  A force-release fences the
+    # old worker's normal post-run publication, so carry this already-persisted
+    # prefix into the replacement session now; otherwise memory stays at the
+    # pre-turn snapshot while state.db contains the interrupted input, and a
+    # later submit/resume can replay adjacent user rows.  Deep-copy to sever the
+    # abandoned worker's mutable list/dict ownership.
+    persist_lock = getattr(old_agent, "_session_persist_lock", None)
+    persist_guard = persist_lock if persist_lock is not None else contextlib.nullcontext()
+    with persist_guard:
+        live_snapshot = getattr(old_agent, "_session_messages", None)
+        if isinstance(live_snapshot, list):
+            # The live list can be between append and flush when Stop lands.
+            # Holding the persist lock makes the intrinsic markers an atomic
+            # view of the committed batch rather than a partially stamped one.
+            # Never feed an unflushed assistant/tool tail to the replacement as
+            # durable conversation_history (that would make the next flush
+            # identity-skip rows which do not exist in SQLite).
+            durable_snapshot = [
+                message
+                for message in live_snapshot
+                if isinstance(message, dict) and message.get("_db_persisted")
+            ]
+            if durable_snapshot:
+                session["history"] = copy.deepcopy(durable_snapshot)
+        # Fence any later old-worker finalizer from opening another DB write
+        # after the atomic snapshot. _quiesce_abandoned_agent repeats this
+        # defensively after requesting the hard interrupt.
+        if old_agent is not None:
+            with contextlib.suppress(Exception):
+                old_agent._session_db = None
     _bump_run_generation_locked(session)
     session["agent"] = None
     session["agent_error"] = None

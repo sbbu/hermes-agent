@@ -12143,6 +12143,12 @@ def test_session_interrupt_force_releases_stuck_desktop_turn(monkeypatch):
     class _Agent:
         def __init__(self):
             self._session_db = object()
+            self._session_persist_lock = threading.RLock()
+            self._session_messages = [
+                {"role": "assistant", "content": "prior", "_db_persisted": True},
+                {"role": "user", "content": "stuck", "_db_persisted": True},
+                {"role": "assistant", "content": "unflushed tool call"},
+            ]
             self.tool_progress_callback = object()
             self.interrupt_reason = None
 
@@ -12163,6 +12169,7 @@ def test_session_interrupt_force_releases_stuck_desktop_turn(monkeypatch):
         agent_build_generation=4,
         running=True,
         run_generation=1,
+        history=[{"role": "assistant", "content": "prior"}],
         inflight_turn={"text": "stuck"},
         queued_prompt={"text": "discard me", "transport": None},
         slash_worker=worker,
@@ -12189,6 +12196,11 @@ def test_session_interrupt_force_releases_stuck_desktop_turn(monkeypatch):
         assert session["agent_build_started"] is False
         assert session["agent_build_generation"] == 5
         assert session["run_generation"] == 2
+        assert session["history"] == [
+            {"role": "assistant", "content": "prior", "_db_persisted": True},
+            {"role": "user", "content": "stuck", "_db_persisted": True},
+        ]
+        assert session["history"] is not agent._session_messages
         assert session["queued_prompt"] is None
         assert session["build_requested"] is True
         assert worker.closed is True
