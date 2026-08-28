@@ -1385,7 +1385,8 @@ def _history_has_unfinished_gateway_work(history: Any) -> bool:
     a shutdown can mark a session while the model was merely between messages,
     and blindly waking it produces the useless "I'm back / interrupted" filler
     that users read as nonsense.  Auto-resume should only fire when there is a
-    concrete unfinished assistant→tool sequence to process.
+    concrete unfinished assistant→tool sequence or a persisted user request
+    with no assistant response to process.
     """
     if not isinstance(history, list):
         return False
@@ -1398,6 +1399,8 @@ def _history_has_unfinished_gateway_work(history: Any) -> bool:
         if role in {"tool", "function"}:
             return True
         if role == "assistant" and msg.get("tool_calls"):
+            return True
+        if role == "user":
             return True
         return False
     return False

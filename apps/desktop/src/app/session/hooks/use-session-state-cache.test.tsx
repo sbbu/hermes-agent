@@ -2,6 +2,7 @@ import { act, cleanup, render } from '@testing-library/react'
 import { type MutableRefObject, useLayoutEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection } from '@/api/client'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
@@ -43,6 +44,7 @@ interface HarnessProps {
 describe('useSessionStateCache — stored-id rotation provenance', () => {
   afterEach(() => {
     cleanup()
+    setApiRequestConnection(null)
     $activeGatewayProfile.set('default')
     setActiveSessionId(null)
     setActiveSessionStoredIdRotation(null)
@@ -123,6 +125,26 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     act(() => $activeGatewayProfile.set('profile-b'))
 
     expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-A')
+  })
+
+  it('discards stored-id aliases when the gateway connection changes under the same profile', () => {
+    let cache!: Cache
+
+    setApiRequestConnection('connection-a')
+    $activeGatewayProfile.set('default')
+    render(
+      <Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="stored-A" />
+    )
+    act(() => {
+      cache.updateSessionState('runtime-A', state => state, 'stored-A')
+      cache.updateSessionState('runtime-A', state => state, 'stored-B')
+    })
+    expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-B')
+
+    setApiRequestConnection('connection-b')
+
+    expect(cache.resolveStoredSessionId('stored-A')).toBe('stored-A')
+    expect(cache.runtimeIdByStoredSessionIdRef.current.size).toBe(0)
   })
 
   it('fences stale aliases synchronously even before profile-switch effects', () => {

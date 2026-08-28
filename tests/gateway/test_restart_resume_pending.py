@@ -695,6 +695,9 @@ class TestResumePendingSystemNote:
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "done"},
         ]) is False
+        assert _history_has_unfinished_gateway_work([
+            {"role": "user", "content": "accepted but interrupted before response"},
+        ]) is True
 
 
 # ---------------------------------------------------------------------------

@@ -250,7 +250,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       }
     }
 
-    if (sessionId && hasStatePatch) {
+    if (sessionId && hasStatePatch && fromActiveSource()) {
       updateSessionState(
         sessionId,
         state => ({
@@ -272,7 +272,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // its dot without the user opening it. updateSessionState only
     // mutates the per-runtime cache entry, and syncSessionStateToView
     // guards the view publish to the active session, so this is safe.
-    if (runningChanged && sessionId) {
+    if (runningChanged && sessionId && fromActiveSource()) {
       // Set when THIS event released a turn that ended without ever
       // producing an assistant payload, so the catch-up side effects below
       // run on that edge only. The updater is invoked exactly once,

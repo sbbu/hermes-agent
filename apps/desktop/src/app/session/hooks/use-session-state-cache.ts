@@ -3,6 +3,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
+import { getApiRequestConnection } from '@/api/client'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -133,7 +134,9 @@ export function useSessionStateCache({
   // cache: aliases are local to this hook and discarded whenever the active
   // gateway profile changes.
   const storedSessionIdAliasesRef = useRef(new Map<string, string>())
-  const storedSessionAliasProfileRef = useRef(normalizeProfileKey($activeGatewayProfile.get()))
+  const activeRouteScopeKey = () =>
+    `${getApiRequestConnection() ?? 'local'}::${normalizeProfileKey($activeGatewayProfile.get())}`
+  const storedSessionAliasScopeRef = useRef(activeRouteScopeKey())
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
   const transcriptViewGateByRuntimeIdRef = useRef(new Map<string, symbol>())
@@ -147,15 +150,15 @@ export function useSessionStateCache({
   }, [busy, busyRef])
 
   const syncStoredSessionAliasProfile = useCallback(() => {
-    const currentProfile = normalizeProfileKey($activeGatewayProfile.get())
+    const currentScope = activeRouteScopeKey()
 
-    if (storedSessionAliasProfileRef.current !== currentProfile) {
+    if (storedSessionAliasScopeRef.current !== currentScope) {
       storedSessionIdAliasesRef.current.clear()
       // The reverse map is profile-blind too. A stored id is only unique
       // inside one profile, so carrying this map across a live profile swap
       // can route the new profile into the previous profile's runtime.
       runtimeIdByStoredSessionIdRef.current.clear()
-      storedSessionAliasProfileRef.current = currentProfile
+      storedSessionAliasScopeRef.current = currentScope
     }
   }, [])
 
@@ -205,7 +208,7 @@ export function useSessionStateCache({
 
       if (
         sourceProfile &&
-        normalizeProfileKey(sourceProfile) !== storedSessionAliasProfileRef.current
+        normalizeProfileKey(sourceProfile) !== normalizeProfileKey($activeGatewayProfile.get())
       ) {
         // A queued event from the profile we just left must not mutate this
         // profile-blind cache or either profile-blind route map. Return a
@@ -239,7 +242,7 @@ export function useSessionStateCache({
             if (storedSessionId) {
               syncStoredSessionAliasProfile()
 
-              const activeProfile = storedSessionAliasProfileRef.current
+              const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
               const rotationBelongsToActiveProfile =
                 !sourceProfile || normalizeProfileKey(sourceProfile) === activeProfile
 
@@ -436,7 +439,7 @@ export function useSessionStateCache({
 
       if (
         sourceProfile &&
-        normalizeProfileKey(sourceProfile) !== storedSessionAliasProfileRef.current
+        normalizeProfileKey(sourceProfile) !== normalizeProfileKey($activeGatewayProfile.get())
       ) {
         // Do not invoke the updater: besides the cache write below, callers can
         // perform edge-triggered side effects from inside it.
