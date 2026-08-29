@@ -181,6 +181,7 @@ export class GatewayClient extends EventEmitter {
   private publish(ev: GatewayEvent) {
     if (ev.type === 'gateway.ready') {
       this.ready = true
+      this.resetReconnectBackoff()
 
       if (this.readyTimer) {
         clearTimeout(this.readyTimer)
@@ -323,12 +324,15 @@ export class GatewayClient extends EventEmitter {
     this.reconnectTimer.unref?.()
   }
 
-  private clearReconnect() {
+  private cancelReconnectTimer() {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+  }
 
+  private resetReconnectBackoff() {
+    this.cancelReconnectTimer()
     this.reconnectAttempts = 0
   }
 
@@ -585,7 +589,7 @@ export class GatewayClient extends EventEmitter {
             }
 
             this.lastActivityAt = Date.now()
-            this.clearReconnect()
+            this.resetReconnectBackoff()
             this.connectSidecarMirror()
           },
           { once: true }
@@ -656,7 +660,9 @@ export class GatewayClient extends EventEmitter {
 
   start() {
     this.disposed = false
-    this.clearReconnect()
+    // A direct restart supersedes any scheduled retry, but a retry attempt
+    // must retain its backoff until a transport actually becomes healthy.
+    this.cancelReconnectTimer()
 
     const root = process.env.HERMES_PYTHON_SRC_ROOT ?? resolve(import.meta.dirname, '../../')
     const attachUrl = resolveGatewayAttachUrl()
@@ -665,7 +671,6 @@ export class GatewayClient extends EventEmitter {
     this.attachUrl = attachUrl
     this.sidecarUrl = sidecarUrl
     this.resetStartupState()
-    this.clearReconnect()
     this.stopHeartbeat()
 
     if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
@@ -924,7 +929,7 @@ export class GatewayClient extends EventEmitter {
 
   kill(reason = 'requested') {
     this.disposed = true
-    this.clearReconnect()
+    this.resetReconnectBackoff()
     this.stopHeartbeat()
     const proc = this.proc
     const killed = proc?.kill()

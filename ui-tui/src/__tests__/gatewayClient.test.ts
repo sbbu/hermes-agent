@@ -561,6 +561,37 @@ describe('GatewayClient websocket attach mode', () => {
     }
   })
 
+  it('backs off repeated failed reconnect attempts until a socket opens', async () => {
+    vi.useFakeTimers()
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+
+    try {
+      gw.start()
+      const first = FakeWebSocket.instances[0]!
+
+      first.open()
+      first.close(1011)
+      await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS)
+      expect(FakeWebSocket.instances).toHaveLength(2)
+
+      FakeWebSocket.instances[1]!.close(1011)
+      await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS)
+      expect(FakeWebSocket.instances).toHaveLength(2)
+
+      await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS)
+      expect(FakeWebSocket.instances).toHaveLength(3)
+
+      FakeWebSocket.instances[2]!.open()
+      FakeWebSocket.instances[2]!.close(1011)
+      await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS)
+      expect(FakeWebSocket.instances).toHaveLength(4)
+    } finally {
+      gw.kill()
+      vi.useRealTimers()
+    }
+  })
+
   it('does not heartbeat an older backend that omits the capability', async () => {
     vi.useFakeTimers()
     process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
