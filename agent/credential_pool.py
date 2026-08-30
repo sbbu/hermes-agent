@@ -316,6 +316,20 @@ def label_from_token(token: str, fallback: str) -> str:
     return fallback
 
 
+def _codex_token_account_identity(token: Any) -> Optional[str]:
+    """Return a stable unverified account identity for a Codex OAuth JWT."""
+    if not isinstance(token, str) or not token:
+        return None
+    claims = _decode_jwt_claims(token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claims, dict):
+        account_id = auth_claims.get("chatgpt_account_id")
+        if isinstance(account_id, str) and account_id:
+            return account_id
+    subject = claims.get("sub")
+    return subject if isinstance(subject, str) and subject else None
+
+
 def _next_priority(entries: List[PooledCredential]) -> int:
     return max((entry.priority for entry in entries), default=-1) + 1
 
@@ -1205,11 +1219,16 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        Mirrors the Nous/Anthropic resync paths above.  Only applies to the
+        singleton-seeded ``device_code`` entry or a legacy manual alias whose
+        token identity proves it tracks that singleton. Other manual entries
+        are independent pool rows; adopting the singleton would collapse
+        accounts.
         """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        if self.provider != "openai-codex" or entry.source not in (
+            "device_code",
+            "manual:device_code",
+        ):
             return entry
         try:
             owner_path = auth_mod._auth_store_path_for_provider("openai-codex")
@@ -1223,6 +1242,15 @@ class CredentialPool:
                 return entry
             store_access = tokens.get("access_token", "")
             store_refresh = tokens.get("refresh_token", "")
+            if (
+                entry.source == "manual:device_code"
+                and not self._codex_entry_tracks_singleton(
+                    entry,
+                    store_access=store_access,
+                    store_refresh=store_refresh,
+                )
+            ):
+                return entry
             # Adopt auth.json tokens when either side differs.  Codex refresh
             # tokens are single-use too, so a fresh refresh_token from
             # another process means our entry's pair is consumed/stale.
@@ -1280,6 +1308,26 @@ class CredentialPool:
         except Exception as exc:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
         return entry
+
+    @staticmethod
+    def _codex_entry_tracks_singleton(
+        entry: PooledCredential,
+        *,
+        store_access: Any,
+        store_refresh: Any,
+    ) -> bool:
+        """Distinguish a legacy singleton alias from an independent manual account."""
+        entry_access = entry.access_token or ""
+        entry_refresh = entry.refresh_token or ""
+        store_access = str(store_access or "")
+        store_refresh = str(store_refresh or "")
+        if (store_access and store_access == entry_access) or (
+            store_refresh and store_refresh == entry_refresh
+        ):
+            return True
+        entry_identity = _codex_token_account_identity(entry_access)
+        store_identity = _codex_token_account_identity(store_access)
+        return bool(entry_identity and entry_identity == store_identity)
 
     def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync an xAI OAuth pool entry from auth.json if tokens differ.
@@ -1493,7 +1541,12 @@ class CredentialPool:
             logger.debug("Failed to sync Nous entry from auth.json: %s", exc)
         return entry
 
-    def _sync_device_code_entry_to_auth_store(self, entry: PooledCredential) -> None:
+    def _sync_device_code_entry_to_auth_store(
+        self,
+        entry: PooledCredential,
+        *,
+        prior_entry: Optional[PooledCredential] = None,
+    ) -> None:
         """Write refreshed pool entry tokens back to auth.json providers.
 
         After a pool-level refresh, the pool entry has fresh tokens but
@@ -1515,11 +1568,10 @@ class CredentialPool:
         whatever provider happened to refresh last, not whatever the
         user actually chose.
         """
-        # Only sync entries that were seeded *from* a singleton.  Manually
-        # added pool entries (source="manual:*") are independent credentials
-        # and must not write back to the singleton.  All singleton-seeded
-        # device-code sources (nous, openai-codex, xAI) use ``device_code``.
-        if entry.source != "device_code":
+        # Singleton-seeded rows always write through. A legacy manual alias may
+        # do so only when its prior token identity proves that it tracks the
+        # singleton; independent manual accounts remain pool-only.
+        if entry.source not in ("device_code", "manual:device_code"):
             return
         if self.provider == "openai-codex":
             try:
@@ -1531,6 +1583,15 @@ class CredentialPool:
                         return
                     tokens = state.get("tokens")
                     if not isinstance(tokens, dict):
+                        return
+                    if (
+                        entry.source == "manual:device_code"
+                        and not self._codex_entry_tracks_singleton(
+                            prior_entry or entry,
+                            store_access=tokens.get("access_token", ""),
+                            store_refresh=tokens.get("refresh_token", ""),
+                        )
+                    ):
                         return
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
@@ -2381,7 +2442,7 @@ class CredentialPool:
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.
-        self._sync_device_code_entry_to_auth_store(updated)
+        self._sync_device_code_entry_to_auth_store(updated, prior_entry=entry)
         return updated
 
     def _codex_quota_restored_upstream(self, entry: PooledCredential) -> bool:

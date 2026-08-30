@@ -4,6 +4,7 @@ import base64
 import json
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 
@@ -232,6 +233,83 @@ def test_device_code_sync_targets_global_owner(profile_and_root):
     )
     assert _read(root_path)["providers"][PROVIDER]["tokens"]["refresh_token"] == "root-new-refresh"
     assert _read(profile_path)["providers"][PROVIDER]["tokens"]["refresh_token"] == "consumed-refresh"
+
+
+def test_manual_device_code_sync_does_not_adopt_singleton_account(profile_and_root):
+    _profile_path, root_path = profile_and_root
+    _write(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                PROVIDER: {
+                    "tokens": {
+                        "access_token": "singleton-access",
+                        "refresh_token": "singleton-refresh",
+                    }
+                }
+            },
+        },
+    )
+    independent = _entry(
+        "independent-access",
+        "independent-refresh",
+        source="manual:device_code",
+    )
+    pool = CredentialPool(PROVIDER, [independent])
+
+    synced = pool._sync_codex_entry_from_auth_store(independent)
+
+    assert synced.access_token == "independent-access"
+    assert synced.refresh_token == "independent-refresh"
+
+
+def test_manual_device_code_singleton_alias_adopts_rotated_same_account(
+    profile_and_root,
+):
+    _profile_path, root_path = profile_and_root
+
+    def account_token(generation: int) -> str:
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"sub": "shared-account", "generation": generation}).encode()
+        ).decode("ascii").rstrip("=")
+        return f"e30.{payload}.signature"
+
+    _write(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                PROVIDER: {
+                    "tokens": {
+                        "access_token": account_token(2),
+                        "refresh_token": "singleton-refresh-2",
+                    }
+                }
+            },
+        },
+    )
+    alias = _entry(
+        account_token(1),
+        "singleton-refresh-1",
+        source="manual:device_code",
+    )
+    pool = CredentialPool(PROVIDER, [alias])
+
+    synced = pool._sync_codex_entry_from_auth_store(alias)
+
+    assert synced.access_token == account_token(2)
+    assert synced.refresh_token == "singleton-refresh-2"
+
+    refreshed = replace(
+        alias,
+        access_token=account_token(3),
+        refresh_token="singleton-refresh-3",
+    )
+    pool._sync_device_code_entry_to_auth_store(refreshed, prior_entry=synced)
+    state = _read(root_path)["providers"][PROVIDER]["tokens"]
+    assert state["access_token"] == account_token(3)
+    assert state["refresh_token"] == "singleton-refresh-3"
 
 
 def test_profiles_refresh_one_canonical_manual_chain(profile_and_root, monkeypatch):

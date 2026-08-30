@@ -372,6 +372,29 @@ class TestTickLifecycle:
         assert mgr.state.awaiting_response is False
         assert mgr.state.ticks_fired == 0
 
+    def test_cas_empty_completion_preserves_self_paced_backoff(self, hermes_home):
+        from hermes_cli.loops import LoopManager, save_loop
+
+        mgr = LoopManager(session_id="t5-cas-empty")
+        state = mgr.set("/recap")
+        state.next_due_at = time.time() - 1
+        save_loop(mgr.session_id, state)
+
+        assert mgr.fire_tick() == "/recap"
+        first_fired = mgr.state.last_fired_at
+        first_ticks = mgr.state.ticks_fired
+        assert mgr.complete_empty_tick_if_current(first_fired, first_ticks)
+        first_delay = mgr.state.current_delay
+
+        mgr.state.next_due_at = time.time() - 1
+        save_loop(mgr.session_id, mgr.state)
+        assert mgr.fire_tick() == "/recap"
+        second_fired = mgr.state.last_fired_at
+        second_ticks = mgr.state.ticks_fired
+        assert mgr.complete_empty_tick_if_current(second_fired, second_ticks)
+
+        assert mgr.state.current_delay == first_delay * 2
+
     def test_complete_tick_marker_stops(self, hermes_home):
         from hermes_cli.loops import LoopManager
 

@@ -721,6 +721,113 @@ class LoopManager:
         s.ticks_fired = max(0, s.ticks_fired - 1)
         save_loop(self.session_id, s)
 
+    def _claimed_tick_snapshot(
+        self,
+        expected_last_fired_at: float,
+        expected_ticks_fired: int,
+    ) -> Optional[Tuple[Any, str, LoopState]]:
+        """Load the exact active tick state used by optimistic lifecycle updates."""
+        db = _get_session_db()
+        if db is None:
+            return None
+        try:
+            raw = db.get_meta(_meta_key(self.session_id))
+            state = LoopState.from_json(raw) if raw else None
+        except Exception:
+            return None
+        if (
+            state is None
+            or state.status != "active"
+            or not state.awaiting_response
+            or state.last_fired_at != expected_last_fired_at
+            or state.ticks_fired != expected_ticks_fired
+        ):
+            return None
+        return db, raw, state
+
+    def abandon_tick_if_current(
+        self,
+        expected_last_fired_at: float,
+        expected_ticks_fired: int,
+    ) -> bool:
+        """Roll back a tick without overwriting a raced pause/stop/replacement."""
+        snapshot = self._claimed_tick_snapshot(
+            expected_last_fired_at, expected_ticks_fired
+        )
+        if snapshot is None:
+            return False
+        db, raw, state = snapshot
+        state.awaiting_response = False
+        state.ticks_fired = max(0, state.ticks_fired - 1)
+        return bool(
+            db.compare_and_set_meta(_meta_key(self.session_id), raw, state.to_json())
+        )
+
+    def complete_empty_tick_if_current(
+        self,
+        expected_last_fired_at: float,
+        expected_ticks_fired: int,
+    ) -> Dict[str, Any]:
+        """Complete a slash-only tick with a CAS against user loop controls."""
+        snapshot = self._claimed_tick_snapshot(
+            expected_last_fired_at, expected_ticks_fired
+        )
+        if snapshot is None:
+            return {}
+        db, raw, state = snapshot
+        state.awaiting_response = False
+        now = time.time()
+        if state.times and state.ticks_fired >= state.times:
+            state.status = "done"
+            state.last_stop_reason = f"completed the requested {state.times} runs"
+            decision = {
+                "status": "done",
+                "stopped": True,
+                "reason": state.last_stop_reason,
+                "message": f"✓ Loop finished — ran {state.times}/{state.times} times.",
+            }
+        elif state.max_ticks and state.ticks_fired >= state.max_ticks:
+            state.status = "paused"
+            state.paused_reason = (
+                f"tick budget exhausted ({state.ticks_fired}/{state.max_ticks})"
+            )
+            decision = {
+                "status": "paused",
+                "stopped": True,
+                "reason": state.paused_reason,
+                "message": (
+                    f"⏸ Loop paused — {state.ticks_fired}/{state.max_ticks} ticks used "
+                    "(loops.max_ticks). /loop resume to keep going, /loop stop to end it."
+                ),
+            }
+        else:
+            if state.mode == "self_paced":
+                digest = _digest_response("")
+                floor = self_paced_floor_seconds()
+                ceiling = self_paced_ceiling_seconds()
+                if digest == state.last_response_digest:
+                    state.current_delay = min(
+                        max(state.current_delay, floor) * 2, ceiling
+                    )
+                else:
+                    state.current_delay = float(floor)
+                state.last_response_digest = digest
+            else:
+                state.current_delay = state.interval_seconds
+            state.next_due_at = now + state.current_delay
+            decision = {
+                "status": "active",
+                "stopped": False,
+                "reason": "loop continues",
+                "message": "",
+            }
+        if not db.compare_and_set_meta(
+            _meta_key(self.session_id), raw, state.to_json()
+        ):
+            return {}
+        self._state = state
+        return decision
+
     def complete_tick(self, last_response: str) -> Dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 

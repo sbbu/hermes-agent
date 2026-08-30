@@ -143,14 +143,89 @@ def test_tui_tick_fires_when_idle_and_due(server, session):
     def fake_submit(rid, sid_, session_, text, **kwargs):
         fired["text"] = text
 
+    s["run_generation"] = 7
     with patch.object(server, "_run_prompt_submit", fake_submit), \
-         patch.object(server, "_emit"):
+         patch.object(server, "_emit") as emit:
         server._maybe_fire_tui_loop_tick(sid, s)
 
     assert "poll the build" in fired.get("text", "")
     assert "[/loop wakeup #1" in fired["text"]
     # Session claimed for the wakeup turn.
     assert s["running"] is True
+    assert s["run_generation"] == 8
+    assert s["inflight_turn"]["user"] == fired["text"]
+    # The dispatch path owns the sole message.start emission; the loop driver
+    # must not emit a second one before dispatch.
+    assert sum(
+        call.args[:2] == ("message.start", sid) for call in emit.call_args_list
+    ) == 1
+
+
+def test_tui_tick_dispatches_with_fresh_generation(server, session):
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    mgr.set("poll", interval_seconds=60)
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+    s["run_generation"] = 12
+    seen = {}
+
+    def fake_submit(
+        _rid, _sid, _session, _text, *, expected_generation=None, **kwargs
+    ):
+        seen["expected_generation"] = expected_generation
+        seen.update(kwargs)
+
+    with patch.object(server, "_run_prompt_submit", fake_submit), patch.object(server, "_emit"):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    assert seen["expected_generation"] == 13
+    assert s["run_generation"] == 13
+
+
+def test_tui_tick_abandons_when_claimed_dispatch_is_rejected(server, session):
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    mgr.set("poll", interval_seconds=60)
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+
+    with patch.object(server, "_dispatch_claimed_prompt", return_value=False), patch.object(
+        server, "_emit"
+    ):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    state = LoopManager(session_key).state
+    assert state is not None
+    assert state.awaiting_response is False
+    assert state.ticks_fired == 0
+
+
+def test_tui_tick_rejection_does_not_resurrect_raced_stop(server, session):
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    mgr.set("poll", interval_seconds=60)
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+
+    def reject_after_stop(*_args, **_kwargs):
+        LoopManager(session_key).clear()
+        return False
+
+    with patch.object(
+        server, "_dispatch_claimed_prompt", side_effect=reject_after_stop
+    ), patch.object(server, "_emit"):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    state = LoopManager(session_key).state
+    assert state is not None
+    assert state.status == "cleared"
 
 
 def test_tui_tick_defers_when_running(server, session):

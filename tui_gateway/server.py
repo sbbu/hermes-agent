@@ -12186,9 +12186,8 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     """Fire a due /loop wakeup for an idle TUI/Desktop/dashboard session.
 
     Called from the per-session notification poller thread on a coarse
-    cadence. Claims the session under history_lock (running=True) before
-    dispatching so a racing user prompt wins cleanly. The post-turn hook
-    in the turn dispatcher completes the tick.
+    cadence. Claims the session under history_lock before dispatching so a
+    racing user prompt wins cleanly. The post-turn hook completes the tick.
     """
     try:
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
@@ -12204,16 +12203,26 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     if goal_blocks_loop_tick(sid_key):
         return
 
+    submit_generation: int | None = None
     with session["history_lock"]:
         if session.get("running"):
             return  # busy — stays due, next poll retries
-        session["running"] = True
+        submit_generation = _begin_session_run_locked(session)
 
     wakeup = mgr.fire_tick()
     if not wakeup:
-        with session["history_lock"]:
-            session["running"] = False
+        _abandon_claimed_run(session, submit_generation)
         return
+
+    claimed_state = mgr.state
+    if claimed_state is None:
+        _abandon_claimed_run(session, submit_generation)
+        return
+    claimed_last_fired_at = claimed_state.last_fired_at
+    claimed_ticks_fired = claimed_state.ticks_fired
+
+    def abandon_current_tick() -> None:
+        mgr.abandon_tick_if_current(claimed_last_fired_at, claimed_ticks_fired)
 
     tick_no = mgr.state.ticks_fired if mgr.state else "?"
     rid = f"__loop__{int(time.time() * 1000)}"
@@ -12226,8 +12235,8 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         if wakeup.lstrip().startswith("/"):
             # Slash-command loop: route through the slash pipeline instead of
             # the model. No model reply to evaluate — complete immediately.
-            with session["history_lock"]:
-                session["running"] = False
+            _abandon_claimed_run(session, submit_generation)
+            submit_generation = None
             try:
                 parts = wakeup.lstrip()[1:].split(None, 1)
                 resp = _methods["command.dispatch"](
@@ -12248,30 +12257,53 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                     # the tick.
                     with session["history_lock"]:
                         if session.get("running"):
-                            mgr.abandon_tick()
+                            abandon_current_tick()
                             return
-                        session["running"] = True
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, payload["message"])
+                        submit_generation = _begin_session_run_locked(
+                            session, payload["message"]
+                        )
+                    started = _dispatch_claimed_prompt(
+                        rid,
+                        sid,
+                        session,
+                        payload["message"],
+                        expected_generation=submit_generation,
+                    )
+                    if not started:
+                        abandon_current_tick()
                     return
             except Exception:
-                pass
-            decision = mgr.complete_tick("")
+                abandon_current_tick()
+                raise
+            decision = mgr.complete_empty_tick_if_current(
+                claimed_last_fired_at, claimed_ticks_fired
+            )
             if decision.get("message"):
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
-        _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, wakeup)
+        with session["history_lock"]:
+            if not _run_current_locked(session, submit_generation):
+                abandon_current_tick()
+                return
+            _start_inflight_turn(session, wakeup)
+        started = _dispatch_claimed_prompt(
+            rid,
+            sid,
+            session,
+            wakeup,
+            expected_generation=submit_generation,
+        )
+        if not started:
+            abandon_current_tick()
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
             f"{type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        with session["history_lock"]:
-            session["running"] = False
+        _abandon_claimed_run(session, submit_generation)
         try:
-            mgr.abandon_tick()
+            abandon_current_tick()
         except Exception:
             pass
 
