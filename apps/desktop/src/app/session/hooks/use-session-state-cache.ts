@@ -1,9 +1,9 @@
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import { getApiRequestConnection } from '@/api/client'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
-import { getApiRequestConnection } from '@/api/client'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -134,8 +134,10 @@ export function useSessionStateCache({
   // cache: aliases are local to this hook and discarded whenever the active
   // gateway profile changes.
   const storedSessionIdAliasesRef = useRef(new Map<string, string>())
+
   const activeRouteScopeKey = () =>
     `${getApiRequestConnection() ?? 'local'}::${normalizeProfileKey($activeGatewayProfile.get())}`
+
   const storedSessionAliasScopeRef = useRef(activeRouteScopeKey())
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
@@ -206,10 +208,7 @@ export function useSessionStateCache({
     (sessionId: string, storedSessionId?: string | null, sourceProfile?: string | null) => {
       syncStoredSessionAliasProfile()
 
-      if (
-        sourceProfile &&
-        normalizeProfileKey(sourceProfile) !== normalizeProfileKey($activeGatewayProfile.get())
-      ) {
+      if (sourceProfile && normalizeProfileKey(sourceProfile) !== normalizeProfileKey($activeGatewayProfile.get())) {
         // A queued event from the profile we just left must not mutate this
         // profile-blind cache or either profile-blind route map. Return a
         // detached snapshot so direct callers still receive a valid state.
@@ -243,6 +242,7 @@ export function useSessionStateCache({
               syncStoredSessionAliasProfile()
 
               const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+
               const rotationBelongsToActiveProfile =
                 !sourceProfile || normalizeProfileKey(sourceProfile) === activeProfile
 
@@ -437,10 +437,7 @@ export function useSessionStateCache({
     ) => {
       syncStoredSessionAliasProfile()
 
-      if (
-        sourceProfile &&
-        normalizeProfileKey(sourceProfile) !== normalizeProfileKey($activeGatewayProfile.get())
-      ) {
+      if (sourceProfile && normalizeProfileKey(sourceProfile) !== normalizeProfileKey($activeGatewayProfile.get())) {
         // Do not invoke the updater: besides the cache write below, callers can
         // perform edge-triggered side effects from inside it.
         return sessionStateCache.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)

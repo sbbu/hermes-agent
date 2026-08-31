@@ -151,9 +151,11 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     let cache!: Cache
 
     $activeGatewayProfile.set('profile-a')
+
     const view = render(
       <Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="stored-A" />
     )
+
     act(() => {
       cache.updateSessionState('runtime-A', state => state, 'stored-A')
       cache.updateSessionState('runtime-A', state => state, 'stored-B')

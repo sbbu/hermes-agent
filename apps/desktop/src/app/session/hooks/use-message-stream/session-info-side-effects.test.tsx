@@ -61,11 +61,7 @@ describe('session.info config refetch gating', () => {
   it('does not recreate cache routes from a queued old-profile running update', () => {
     mountStream()
 
-    sessionInfo(
-      'old-profile-runtime',
-      { running: true, stored_session_id: 'old-profile-stored' },
-      'profile-we-left'
-    )
+    sessionInfo('old-profile-runtime', { running: true, stored_session_id: 'old-profile-stored' }, 'profile-we-left')
 
     expect(sessionStates!.get('old-profile-runtime')?.storedSessionId).not.toBe('old-profile-stored')
   })
